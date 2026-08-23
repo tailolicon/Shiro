@@ -1,0 +1,13 @@
+- id: session-title-llm
+  name: '@deepseek-ai/dsh-session-title-first-prompt-llm'
+  disabled: true
+- insert:
+    - id: llm-shiro-harness-bridge
+      name: '@shiro-ai/harness-bridge'
+      config:
+        provider: shiro-sol
+        model: gpt-5.6-sol
+        workspaceRoot: !!js process.env.SHIRO_WORKSPACE_ROOT
+        token: !!js process.env.SHIRO_BRIDGE_TOKEN
+        port: !!js Number(process.env.SHIRO_BRIDGE_PORT ?? 23157)
+        waitMs: 25000

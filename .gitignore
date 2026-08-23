@@ -1,0 +1,27 @@
+# Dependencies and generated engine output
+**/node_modules/
+engine/.shiro-build-ready
+engine/.cache/
+engine/**/dist/
+engine/**/*.tsbuildinfo
+
+# Desktop build artifacts
+desktop/dist/
+desktop/.pake/
+desktop/src-tauri/target/
+desktop/*.exe
+desktop/*.msi
+
+# Local state and secrets must never enter Git
+.env
+.env.*
+!.env.example
+.shiro-runtime/
+*.log
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini

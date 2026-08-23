@@ -1,0 +1,21 @@
+{
+  "$schema": "https://raw.githubusercontent.com/tw93/Pake/main/schema/pake.schema.json",
+  "url": "http://127.0.0.1:3080/",
+  "name": "Shiro",
+  "identifier": "ai.shiro.desktop",
+  "title": "Shiro",
+  "icon": "./shiro.svg",
+  "width": 1440,
+  "height": 900,
+  "minWidth": 1000,
+  "minHeight": 700,
+  "appVersion": "0.1.0",
+  "maximize": true,
+  "darkMode": true,
+  "showSystemTray": false,
+  "hideOnClose": false,
+  "keepBinary": true,
+  "enableFind": true,
+  "newWindow": true,
+  "targets": "x64"
+}

@@ -1,0 +1,11 @@
+{
+  "name": "shiro",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local ChatGPT Sol coding-agent bridge powered by DeepSeek Harness",
+  "scripts": {
+    "test": "pnpm --dir bridge test",
+    "build:desktop": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/Build-Desktop.ps1",
+    "start": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/Start-Shiro.ps1"
+  }
+}

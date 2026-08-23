@@ -1,0 +1,611 @@
+import { randomUUID, timingSafeEqual } from 'node:crypto'
+import { createServer } from 'node:http'
+import { resolve } from 'node:path'
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
+import { z } from 'zod'
+
+const DEFAULT_PROVIDER = 'shiro-sol'
+const DEFAULT_MODEL = 'gpt-5.6-sol'
+const DEFAULT_PORT = 23157
+const MAX_WAIT_MS = 45_000
+
+const delay = ms => new Promise(resolveDelay => setTimeout(resolveDelay, ms))
+
+function asError(error) {
+  return error instanceof Error ? error : new Error(String(error))
+}
+
+function safeEqual(left, right) {
+  const a = Buffer.from(left)
+  const b = Buffer.from(right)
+  return a.length === b.length && timingSafeEqual(a, b)
+}
+
+function requiredString(value, label) {
+  if (typeof value !== 'string' || value.trim() === '') throw new Error(`${label} is required`)
+  return value.trim()
+}
+
+function normalizeConfig(config = {}) {
+  const port = Number(config.port ?? DEFAULT_PORT)
+  const waitMs = Number(config.waitMs ?? 25_000)
+  if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('port must be an integer from 1024 to 65535')
+  if (!Number.isInteger(waitMs) || waitMs < 100 || waitMs > MAX_WAIT_MS) throw new Error(`waitMs must be an integer from 100 to ${MAX_WAIT_MS}`)
+  return {
+    provider: requiredString(config.provider ?? DEFAULT_PROVIDER, 'provider'),
+    model: requiredString(config.model ?? DEFAULT_MODEL, 'model'),
+    workspaceRoot: resolve(requiredString(config.workspaceRoot, 'workspaceRoot')),
+    token: requiredString(config.token, 'token'),
+    port,
+    waitMs,
+  }
+}
+
+function publicRequest(id, options) {
+  return {
+    request_id: id,
+    session_id: options.sessionId ?? null,
+    purpose: options.purpose ?? 'conversation',
+    provider: options.provider,
+    model: options.model,
+    system: options.system ?? '',
+    messages: options.messages,
+    tools: options.tools ?? [],
+    generation: {
+      temperature: options.temperature ?? null,
+      max_tokens: options.maxTokens ?? null,
+      stop: options.stop ?? [],
+      reasoning_effort: options.reasoningEffort ?? null,
+    },
+  }
+}
+
+export class BridgeBroker {
+  #pending = new Map()
+  #listeners = new Set()
+
+  enqueue(options) {
+    const id = randomUUID()
+    let settle
+    const response = new Promise((resolveResponse) => { settle = resolveResponse })
+    const row = {
+      id,
+      sessionId: options.sessionId ?? null,
+      createdAt: Date.now(),
+      request: publicRequest(id, options),
+      settle,
+    }
+    this.#pending.set(id, row)
+    this.#notify()
+    return { id, response }
+  }
+
+  cancel(id, failure = { message: 'Harness cancelled the model request', code: 'ABORTED' }) {
+    const row = this.#pending.get(id)
+    if (row === undefined) return false
+    this.#pending.delete(id)
+    row.settle({ kind: 'aborted', failure })
+    this.#notify()
+    return true
+  }
+
+  submit(id, response) {
+    const row = this.#pending.get(id)
+    if (row === undefined) throw new Error(`model request ${id} is not pending`)
+    this.#pending.delete(id)
+    row.settle(response)
+    this.#notify()
+    return row
+  }
+
+  snapshot() {
+    return [...this.#pending.values()]
+      .sort((a, b) => a.createdAt - b.createdAt)
+      .map(row => row.request)
+  }
+
+  async waitForPending(timeoutMs) {
+    const ready = this.snapshot()
+    if (ready.length > 0) return ready
+    let wake
+    const changed = new Promise(resolveChange => { wake = resolveChange })
+    this.#listeners.add(wake)
+    try {
+      await Promise.race([changed, delay(timeoutMs)])
+      return this.snapshot()
+    } finally {
+      this.#listeners.delete(wake)
+    }
+  }
+
+  #notify() {
+    for (const listener of this.#listeners) listener()
+    this.#listeners.clear()
+  }
+}
+
+function finishReason(kind) {
+  if (kind === 'tool-calls') return { kind: 'tool-calls' }
+  if (kind === 'max-tokens') return { kind: 'max-tokens' }
+  return { kind: 'stop' }
+}
+
+function normalizeBlock(block) {
+  if (block.type === 'tool_call') {
+    return {
+      type: 'tool-call',
+      id: block.id,
+      name: block.name,
+      arguments: typeof block.arguments === 'string' ? block.arguments : JSON.stringify(block.arguments),
+    }
+  }
+  return { type: block.type, text: block.text }
+}
+
+export class ChatGptSolAdapter {
+  constructor(broker, provider, model) {
+    this.broker = broker
+    this.provider = provider
+    this.model = model
+  }
+
+  providerInfo(provider) {
+    return { id: provider, name: 'ChatGPT Web · GPT-5.6 Sol' }
+  }
+
+  providerRetryPolicy() {
+    return undefined
+  }
+
+  async listModels(provider) {
+    return [{ provider, id: this.model, name: 'GPT-5.6 Sol (ChatGPT Web)', inputModalities: ['text', 'image'] }]
+  }
+
+  async resolveModel(provider, model) {
+    return { provider, id: model, name: 'GPT-5.6 Sol (ChatGPT Web)', inputModalities: ['text', 'image'] }
+  }
+
+  async prepareCall(provider, model, signal) {
+    return {
+      model: await this.resolveModel(provider, model, signal),
+      stream: options => this.stream(options),
+    }
+  }
+
+  async *stream(options) {
+    const pending = this.broker.enqueue(options)
+    let response
+    const onAbort = () => { this.broker.cancel(pending.id) }
+    options.signal?.addEventListener('abort', onAbort, { once: true })
+    try {
+      response = await pending.response
+    } finally {
+      options.signal?.removeEventListener('abort', onAbort)
+    }
+
+    if (response.kind === 'aborted') {
+      yield { type: 'finish', reason: { kind: 'aborted', failure: response.failure } }
+      return
+    }
+
+    const blocks = response.blocks.map(normalizeBlock)
+    for (let index = 0; index < blocks.length; index++) {
+      const block = blocks[index]
+      yield { type: 'block-start', index, blockType: block.type }
+      if (block.type === 'text') {
+        yield { type: 'text-delta', index, text: block.text }
+      } else if (block.type === 'reasoning') {
+        yield { type: 'reasoning-delta', index, text: block.text }
+      } else if (block.type === 'tool-call') {
+        yield { type: 'tool-call-delta', index, id: block.id, name: block.name, argumentsDelta: block.arguments }
+      }
+      yield { type: 'block-end', index, block }
+    }
+    yield {
+      type: 'usage',
+      usage: response.usage ?? { inputTokens: 0, outputTokens: 0 },
+    }
+    const inferred = blocks.some(block => block.type === 'tool-call') ? 'tool-calls' : 'stop'
+    yield { type: 'finish', reason: finishReason(response.finishReason ?? inferred) }
+  }
+}
+
+function rpcId(prefix) {
+  return `${prefix}-${randomUUID()}`
+}
+
+async function unwrap(promise, label) {
+  const response = await promise
+  if (!response.result.ok) throw new Error(`${label}: ${response.result.error.code}: ${response.result.error.message}`)
+  return response.result.value
+}
+
+async function history(ctx, sessionId) {
+  return unwrap(ctx.apiProxy.sessions.history({
+    rpcId: rpcId('bridge-history'),
+    payload: { sessionId, maxMessages: 100 },
+  }), 'session.history')
+}
+
+function latestSeq(page) {
+  return page.events.reduce((max, entry) => Math.max(max, entry.event.seq), -1)
+}
+
+function turnCompletion(page, afterSeq) {
+  const completed = page.events
+    .map(entry => entry.event)
+    .filter(event => event.seq > afterSeq && event.type === 'turn/end')
+    .at(-1)
+  if (completed === undefined) return null
+  const texts = page.events.flatMap(({ event }) => {
+    if (event.seq <= afterSeq || event.type !== 'assistant/message') return []
+    const content = event.data?.message?.content
+    if (!Array.isArray(content)) return []
+    return content.filter(block => block?.type === 'text' && typeof block.text === 'string').map(block => block.text)
+  })
+  return { event: completed, assistant_text: texts.at(-1) ?? '' }
+}
+
+class BridgeController {
+  constructor(ctx, broker, config) {
+    this.ctx = ctx
+    this.broker = broker
+    this.config = config
+    this.operation = null
+    this.interactions = new Map()
+    this.eventsAbort = new AbortController()
+    this.eventsTask = this.pumpEvents()
+  }
+
+  async pumpEvents() {
+    try {
+      const stream = this.ctx.apiProxy.events.mux({
+        rpcId: rpcId('bridge-events'),
+        payload: {},
+      }, this.eventsAbort.signal)
+      for await (const envelope of stream) {
+        const frame = envelope.payload
+        if (frame.type === 'approval/requested' || frame.type === 'question/requested') {
+          this.interactions.set(envelope.rpcId, {
+            interaction_id: envelope.rpcId,
+            ...frame,
+          })
+        } else if (frame.type === 'approval/resolved') {
+          for (const [id, item] of this.interactions) {
+            if (item.type === 'approval/requested' && item.approvalId === frame.approvalId) this.interactions.delete(id)
+          }
+        } else if (frame.type === 'question/resolved') {
+          this.interactions.delete(frame.questionRpcId)
+        }
+      }
+    } catch (error) {
+      if (!this.eventsAbort.signal.aborted) process.stderr.write(`dsh-sol-bridge: event stream failed: ${asError(error).message}\n`)
+    }
+  }
+
+  interactionSnapshot() {
+    return [...this.interactions.values()]
+  }
+
+  async workspace() {
+    return unwrap(this.ctx.apiProxy.workspace.create({
+      rpcId: rpcId('bridge-workspace'),
+      payload: { path: this.config.workspaceRoot },
+    }), 'workspace.create')
+  }
+
+  async sessions() {
+    const workspaceValue = await this.workspace()
+    const listed = await unwrap(this.ctx.apiProxy.sessions.list({
+      rpcId: rpcId('bridge-sessions'),
+      payload: {},
+    }), 'session.list')
+    const allowed = new Set(workspaceValue.workspace.sessionIds)
+    return {
+      workspace_id: workspaceValue.workspace.workspaceId,
+      workspace_title: workspaceValue.workspace.title,
+      sessions: listed.items.filter(item => allowed.has(item.sessionId)),
+    }
+  }
+
+  async start(prompt, agentPreset, requestedSessionId) {
+    if (this.operation?.status === 'running') throw new Error('another root Harness turn is already running')
+    const workspaceValue = await this.workspace()
+    let created
+    if (requestedSessionId === undefined) {
+      created = await unwrap(this.ctx.apiProxy.sessions.create({
+        rpcId: rpcId('bridge-session'),
+        payload: {
+          workspaceId: workspaceValue.workspace.workspaceId,
+          ...(agentPreset === undefined ? {} : { agentPreset }),
+        },
+      }), 'session.create')
+    } else {
+      if (agentPreset !== undefined) throw new Error('agent_preset is valid only when creating a new session')
+      if (!workspaceValue.workspace.sessionIds.includes(requestedSessionId)) {
+        throw new Error('session_id is not registered under the fixed bridge workspace')
+      }
+      created = { sessionId: requestedSessionId }
+    }
+    await unwrap(this.ctx.apiProxy.sessions.selectModel({
+      rpcId: rpcId('bridge-model'),
+      payload: { sessionId: created.sessionId, provider: this.config.provider, model: this.config.model },
+    }), 'session.selectModel')
+    const before = await history(this.ctx, created.sessionId)
+    this.operation = {
+      id: randomUUID(),
+      rootSessionId: created.sessionId,
+      workspaceId: workspaceValue.workspace.workspaceId,
+      afterSeq: latestSeq(before),
+      status: 'running',
+      startedAt: Date.now(),
+    }
+    await unwrap(this.ctx.apiProxy.sessions.prompt({
+      rpcId: rpcId('bridge-prompt'),
+      payload: {
+        sessionId: created.sessionId,
+        mode: 'queue',
+        content: [{ type: 'text', text: prompt }],
+        clientTimeZone: 'Asia/Saigon',
+      },
+    }), 'session.prompt')
+    return this.waitForOutcome(this.config.waitMs)
+  }
+
+  async submit(requestId, response, waitMs) {
+    this.broker.submit(requestId, response)
+    return this.waitForOutcome(waitMs)
+  }
+
+  async waitForOutcome(waitMs) {
+    const operation = this.operation
+    if (operation === null) return { status: 'idle', model_requests: this.broker.snapshot() }
+    const deadline = Date.now() + waitMs
+    while (Date.now() < deadline) {
+      const pending = this.broker.snapshot()
+      if (pending.length > 0) {
+        return {
+          status: 'model_input_required',
+          operation_id: operation.id,
+          root_session_id: operation.rootSessionId,
+          model_requests: pending,
+          instruction: 'Act as GPT-5.6 Sol for each exact model request. Return Harness tool calls as tool_call blocks; do not execute those tools outside Harness. Submit every pending request, then continue until status is completed.',
+        }
+      }
+      const interactions = this.interactionSnapshot()
+      if (interactions.length > 0) {
+        return {
+          status: 'user_input_required',
+          operation_id: operation.id,
+          root_session_id: operation.rootSessionId,
+          interactions,
+          instruction: 'Relay questions to the user. Allow an approval only after the user explicitly consents to that exact operation; otherwise reject it. Call harness_respond, then continue.',
+        }
+      }
+      const page = await history(this.ctx, operation.rootSessionId)
+      const done = turnCompletion(page, operation.afterSeq)
+      if (done !== null) {
+        operation.status = 'completed'
+        return {
+          status: 'completed',
+          operation_id: operation.id,
+          root_session_id: operation.rootSessionId,
+          completion: done,
+        }
+      }
+      await delay(150)
+    }
+    return {
+      status: 'running',
+      operation_id: operation.id,
+      root_session_id: operation.rootSessionId,
+      model_requests: this.broker.snapshot(),
+      instruction: 'Call harness_status or harness_continue again. Harness is still executing its own tools.',
+    }
+  }
+
+  async status(waitMs) {
+    return this.waitForOutcome(waitMs)
+  }
+
+  async respond(interactionId, approvalOutcome, answers, waitMs) {
+    const interaction = this.interactions.get(interactionId)
+    if (interaction === undefined) throw new Error(`interaction ${interactionId} is not pending`)
+    let value
+    if (interaction.type === 'approval/requested') {
+      if (approvalOutcome === undefined) throw new Error('approval_outcome is required for an approval')
+      if (answers !== undefined) throw new Error('answers are valid only for a question')
+      value = {
+        sessionId: interaction.sessionId,
+        approvalId: interaction.approvalId,
+        outcome: approvalOutcome,
+      }
+    } else {
+      if (answers === undefined) throw new Error('answers are required for a question')
+      if (approvalOutcome !== undefined) throw new Error('approval_outcome is valid only for an approval')
+      value = { sessionId: interaction.sessionId, answer: { answers } }
+    }
+    const receipt = await this.ctx.apiProxy.respond({
+      type: 'client-response',
+      rpcId: interactionId,
+      result: { ok: true, value },
+    })
+    if (!receipt.accepted) throw new Error(`Harness rejected the response: ${receipt.reason}`)
+    this.interactions.delete(interactionId)
+    return this.waitForOutcome(waitMs)
+  }
+
+  async cancel() {
+    const operation = this.operation
+    if (operation === null || operation.status !== 'running') return { cancelled: false, status: operation?.status ?? 'idle' }
+    await unwrap(this.ctx.apiProxy.sessions.cancel({
+      rpcId: rpcId('bridge-cancel'),
+      payload: { sessionId: operation.rootSessionId },
+    }), 'session.cancel')
+    operation.status = 'cancelled'
+    return { cancelled: true, root_session_id: operation.rootSessionId }
+  }
+
+  async dispose() {
+    this.eventsAbort.abort()
+    await this.eventsTask
+  }
+}
+
+const modelBlockSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('text'), text: z.string() }),
+  z.object({ type: z.literal('reasoning'), text: z.string() }),
+  z.object({
+    type: z.literal('tool_call'),
+    id: z.string().min(1),
+    name: z.string().min(1),
+    arguments: z.union([z.string(), z.record(z.string(), z.unknown())]),
+  }),
+])
+
+function toolResult(value) {
+  return { content: [{ type: 'text', text: JSON.stringify(value) }] }
+}
+
+function errorResult(error) {
+  return { content: [{ type: 'text', text: asError(error).message }], isError: true }
+}
+
+function configureMcp(server, controller, config) {
+  server.registerTool('harness_start', {
+    title: 'Start a full Shiro coding task',
+    description: `Starts one Shiro task in the fixed sandbox ${config.workspaceRoot}. This is the entry point. The returned model_requests are exact engine LLM calls: act as GPT-5.6 Sol and answer them with harness_continue. All filesystem, PowerShell, tests, Git, skills, plans, goals, subagents, workflows, approvals, persistence, and sandboxing stay inside Shiro's DeepSeek Harness engine.`,
+    inputSchema: {
+      prompt: z.string().min(1).describe('The user task for Shiro.'),
+      agent_preset: z.string().min(1).optional().describe('Optional Harness preset; omit to use the full standard coding-agent preset.'),
+      session_id: z.string().min(1).optional().describe('Optional durable Harness session id returned by harness_sessions. Omit to create a new session.'),
+    },
+  }, async ({ prompt, agent_preset: agentPreset, session_id: sessionId }) => {
+    try { return toolResult(await controller.start(prompt, agentPreset, sessionId)) } catch (error) { return errorResult(error) }
+  })
+
+  server.registerTool('harness_sessions', {
+    title: 'List resumable Shiro sessions',
+    description: 'Lists only durable sessions registered under the bridge\'s fixed project root. Pass one returned session id to harness_start to continue that exact Harness conversation.',
+    inputSchema: {},
+  }, async () => {
+    try { return toolResult(await controller.sessions()) } catch (error) { return errorResult(error) }
+  })
+
+  server.registerTool('harness_continue', {
+    title: 'Return one Sol model decision to Shiro',
+    description: 'Answers exactly one pending Harness model request. Use only tool names and JSON arguments from that request. If tools are needed, return tool_call blocks so Harness executes them under its own sandbox; never simulate tool results. Keep calling this tool for every returned model request until status is completed.',
+    inputSchema: {
+      request_id: z.string().uuid(),
+      blocks: z.array(modelBlockSchema).min(1),
+      finish_reason: z.enum(['stop', 'tool-calls', 'max-tokens']).optional(),
+      usage: z.object({ inputTokens: z.number().int().nonnegative(), outputTokens: z.number().int().nonnegative() }).optional(),
+      wait_ms: z.number().int().min(100).max(MAX_WAIT_MS).optional(),
+    },
+  }, async ({ request_id: requestId, blocks, finish_reason: finishReasonValue, usage, wait_ms: waitMs }) => {
+    try {
+      return toolResult(await controller.submit(requestId, {
+        blocks,
+        ...(finishReasonValue === undefined ? {} : { finishReason: finishReasonValue }),
+        ...(usage === undefined ? {} : { usage }),
+      }, waitMs ?? config.waitMs))
+    } catch (error) { return errorResult(error) }
+  })
+
+  server.registerTool('harness_status', {
+    title: 'Inspect the active Shiro task',
+    description: 'Returns pending model requests, running tool state, or final completion for the active Harness turn.',
+    inputSchema: { wait_ms: z.number().int().min(0).max(MAX_WAIT_MS).optional() },
+  }, async ({ wait_ms: waitMs }) => {
+    try { return toolResult(await controller.status(waitMs ?? 0)) } catch (error) { return errorResult(error) }
+  })
+
+  server.registerTool('harness_respond', {
+    title: 'Answer a Harness question or approval request',
+    description: 'Answers one pending Harness interaction returned with status user_input_required. Relay questions to the user. For approvals, allowed-once transmits consent to run the exact wider operation and must be used only after explicit user confirmation; use rejected otherwise.',
+    inputSchema: {
+      interaction_id: z.string().min(1),
+      approval_outcome: z.enum(['allowed-once', 'rejected']).optional(),
+      answers: z.array(z.object({
+        id: z.string().min(1),
+        selected: z.array(z.string()),
+        custom: z.string().optional(),
+      })).optional(),
+      wait_ms: z.number().int().min(100).max(MAX_WAIT_MS).optional(),
+    },
+  }, async ({ interaction_id: interactionId, approval_outcome: approvalOutcome, answers, wait_ms: waitMs }) => {
+    try { return toolResult(await controller.respond(interactionId, approvalOutcome, answers, waitMs ?? config.waitMs)) } catch (error) { return errorResult(error) }
+  })
+
+  server.registerTool('harness_cancel', {
+    title: 'Cancel the active Shiro turn',
+    description: 'Cancels only the active Harness turn. It does not delete files, sessions, or workspaces.',
+    inputSchema: {},
+  }, async () => {
+    try { return toolResult(await controller.cancel()) } catch (error) { return errorResult(error) }
+  })
+}
+
+async function handleMcpRequest(req, res, controller, config) {
+  const authorization = req.headers.authorization ?? ''
+  if (!safeEqual(authorization, `Bearer ${config.token}`)) {
+    res.writeHead(401, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ error: 'unauthorized' }))
+    return
+  }
+  const server = new McpServer(
+    { name: 'shiro-harness-bridge', version: '0.1.0' },
+    {
+      capabilities: { tools: {} },
+      instructions: 'Use harness_start, then act as the model for every returned model_requests item with harness_continue. Shiro executes all coding tools inside its fixed project root. Continue until completed.',
+    },
+  )
+  configureMcp(server, controller, config)
+  const transport = new StreamableHTTPServerTransport({})
+  res.on('close', () => { void transport.close(); void server.close() })
+  await server.connect(transport)
+  await transport.handleRequest(req, res)
+}
+
+function startHttpServer(ctx, broker, config) {
+  const controller = new BridgeController(ctx, broker, config)
+  const http = createServer((req, res) => {
+    const url = new URL(req.url ?? '/', 'http://127.0.0.1')
+    if (url.pathname === '/health') {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, provider: config.provider, model: config.model, workspaceRoot: config.workspaceRoot }))
+      return
+    }
+    if (url.pathname !== '/mcp') {
+      res.writeHead(404).end()
+      return
+    }
+    void handleMcpRequest(req, res, controller, config).catch(error => {
+      if (!res.headersSent) res.writeHead(500, { 'content-type': 'text/plain' })
+      res.end(asError(error).message)
+    })
+  })
+  http.listen(config.port, '127.0.0.1')
+  http.on('listening', () => {
+    process.stderr.write(`shiro-bridge: http://127.0.0.1:${config.port}/mcp (workspace ${config.workspaceRoot})\n`)
+  })
+  return { http, controller }
+}
+
+export const name = 'llm-shiro-harness-bridge'
+export const inject = ['llm', 'apiProxy']
+
+export function apply(ctx, rawConfig = {}) {
+  const config = normalizeConfig(rawConfig)
+  const broker = new BridgeBroker()
+  const adapter = new ChatGptSolAdapter(broker, config.provider, config.model)
+  ctx.llm.registerAdapter([config.provider], adapter)
+  ctx.effect(() => {
+    const runtime = startHttpServer(ctx, broker, config)
+    return async () => {
+      await runtime.controller.dispose()
+      await new Promise(resolveClose => { runtime.http.close(() => resolveClose()) })
+    }
+  }, 'shiro-harness-bridge.serve')
+}
