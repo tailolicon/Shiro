@@ -45,6 +45,7 @@ $Profile = [ordered]@{
     name = 'shiro-profile-web'
     private = $true
     dependencies = [ordered]@{
+        '@deepseek-ai/dsh-tools' = "link:$(($EngineRoot -replace '\\', '/'))/packages/core/tools"
         '@shiro-ai/harness-bridge' = "link:$BridgeLink"
     }
     dsh = [ordered]@{
@@ -82,6 +83,8 @@ try {
         try { & pnpm install --frozen-lockfile=false } finally { Pop-Location }
         if ($LASTEXITCODE -ne 0) { throw 'Bridge dependency installation failed.' }
     }
+
+    & (Join-Path $PSScriptRoot 'Setup-Shiro-Runner.ps1') -RepoRoot $RepoRoot
 
     Write-Host 'Linking the Shiro runtime profile...'
     Push-Location $ProfileRoot

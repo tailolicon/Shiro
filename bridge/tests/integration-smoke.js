@@ -73,11 +73,20 @@ try {
   }])
 
   request = requestFrom(outcome)
+  assertTool(request, 'sandbox_exec')
+  outcome = await submit(client, outcome, [{
+    type: 'tool_call', id: 'bridge-call-sandbox', name: 'sandbox_exec', arguments: {
+      command: 'npm test',
+      description: 'Run tests in isolated container',
+    },
+  }])
+
+  request = requestFrom(outcome)
   assertTool(request, 'pwsh')
   outcome = await submit(client, outcome, [{
     type: 'tool_call', id: 'bridge-call-pwsh', name: 'pwsh', arguments: {
-      command: 'Get-Content bridge-smoke.txt; npm test; git status --short',
-      description: 'Verify file tests and Git status',
+      command: 'Get-Content bridge-smoke.txt; git status --short',
+      description: 'Verify file and Git status',
     },
   }])
 

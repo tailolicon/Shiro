@@ -4,7 +4,7 @@
   "private": true,
   "description": "Local ChatGPT Sol coding-agent bridge powered by DeepSeek Harness",
   "scripts": {
-    "test": "pnpm --dir bridge test",
+    "test": "node --test bridge/tests/*.test.js",
     "build:desktop": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/Build-Desktop.ps1",
     "start": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/Start-Shiro.ps1"
   }

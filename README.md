@@ -36,6 +36,8 @@ PowerShell -ExecutionPolicy Bypass -File .\scripts\Start-Shiro.ps1 -Rebuild
 - Token, session và cấu hình runtime nằm tại thư mục anh em `E:\Project\.ShiroRuntime`, ngoài project root.
 - Không có lệnh tự động push hoặc merge. Git vẫn hoạt động cục bộ trong project root.
 - Secure MCP Tunnel là kết nối outbound; MCP cục bộ không được mở trực tiếp ra LAN/Internet.
+- Test runner và build dùng `sandbox_exec`: chỉ repo Shiro được mount vào một container không có mạng, không có quyền mở rộng và tự hủy sau mỗi lệnh. Điều này tránh giới hạn tiến trình con của sandbox Windows mà không mở quyền ra toàn máy.
+- `Start-Shiro.cmd` tự khởi động Docker Desktop khi cần, dựng runner và chuẩn bị dependency Linux riêng trong Docker volumes; nó không ghi đè `node_modules` của Windows.
 
 ## Nguồn mở
 

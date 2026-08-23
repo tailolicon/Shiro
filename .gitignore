@@ -1,5 +1,6 @@
 # Dependencies and generated engine output
 **/node_modules/
+.pnpm-store/
 engine/.shiro-build-ready
 engine/.cache/
 engine/**/dist/

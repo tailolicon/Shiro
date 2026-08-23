@@ -5,14 +5,25 @@
   "type": "module",
   "main": "src/index.js",
   "exports": {
-    ".": "./src/index.js"
+    ".": "./src/index.js",
+    "./container-tool": "./src/container-tool.js"
   },
   "files": [
     "src/index.js",
+    "src/container-tool.js",
+    "src/container-path.js",
     "cordis.patch.yml"
   ],
   "scripts": {
     "test": "node --test tests/*.test.js"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    }
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",

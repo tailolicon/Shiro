@@ -19,6 +19,9 @@ if ($Process.CommandLine -notlike '*Run-Shiro-Backend.ps1*') {
     throw "Refusing to stop PID $ProcessId because it is not the registered Shiro backend."
 }
 
-Stop-Process -Id $ProcessId
+& taskkill.exe /PID $ProcessId /T /F | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to stop the registered Shiro process tree rooted at PID $ProcessId."
+}
 Remove-Item -LiteralPath $PidFile -Force
 Write-Host 'Shiro backend stopped.'
