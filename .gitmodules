@@ -1,0 +1,9 @@
+[submodule "plugins/subagent-monitor"]
+	path = plugins/subagent-monitor
+	url = https://github.com/Mombrane/dsh-subagent-monitor.git
+[submodule "plugins/auto-continue"]
+	path = plugins/auto-continue
+	url = https://github.com/HsiangNianian/dsh-auto-continue.git
+[submodule "research/awesome-dsh-plugin"]
+	path = research/awesome-dsh-plugin
+	url = https://github.com/awesome-dsh-plugin/awesome-dsh-plugin.git

@@ -51,6 +51,8 @@ try {
   await call(client, 'harness_cancel', {})
   let outcome = await call(client, 'harness_start', {
     prompt: 'Full Harness smoke: create and inspect a goal, pause it, run a foreground subagent, then run a two-child workflow. Do not modify files.',
+    speed_profile: 'balanced',
+    reasoning_effort: 'standard',
   })
   const rootSessionId = outcome.root_session_id
 

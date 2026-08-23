@@ -1,8 +1,11 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
+import { rm } from 'node:fs/promises'
+import { fileURLToPath } from 'node:url'
 
 const endpoint = process.env.SHIRO_MCP_URL ?? 'http://127.0.0.1:23157/mcp'
 const token = process.env.SHIRO_BRIDGE_TOKEN ?? 'local-shiro-integration-smoke'
+const smokeFile = fileURLToPath(new URL('../../bridge-smoke.txt', import.meta.url))
 
 function decoded(result) {
   if (result.isError) throw new Error(result.content?.[0]?.text ?? 'MCP tool failed')
@@ -49,10 +52,19 @@ try {
 
   let outcome = await call(client, 'harness_start', {
     prompt: 'Integration smoke: use Harness tools to read package.json, create bridge-smoke.txt, edit it to BRIDGE_WRITE_OK, run npm test and git status, then attempt one write outside the workspace to prove it is denied. Do not push or merge.',
+    speed_profile: 'deep',
+    reasoning_effort: 'max',
   })
   process.stdout.write(`start -> ${outcome.status}; session ${outcome.root_session_id}\n`)
 
   let request = requestFrom(outcome)
+  if (request.generation?.speed_profile !== 'deep' || request.generation?.reasoning_effort !== 'max') {
+    throw new Error(`requested profile was not relayed: ${JSON.stringify(request.generation)}`)
+  }
+  if (outcome.requested_profile?.speed !== 'deep' || outcome.requested_profile?.effort !== 'max') {
+    throw new Error(`requested profile was not reported: ${JSON.stringify(outcome.requested_profile)}`)
+  }
+  process.stdout.write('profile -> speed=deep; effort=max\n')
   assertTool(request, 'read')
   outcome = await submit(client, outcome, [{
     type: 'tool_call', id: 'bridge-call-read', name: 'read', arguments: { file_path: 'package.json' },
@@ -106,4 +118,5 @@ try {
   process.stdout.write(`${outcome.completion.assistant_text}\n`)
 } finally {
   await client.close()
+  await rm(smokeFile, { force: true })
 }

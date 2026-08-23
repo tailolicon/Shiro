@@ -13,6 +13,9 @@ $ProjectRoot = (Resolve-Path -LiteralPath $ProjectRoot).Path
 $EngineRoot = Join-Path $RepoRoot 'engine'
 $BridgeRoot = Join-Path $RepoRoot 'bridge'
 $DesktopRoot = Join-Path $RepoRoot 'desktop'
+$AutoContinueRoot = Join-Path $RepoRoot 'plugins\auto-continue'
+$SubagentMonitorRoot = Join-Path $RepoRoot 'plugins\subagent-monitor'
+$PluginCatalogRoot = Join-Path $RepoRoot 'research\awesome-dsh-plugin'
 $RuntimeRoot = Join-Path (Split-Path -Parent $RepoRoot) '.ShiroRuntime'
 $DshHome = Join-Path $RuntimeRoot 'dsh-home'
 $ProfileRoot = Join-Path $DshHome 'profiles\web'
@@ -21,9 +24,28 @@ $LogRoot = Join-Path $RuntimeRoot 'logs'
 $TokenFile = Join-Path $StateRoot 'bridge-token.txt'
 $BuildMarker = Join-Path $EngineRoot '.shiro-build-ready'
 
-foreach ($RequiredPath in @($EngineRoot, $BridgeRoot, $DesktopRoot, $ProjectRoot)) {
+$AutoContinueManifest = Join-Path $AutoContinueRoot 'package.json'
+$SubagentMonitorManifest = Join-Path $SubagentMonitorRoot 'package.json'
+$PluginCatalogManifest = Join-Path $PluginCatalogRoot 'package.json'
+$MissingPlugin = -not (Test-Path -LiteralPath $AutoContinueManifest -PathType Leaf) `
+    -or -not (Test-Path -LiteralPath $SubagentMonitorManifest -PathType Leaf) `
+    -or -not (Test-Path -LiteralPath $PluginCatalogManifest -PathType Leaf)
+if ($MissingPlugin -and (Test-Path -LiteralPath (Join-Path $RepoRoot '.gitmodules') -PathType Leaf)) {
+    $Git = Get-Command git -ErrorAction SilentlyContinue
+    if ($null -eq $Git) { throw 'Git is required to initialize Shiro plugin submodules.' }
+    Write-Host 'Initializing Shiro plugin submodules at their pinned revisions...'
+    & $Git.Source -C $RepoRoot submodule update --init --recursive
+    if ($LASTEXITCODE -ne 0) { throw 'Shiro plugin submodule initialization failed.' }
+}
+
+foreach ($RequiredPath in @($EngineRoot, $BridgeRoot, $DesktopRoot, $AutoContinueRoot, $SubagentMonitorRoot, $PluginCatalogRoot, $ProjectRoot)) {
     if (-not (Test-Path -LiteralPath $RequiredPath -PathType Container)) {
         throw "Required Shiro directory is missing: $RequiredPath"
+    }
+}
+foreach ($RequiredFile in @($AutoContinueManifest, $SubagentMonitorManifest, $PluginCatalogManifest)) {
+    if (-not (Test-Path -LiteralPath $RequiredFile -PathType Leaf)) {
+        throw "Required pinned Shiro plugin manifest is missing: $RequiredFile"
     }
 }
 
@@ -41,19 +63,40 @@ if (-not (Test-Path -LiteralPath $TokenFile -PathType Leaf)) {
 }
 
 $BridgeLink = ($BridgeRoot -replace '\\', '/')
+$AutoContinueLink = ($AutoContinueRoot -replace '\\', '/')
+$SubagentMonitorLink = ($SubagentMonitorRoot -replace '\\', '/')
+$EngineLink = ($EngineRoot -replace '\\', '/')
 $Profile = [ordered]@{
     name = 'shiro-profile-web'
     private = $true
     dependencies = [ordered]@{
-        '@deepseek-ai/dsh-tools' = "link:$(($EngineRoot -replace '\\', '/'))/packages/core/tools"
+        '@deepseek-ai/cordis' = "link:$EngineLink/vendor/cordis"
+        '@deepseek-ai/schemastery' = "link:$EngineLink/vendor/schemastery"
+        '@deepseek-ai/dsh-client-connection' = "link:$EngineLink/packages/client/connection"
+        '@deepseek-ai/dsh-client-locale' = "link:$EngineLink/packages/client/locale"
+        '@deepseek-ai/dsh-client-runtime' = "link:$EngineLink/packages/client/runtime"
+        '@deepseek-ai/dsh-client-ui-layout' = "link:$EngineLink/packages/client/ui-layout"
+        '@deepseek-ai/dsh-client-ui-settings' = "link:$EngineLink/packages/client/ui-settings"
+        '@deepseek-ai/dsh-client-ui-settings-plugins' = "link:$EngineLink/packages/client/ui-settings-plugins"
+        '@deepseek-ai/dsh-client-ui-sidebar' = "link:$EngineLink/packages/client/ui-sidebar"
+        '@deepseek-ai/dsh-client-ui-slots' = "link:$EngineLink/packages/client/ui-slots"
+        '@deepseek-ai/dsh-host-webserver' = "link:$EngineLink/packages/host/webserver"
+        '@deepseek-ai/dsh-session' = "link:$EngineLink/packages/core/session"
+        '@deepseek-ai/dsh-settings' = "link:$EngineLink/packages/settings/settings"
+        '@deepseek-ai/dsh-subagent' = "link:$EngineLink/packages/subagent/subagent"
+        '@deepseek-ai/dsh-tools' = "link:$EngineLink/packages/core/tools"
         '@shiro-ai/harness-bridge' = "link:$BridgeLink"
+        'dsh-client-auto-continue' = "file:$AutoContinueLink"
+        '@leetoners/dsh-ui-subagent-monitor' = "file:$SubagentMonitorLink"
     }
     dsh = [ordered]@{
         profile = [ordered]@{
             bundles = @(
                 '@deepseek-ai/dsh-base',
                 '@deepseek-ai/dsh-web-app',
-                '@shiro-ai/harness-bridge'
+                '@shiro-ai/harness-bridge',
+                'dsh-client-auto-continue',
+                '@leetoners/dsh-ui-subagent-monitor'
             )
         }
     }

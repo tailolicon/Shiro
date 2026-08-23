@@ -39,6 +39,8 @@ try {
   let outcome = await call(client, 'harness_start', {
     session_id: resumed.sessionId,
     prompt: 'Resume and interaction smoke: ask one question, then test and reject one wider write approval. Do not create the outside file.',
+    speed_profile: 'balanced',
+    reasoning_effort: 'standard',
   })
   const first = oneRequest(outcome)
   if (first.messages.length < 5) throw new Error('resumed model request did not carry durable prior history')

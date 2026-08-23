@@ -4,11 +4,26 @@ import { resolve } from 'node:path'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { z } from 'zod'
+import { redactSecrets } from './redact.js'
 
 const DEFAULT_PROVIDER = 'shiro-sol'
 const DEFAULT_MODEL = 'gpt-5.6-sol'
 const DEFAULT_PORT = 23157
 const MAX_WAIT_MS = 45_000
+const AUTO_CONTINUE_GRACE_MS = 5_000
+
+export const REASONING_EFFORTS = Object.freeze([
+  { id: 'light', name: 'Light', description: 'Ưu tiên phản hồi nhanh cho việc đơn giản.' },
+  { id: 'standard', name: 'Standard', description: 'Cân bằng tốc độ và độ kỹ lưỡng.' },
+  { id: 'high', name: 'High', description: 'Phân tích kỹ hơn cho thay đổi phức tạp.' },
+  { id: 'max', name: 'Max', description: 'Mức kiểm tra sâu nhất cho việc rủi ro cao.' },
+])
+
+export const SPEED_PROFILES = Object.freeze([
+  { id: 'fast', suffix: '-fast', name: 'Fast', description: 'Vòng lặp ngắn, ưu tiên phản hồi nhanh.', defaultEffort: 'light' },
+  { id: 'balanced', suffix: '', name: 'Balanced', description: 'Cân bằng tốc độ, chất lượng và chi phí ngữ cảnh.', defaultEffort: 'standard' },
+  { id: 'deep', suffix: '-deep', name: 'Deep', description: 'Ưu tiên độ kỹ lưỡng, xác minh và audit.', defaultEffort: 'high' },
+])
 
 const delay = ms => new Promise(resolveDelay => setTimeout(resolveDelay, ms))
 
@@ -42,21 +57,59 @@ function normalizeConfig(config = {}) {
   }
 }
 
+function baseModelId(model) {
+  for (const profile of SPEED_PROFILES) {
+    if (profile.suffix !== '' && model.endsWith(profile.suffix)) return model.slice(0, -profile.suffix.length)
+  }
+  return model
+}
+
+function modelIdForSpeed(model, speedProfile) {
+  const profile = SPEED_PROFILES.find(candidate => candidate.id === speedProfile)
+  if (profile === undefined) throw new Error(`unsupported speed profile: ${speedProfile}`)
+  return `${baseModelId(model)}${profile.suffix}`
+}
+
+function profileForModel(model, configuredModel = DEFAULT_MODEL) {
+  const base = baseModelId(configuredModel)
+  const profile = SPEED_PROFILES.find(candidate => `${base}${candidate.suffix}` === model)
+  if (profile === undefined) throw new Error(`unsupported Shiro model: ${model}`)
+  return profile
+}
+
+function modelInfo(provider, model, configuredModel = DEFAULT_MODEL) {
+  const profile = profileForModel(model, configuredModel)
+  return {
+    provider,
+    id: model,
+    name: `GPT-5.6 Sol · ${profile.name}`,
+    description: profile.description,
+    inputModalities: ['text', 'image'],
+    reasoning: {
+      efforts: REASONING_EFFORTS,
+      defaultEffort: profile.defaultEffort,
+    },
+  }
+}
+
 function publicRequest(id, options) {
+  const speedProfile = SPEED_PROFILES.find(profile => options.model.endsWith(profile.suffix) && profile.suffix !== '')
+    ?? SPEED_PROFILES.find(profile => profile.id === 'balanced')
   return {
     request_id: id,
     session_id: options.sessionId ?? null,
     purpose: options.purpose ?? 'conversation',
     provider: options.provider,
     model: options.model,
-    system: options.system ?? '',
-    messages: options.messages,
-    tools: options.tools ?? [],
+    system: redactSecrets(options.system ?? ''),
+    messages: redactSecrets(options.messages),
+    tools: redactSecrets(options.tools ?? []),
     generation: {
       temperature: options.temperature ?? null,
       max_tokens: options.maxTokens ?? null,
       stop: options.stop ?? [],
       reasoning_effort: options.reasoningEffort ?? null,
+      speed_profile: speedProfile.id,
     },
   }
 }
@@ -159,11 +212,11 @@ export class ChatGptSolAdapter {
   }
 
   async listModels(provider) {
-    return [{ provider, id: this.model, name: 'GPT-5.6 Sol (ChatGPT Web)', inputModalities: ['text', 'image'] }]
+    return SPEED_PROFILES.map(profile => modelInfo(provider, modelIdForSpeed(this.model, profile.id), this.model))
   }
 
   async resolveModel(provider, model) {
-    return { provider, id: model, name: 'GPT-5.6 Sol (ChatGPT Web)', inputModalities: ['text', 'image'] }
+    return modelInfo(provider, model, this.model)
   }
 
   async prepareCall(provider, model, signal) {
@@ -232,19 +285,31 @@ function latestSeq(page) {
   return page.events.reduce((max, entry) => Math.max(max, entry.event.seq), -1)
 }
 
-function turnCompletion(page, afterSeq) {
+export function turnCompletion(page, afterSeq) {
   const completed = page.events
     .map(entry => entry.event)
     .filter(event => event.seq > afterSeq && event.type === 'turn/end')
     .at(-1)
   if (completed === undefined) return null
+  const laterTurnStarted = page.events.some(({ event }) => (
+    event.seq > completed.seq && event.type === 'turn/start'
+  ))
+  if (laterTurnStarted) return null
   const texts = page.events.flatMap(({ event }) => {
     if (event.seq <= afterSeq || event.type !== 'assistant/message') return []
     const content = event.data?.message?.content
     if (!Array.isArray(content)) return []
     return content.filter(block => block?.type === 'text' && typeof block.text === 'string').map(block => block.text)
   })
-  return { event: completed, assistant_text: texts.at(-1) ?? '' }
+  return {
+    event: completed,
+    assistant_text: texts.at(-1) ?? '',
+    reason: completed.data?.reason ?? { kind: 'completed' },
+  }
+}
+
+function awaitsAutoContinue(reason) {
+  return reason?.kind === 'max-tokens' || reason?.kind === 'error' || reason?.kind === 'interrupted'
 }
 
 class BridgeController {
@@ -309,7 +374,7 @@ class BridgeController {
     }
   }
 
-  async start(prompt, agentPreset, requestedSessionId) {
+  async start(prompt, agentPreset, requestedSessionId, speedProfile = 'balanced', reasoningEffort) {
     if (this.operation?.status === 'running') throw new Error('another root Harness turn is already running')
     const workspaceValue = await this.workspace()
     let created
@@ -328,9 +393,17 @@ class BridgeController {
       }
       created = { sessionId: requestedSessionId }
     }
+    const selectedModel = modelIdForSpeed(this.config.model, speedProfile)
+    const selectedProfile = profileForModel(selectedModel, this.config.model)
+    const selectedEffort = reasoningEffort ?? selectedProfile.defaultEffort
     await unwrap(this.ctx.apiProxy.sessions.selectModel({
       rpcId: rpcId('bridge-model'),
-      payload: { sessionId: created.sessionId, provider: this.config.provider, model: this.config.model },
+      payload: {
+        sessionId: created.sessionId,
+        provider: this.config.provider,
+        model: selectedModel,
+        reasoningEffort: selectedEffort,
+      },
     }), 'session.selectModel')
     const before = await history(this.ctx, created.sessionId)
     this.operation = {
@@ -340,6 +413,9 @@ class BridgeController {
       afterSeq: latestSeq(before),
       status: 'running',
       startedAt: Date.now(),
+      speedProfile: selectedProfile.id,
+      reasoningEffort: selectedEffort,
+      recoverableEnd: null,
     }
     await unwrap(this.ctx.apiProxy.sessions.prompt({
       rpcId: rpcId('bridge-prompt'),
@@ -370,7 +446,11 @@ class BridgeController {
           operation_id: operation.id,
           root_session_id: operation.rootSessionId,
           model_requests: pending,
-          instruction: 'Act as GPT-5.6 Sol for each exact model request. Return Harness tool calls as tool_call blocks; do not execute those tools outside Harness. Submit every pending request, then continue until status is completed.',
+          requested_profile: {
+            speed: operation.speedProfile,
+            effort: operation.reasoningEffort,
+          },
+          instruction: `Act as GPT-5.6 Sol with requested speed=${operation.speedProfile} and effort=${operation.reasoningEffort} for each exact model request. Return Harness tool calls as tool_call blocks; do not execute those tools outside Harness. Submit every pending request, then continue until status is completed.`,
         }
       }
       const interactions = this.interactionSnapshot()
@@ -386,6 +466,15 @@ class BridgeController {
       const page = await history(this.ctx, operation.rootSessionId)
       const done = turnCompletion(page, operation.afterSeq)
       if (done !== null) {
+        if (awaitsAutoContinue(done.reason)) {
+          if (operation.recoverableEnd?.seq !== done.event.seq) {
+            operation.recoverableEnd = { seq: done.event.seq, observedAt: Date.now() }
+          }
+          if (Date.now() - operation.recoverableEnd.observedAt < AUTO_CONTINUE_GRACE_MS) {
+            await delay(150)
+            continue
+          }
+        }
         operation.status = 'completed'
         return {
           status: 'completed',
@@ -473,6 +562,17 @@ function errorResult(error) {
 }
 
 function configureMcp(server, controller, config) {
+  server.registerTool('harness_profiles', {
+    title: 'List exact Shiro speed and effort profiles',
+    description: 'Returns the exact supported speed profiles, effort levels, defaults, and the limitation that ChatGPT Web compute settings remain controlled by the ChatGPT model selector. Use this when the user asks which parameters are active.',
+    inputSchema: {},
+  }, async () => toolResult({
+    speed_profiles: SPEED_PROFILES.map(({ id, name, description, defaultEffort }) => ({ id, name, description, default_effort: defaultEffort })),
+    reasoning_efforts: REASONING_EFFORTS,
+    default: { speed_profile: 'balanced', reasoning_effort: 'standard' },
+    scope: 'These values select and expose Shiro operating policy. The ChatGPT Web model and compute entitlement are still selected by ChatGPT itself.',
+  }))
+
   server.registerTool('harness_start', {
     title: 'Start a full Shiro coding task',
     description: `Starts one Shiro task in the fixed sandbox ${config.workspaceRoot}. This is the entry point. The returned model_requests are exact engine LLM calls: act as GPT-5.6 Sol and answer them with harness_continue. All filesystem, PowerShell, tests, Git, skills, plans, goals, subagents, workflows, approvals, persistence, and sandboxing stay inside Shiro's DeepSeek Harness engine.`,
@@ -480,9 +580,11 @@ function configureMcp(server, controller, config) {
       prompt: z.string().min(1).describe('The user task for Shiro.'),
       agent_preset: z.string().min(1).optional().describe('Optional Harness preset; omit to use the full standard coding-agent preset.'),
       session_id: z.string().min(1).optional().describe('Optional durable Harness session id returned by harness_sessions. Omit to create a new session.'),
+      speed_profile: z.enum(['fast', 'balanced', 'deep']).describe('Required Shiro operating profile. Use balanced unless the user asks otherwise, and state the selected value to the user.'),
+      reasoning_effort: z.enum(['light', 'standard', 'high', 'max']).describe('Required reasoning effort. Use standard unless the user asks otherwise, and state the selected value to the user.'),
     },
-  }, async ({ prompt, agent_preset: agentPreset, session_id: sessionId }) => {
-    try { return toolResult(await controller.start(prompt, agentPreset, sessionId)) } catch (error) { return errorResult(error) }
+  }, async ({ prompt, agent_preset: agentPreset, session_id: sessionId, speed_profile: speedProfile, reasoning_effort: reasoningEffort }) => {
+    try { return toolResult(await controller.start(prompt, agentPreset, sessionId, speedProfile, reasoningEffort)) } catch (error) { return errorResult(error) }
   })
 
   server.registerTool('harness_sessions', {
@@ -558,7 +660,7 @@ async function handleMcpRequest(req, res, controller, config) {
     { name: 'shiro-harness-bridge', version: '0.1.0' },
     {
       capabilities: { tools: {} },
-      instructions: 'Use harness_start, then act as the model for every returned model_requests item with harness_continue. Shiro executes all coding tools inside its fixed project root. Continue until completed.',
+      instructions: 'Use harness_profiles when parameters are requested. Before harness_start, choose and state exact speed_profile and reasoning_effort; default to balanced/standard. Then act as the model for every returned model_requests item with harness_continue. Shiro executes all coding tools inside its fixed project root. Continue until completed.',
     },
   )
   configureMcp(server, controller, config)
@@ -574,7 +676,14 @@ function startHttpServer(ctx, broker, config) {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1')
     if (url.pathname === '/health') {
       res.writeHead(200, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ ok: true, provider: config.provider, model: config.model, workspaceRoot: config.workspaceRoot }))
+      res.end(JSON.stringify({
+        ok: true,
+        provider: config.provider,
+        model: config.model,
+        workspaceRoot: config.workspaceRoot,
+        speedProfiles: SPEED_PROFILES.map(({ id, name, description, defaultEffort }) => ({ id, name, description, defaultEffort })),
+        reasoningEfforts: REASONING_EFFORTS,
+      }))
       return
     }
     if (url.pathname !== '/mcp') {
