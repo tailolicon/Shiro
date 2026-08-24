@@ -4,7 +4,7 @@ import { resolve } from 'node:path'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { z } from 'zod'
-import { ChatGptBrowserRelay } from './chatgpt-relay.js'
+import { ChatGptBrowserRelay, RelayError, RELAY_RETRYABLE_CODES } from './chatgpt-relay.js'
 import { redactSecrets } from './redact.js'
 
 const DEFAULT_PROVIDER = 'shiro-sol'
@@ -89,7 +89,7 @@ function modelInfo(provider, model, configuredModel = DEFAULT_MODEL) {
   return {
     provider,
     id: model,
-    name: `GPT-5.6 Sol · ${profile.name}`,
+    name: `Shiro · GPT-5.6 Sol · ${profile.name}`,
     description: profile.description,
     inputModalities: ['text', 'image'],
     reasoning: {
@@ -203,20 +203,115 @@ function normalizeBlock(block) {
   return { type: block.type, text: block.text }
 }
 
+/**
+ * Emit the shared block-start/delta/block-end + usage + finish sequence for
+ * one relay or MCP response. `streamedIndex` marks a block whose block-start
+ * and deltas were already emitted live during SSE streaming: the engine's
+ * llm-invariant validator throws on a repeated block-start for the same
+ * index, so that block gets only its closing block-end here.
+ */
+function* emitBlocks(blocks, usage, finishReasonValue, streamedIndex) {
+  for (let index = 0; index < blocks.length; index++) {
+    const block = blocks[index]
+    if (index !== streamedIndex) {
+      yield { type: 'block-start', index, blockType: block.type }
+      if (block.type === 'text') {
+        yield { type: 'text-delta', index, text: block.text }
+      } else if (block.type === 'reasoning') {
+        yield { type: 'reasoning-delta', index, text: block.text }
+      } else if (block.type === 'tool-call') {
+        yield { type: 'tool-call-delta', index, id: block.id, name: block.name, argumentsDelta: block.arguments }
+      }
+    }
+    yield { type: 'block-end', index, block }
+  }
+  yield { type: 'usage', usage: usage ?? { inputTokens: 0, outputTokens: 0 } }
+  const inferred = blocks.some(block => block.type === 'tool-call') ? 'tool-calls' : 'stop'
+  yield { type: 'finish', reason: finishReason(finishReasonValue ?? inferred) }
+}
+
+function hasImageBlock(content) {
+  return Array.isArray(content) && content.some(block => block?.type === 'image')
+}
+
+/**
+ * Resolve durable image attachments into raw bytes for the relay's file
+ * upload, and rewrite the outgoing messages so the JSON prompt embedded in
+ * relayPrompt() never carries anything but a small text placeholder for each
+ * image (durable `ImageAttachmentRef`s never carry raw bytes to begin with --
+ * this also keeps the request-scoped image bytes out of the redacted/logged
+ * request payload). Mirrors, at a much smaller scale, how
+ * engine/packages/llm/llm-deepseek/src/adapter.ts resolves images through its
+ * injected `attachments` service (`ctx.get('attachments')`) before serializing
+ * a request; unlike that adapter this one degrades to a text placeholder
+ * instead of throwing when a durable attachment cannot be resolved, since a
+ * browser-relay completion has no other path to recover.
+ */
+async function resolveImageAttachments(options, attachmentStore, signal) {
+  const messages = options.messages ?? []
+  if (!messages.some(message => hasImageBlock(message.content))) {
+    return { images: [], requestMessages: messages }
+  }
+  const images = []
+  const requestMessages = []
+  for (const message of messages) {
+    if (!hasImageBlock(message.content)) {
+      requestMessages.push(message)
+      continue
+    }
+    const content = []
+    for (const block of message.content) {
+      if (block?.type !== 'image') {
+        content.push(block)
+        continue
+      }
+      const ref = block.attachment
+      const name = ref && typeof ref.name === 'string' && ref.name !== '' ? ref.name : `image-${images.length + 1}`
+      if (attachmentStore === undefined || attachmentStore === null || typeof attachmentStore.readImage !== 'function') {
+        content.push({ type: 'text', text: `[image "${name}" could not be attached: no attachment store available]` })
+        continue
+      }
+      try {
+        const stored = await attachmentStore.readImage(ref, signal)
+        images.push({ data: stored.data, mediaType: stored.ref.mediaType, name })
+        content.push({ type: 'text', text: `[image attached: ${name}]` })
+      } catch (error) {
+        content.push({ type: 'text', text: `[image "${name}" could not be attached: ${asError(error).message}]` })
+      }
+    }
+    requestMessages.push({ ...message, content })
+  }
+  return { images, requestMessages }
+}
+
 export class ChatGptSolAdapter {
-  constructor(broker, provider, model, relay = null) {
+  constructor(broker, provider, model, relay = null, resolveAttachments = () => undefined) {
     this.broker = broker
     this.provider = provider
     this.model = model
     this.relay = relay
+    this.resolveAttachments = resolveAttachments
   }
 
   providerInfo(provider) {
-    return { id: provider, name: 'ChatGPT Web · GPT-5.6 Sol' }
+    return { id: provider, name: 'Shiro · GPT-5.6 Sol' }
   }
 
   providerRetryPolicy() {
-    return undefined
+    // Duck-types engine/packages/llm/llm/src/retry-policy.ts's
+    // `ResolvedNormalRetryPolicy` shape (bridge cannot import the resolver;
+    // see the RelayError doc comment in chatgpt-relay.js). A small bounded
+    // retry count is enough here: relay failures are either fast (HTTP/
+    // network) or already bounded by the 30-minute per-call timeout, so a
+    // long backoff ceiling would only stall the Harness turn.
+    return {
+      mode: 'normal',
+      maxRetries: 3,
+      retryableCodes: [...RELAY_RETRYABLE_CODES],
+      initialDelayMs: 500,
+      maxDelayMs: 10_000,
+      jitterRatio: 0.1,
+    }
   }
 
   async listModels(provider) {
@@ -236,14 +331,48 @@ export class ChatGptSolAdapter {
 
   async *stream(options) {
     let response
+    let usedStreaming = false
+    let streamedFirstBlock = false
     if (this.relay !== null) {
       const status = await this.relay.health(options.signal)
       if (status.ready) {
         try {
-          response = await this.relay.complete(publicRequest(randomUUID(), options), options.signal)
+          const { images, requestMessages } = await resolveImageAttachments(
+            options,
+            this.resolveAttachments?.(),
+            options.signal,
+          )
+          const request = publicRequest(randomUUID(), { ...options, messages: requestMessages })
+          if (typeof this.relay.streamComplete === 'function') {
+            usedStreaming = true
+            for await (const item of this.relay.streamComplete(request, options.signal, images)) {
+              if (item.type === 'delta') {
+                if (!streamedFirstBlock) {
+                  streamedFirstBlock = true
+                  yield { type: 'block-start', index: 0, blockType: 'text' }
+                }
+                yield { type: 'text-delta', index: 0, text: item.text }
+              } else if (item.type === 'final') {
+                response = item.value
+              }
+            }
+          } else {
+            response = await this.relay.complete(request, options.signal, images)
+          }
         } catch (error) {
           if (options.signal?.aborted) {
             response = { kind: 'aborted', failure: { message: 'Harness cancelled the browser relay request', code: 'ABORTED' } }
+          } else if (error instanceof RelayError || usedStreaming) {
+            // A typed relay failure carries a code the engine's retry policy
+            // understands (see providerRetryPolicy() above) -- surface it
+            // instead of silently degrading to the MCP handoff below, so the
+            // harness can automatically re-ask. Once streaming has begun,
+            // partial block-start/text-delta chunks may already be in
+            // flight; falling back to a second, unrelated MCP-sourced
+            // response would re-use block index 0 without ever closing it,
+            // so any streaming-path failure must also propagate rather than
+            // silently switch response sources.
+            throw error
           } else {
             process.stderr.write(`shiro-relay: ${asError(error).message}; falling back to MCP handoff\n`)
           }
@@ -267,24 +396,8 @@ export class ChatGptSolAdapter {
     }
 
     const blocks = response.blocks.map(normalizeBlock)
-    for (let index = 0; index < blocks.length; index++) {
-      const block = blocks[index]
-      yield { type: 'block-start', index, blockType: block.type }
-      if (block.type === 'text') {
-        yield { type: 'text-delta', index, text: block.text }
-      } else if (block.type === 'reasoning') {
-        yield { type: 'reasoning-delta', index, text: block.text }
-      } else if (block.type === 'tool-call') {
-        yield { type: 'tool-call-delta', index, id: block.id, name: block.name, argumentsDelta: block.arguments }
-      }
-      yield { type: 'block-end', index, block }
-    }
-    yield {
-      type: 'usage',
-      usage: response.usage ?? { inputTokens: 0, outputTokens: 0 },
-    }
-    const inferred = blocks.some(block => block.type === 'tool-call') ? 'tool-calls' : 'stop'
-    yield { type: 'finish', reason: finishReason(response.finishReason ?? inferred) }
+    const streamedIndex = streamedFirstBlock && blocks[0]?.type === 'text' ? 0 : -1
+    yield* emitBlocks(blocks, response.usage, response.finishReason, streamedIndex)
   }
 }
 
@@ -741,7 +854,13 @@ export function apply(ctx, rawConfig = {}) {
     token: config.relayToken,
     model: config.relayModel,
   })
-  const adapter = new ChatGptSolAdapter(broker, config.provider, config.model, relay)
+  // 'attachments' is deliberately not a hard `inject` dependency (unlike
+  // 'llm'/'apiProxy' above): it is an optional durable-image service that
+  // may not be mounted in every Shiro composition, and a hard inject would
+  // block this plugin from loading at all until one is. `ctx.get()` reads it
+  // only at call time, mirroring how engine/packages/llm/llm-deepseek/src
+  // /adapter.ts resolves it (`resolveAttachments: () => ctx.get('attachments')`).
+  const adapter = new ChatGptSolAdapter(broker, config.provider, config.model, relay, () => ctx.get('attachments'))
   ctx.llm.registerAdapter([config.provider], adapter)
   ctx.effect(() => {
     const runtime = startHttpServer(ctx, broker, config)
