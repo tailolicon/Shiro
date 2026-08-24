@@ -194,7 +194,8 @@ if (-not $NoDesktop) {
     if (Test-Path -LiteralPath $DesktopApp -PathType Leaf) {
         Start-Process -FilePath $DesktopApp | Out-Null
     } else {
-        Write-Host 'Desktop app is not built yet; opening the local UI in the browser.'
-        Start-Process "http://127.0.0.1:$WebPort/" | Out-Null
+        $DesktopConfig = Get-Content -Raw -LiteralPath (Join-Path $DesktopRoot 'pake.config.json') | ConvertFrom-Json
+        Write-Host 'Desktop app is not built yet; opening the Shiro ChatGPT conversation in the browser.'
+        Start-Process $DesktopConfig.url | Out-Null
     }
 }

@@ -34,7 +34,9 @@ Plugin và catalog nghiên cứu được ghim commit trong `.gitmodules`/Git in
 
 ## Chạy trên máy này
 
-Nhấp đúp `Start-Shiro.cmd`. Lần đầu Shiro sẽ cài dependency và build engine; các lần sau sẽ khởi động nhanh hơn. Giao diện dùng địa chỉ cục bộ `http://127.0.0.1:3080/`.
+Nhấp đúp `Start-Shiro.cmd`. Lần đầu Shiro sẽ cài dependency và build engine; các lần sau sẽ khởi động nhanh hơn. Ứng dụng desktop mở cuộc trò chuyện ChatGPT Work đã gắn nguồn Shiro; hãy nhập yêu cầu ở đó để ChatGPT gọi Harness qua MCP.
+
+`http://127.0.0.1:3080/` là bảng điều khiển Harness cục bộ để xem session và chẩn đoán. Không dùng ô chat tại địa chỉ này làm giao diện ChatGPT: MCP hoạt động theo chiều ChatGPT gọi Shiro nên một tin nhắn gửi trực tiếp tại bảng điều khiển sẽ chờ mà không có model đến nhận.
 
 Để kết nối lại ChatGPT sau khi khởi động máy, chạy `Start-Shiro-Tunnel.cmd`. OpenAI runtime API key chỉ được giữ trong bộ nhớ của tiến trình tunnel và không được ghi vào repo.
 
