@@ -108,6 +108,58 @@ function classifyFetchFailure(error, userSignal) {
   return new RelayError(`ChatGPT browser relay request failed: ${message}`, 'TRANSPORT', { cause: error })
 }
 
+/**
+ * Escape double quotes the model embedded raw inside JSON string values
+ * (for example a PowerShell command containing "env:APPDATA/npm"). A quote
+ * inside a string only really closes it when the next non-whitespace
+ * character is structural JSON (, } ] : or end of input); any other
+ * follower means the model forgot to escape, so the quote is content.
+ * Heuristic by nature -- an embedded quote directly followed by a comma is
+ * still misread as a close -- but it is only ever tried after strict
+ * parsing has already failed, so it can only rescue, never corrupt.
+ */
+function repairUnescapedInnerQuotes(candidate) {
+  let out = ''
+  let inString = false
+  for (let i = 0; i < candidate.length; i++) {
+    const ch = candidate[i]
+    if (!inString) {
+      if (ch === '"') inString = true
+      out += ch
+      continue
+    }
+    if (ch === '\\') {
+      out += ch + (candidate[i + 1] ?? '')
+      i++
+      continue
+    }
+    if (ch === '"') {
+      let j = i + 1
+      while (j < candidate.length && /\s/.test(candidate[j])) j++
+      const next = candidate[j]
+      if (next === undefined || next === ',' || next === '}' || next === ']' || next === ':') {
+        inString = false
+        out += ch
+      } else {
+        out += '\\"'
+      }
+      continue
+    }
+    out += ch
+  }
+  return out
+}
+
+function repairPathBackslashes(candidate) {
+  // ChatGPT occasionally emits otherwise-valid JSON with raw Windows path
+  // separators (for example E:\Project\Shiro). Repair path-like backslashes
+  // only after strict parsing fails so valid JSON escapes keep their meaning.
+  return candidate.replace(
+    /(?<=[A-Za-z0-9:._-])\\(?=[A-Za-z0-9._-])/g,
+    '\\\\',
+  )
+}
+
 function extractJson(text) {
   const trimmed = String(text ?? '').trim()
   const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1]?.trim()
@@ -118,16 +170,19 @@ function extractJson(text) {
   for (const candidate of candidates) {
     try { return JSON.parse(candidate) } catch {}
   }
-  // ChatGPT occasionally emits otherwise-valid JSON with raw Windows path
-  // separators (for example E:\Project\Shiro). Repair path-like backslashes
-  // only after strict parsing fails so valid JSON escapes keep their meaning.
-  for (const candidate of candidates) {
-    const repaired = candidate.replace(
-      /(?<=[A-Za-z0-9:._-])\\(?=[A-Za-z0-9._-])/g,
-      '\\\\',
-    )
-    if (repaired === candidate) continue
-    try { return JSON.parse(repaired) } catch {}
+  // Repair passes run strictly after clean parsing fails, cheapest first,
+  // then combined: backslashes, embedded quotes, both together.
+  const repairs = [
+    repairPathBackslashes,
+    repairUnescapedInnerQuotes,
+    candidate => repairUnescapedInnerQuotes(repairPathBackslashes(candidate)),
+  ]
+  for (const repair of repairs) {
+    for (const candidate of candidates) {
+      const repaired = repair(candidate)
+      if (repaired === candidate) continue
+      try { return JSON.parse(repaired) } catch {}
+    }
   }
   return null
 }
@@ -205,6 +260,7 @@ function relayPrompt(request) {
     'Return exactly one JSON object with no Markdown fence or surrounding prose.',
     'Schema: {"blocks":[{"type":"text","text":"..."}|{"type":"reasoning","text":"visible concise reasoning summary"}|{"type":"tool_call","id":"unique-id","name":"exact available tool name","arguments":{}}],"finishReason":"stop"|"tool-calls"|"max-tokens"}.',
     'The response must be strict JSON. Inside argument strings, use forward slashes for paths and never emit a raw Windows backslash.',
+    'Escape every double quote inside a JSON string value as \\". In shell commands prefer single quotes so no escaping is needed.',
     'Use only tool names and argument shapes present in the exact Harness request below.',
     'If tools are required, prefer tool_call blocks and set finishReason to tool-calls. Do not fabricate tool results.',
     'The request contains the complete current context, including prior Harness tool results.',

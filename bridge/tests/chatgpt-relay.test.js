@@ -196,6 +196,27 @@ test('browser relay throws a typed retryable error for a genuinely empty reply',
   })
 })
 
+test('browser relay repairs unescaped double quotes embedded in tool-call argument strings', async () => {
+  // Reproduces a live failure: Sol emitted a PowerShell command containing
+  // raw "env:APPDATA/npm" quotes inside the JSON string, which strict
+  // parsing rejects and the old code rendered as a raw-JSON text reply.
+  const wire = '{"blocks":[{"type":"tool_call","id":"pwsh-locate-dsh","name":"pwsh",'
+    + '"arguments":{"command":"$cmd = Get-Command dsh -ErrorAction SilentlyContinue; '
+    + 'if ($cmd) { $cmd | Format-List * } else { Write-Output \'DSH_NOT_IN_PATH\'; npm prefix -g; '
+    + 'Get-ChildItem "env:APPDATA/npm" -Filter \'dsh*\' -ErrorAction SilentlyContinue | Select-Object FullName,Name }",'
+    + '"description":"Locate installed dsh command and npm shim"}}],"finishReason":"tool-calls"}'
+  const relay = new ChatGptBrowserRelay({
+    url: 'http://127.0.0.1:23158',
+    token: 'relay-test-token',
+    fetchImpl: async () => Response.json({ response: wire }),
+  })
+  const result = await relay.complete({ ...request, tools: [{ name: 'pwsh' }] })
+  assert.equal(result.finishReason, 'tool-calls')
+  assert.equal(result.blocks[0].type, 'tool_call')
+  assert.equal(result.blocks[0].name, 'pwsh')
+  assert.match(result.blocks[0].arguments.command, /Get-ChildItem "env:APPDATA\/npm" -Filter 'dsh\*'/)
+})
+
 test('browser relay still falls back to a plain text block for genuine prose', async () => {
   const relay = new ChatGptBrowserRelay({
     url: 'http://127.0.0.1:23158',
