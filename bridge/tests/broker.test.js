@@ -40,6 +40,23 @@ test('adapter emits raw Harness tool-call chunks and terminal usage before finis
   assert.equal(chunks.find(chunk => chunk.type === 'block-end').block.arguments, '{"path":"package.json"}')
 })
 
+test('adapter uses the connected browser relay without publishing an MCP handoff', async () => {
+  const broker = new BridgeBroker()
+  const relay = {
+    health: async () => ({ ready: true, clients: 1 }),
+    complete: async request => ({
+      blocks: [{ type: 'text', text: `relay:${request.messages[0].content[0].text}` }],
+      finishReason: 'stop',
+    }),
+  }
+  const adapter = new ChatGptSolAdapter(broker, 'shiro-sol', 'gpt-5.6-sol', relay)
+  const chunks = []
+  for await (const chunk of adapter.stream(options)) chunks.push(chunk)
+  assert.equal(broker.snapshot().length, 0)
+  assert.equal(chunks.find(chunk => chunk.type === 'text-delta').text, 'relay:test')
+  assert.deepEqual(chunks.at(-1), { type: 'finish', reason: { kind: 'stop' } })
+})
+
 test('adapter exposes native speed profiles and reasoning effort metadata', async () => {
   const adapter = new ChatGptSolAdapter(new BridgeBroker(), 'shiro-sol', 'gpt-5.6-sol')
   const models = await adapter.listModels('shiro-sol')

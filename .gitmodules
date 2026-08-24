@@ -7,3 +7,6 @@
 [submodule "research/awesome-dsh-plugin"]
 	path = research/awesome-dsh-plugin
 	url = https://github.com/awesome-dsh-plugin/awesome-dsh-plugin.git
+[submodule "relay/chatgpt-bridge"]
+	path = relay/chatgpt-bridge
+	url = https://github.com/DrA1ex/chatgpt-bridge.git

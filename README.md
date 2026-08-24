@@ -8,6 +8,7 @@ Giao diện web cục bộ được đóng gói thành ứng dụng Windows bằ
 
 - `engine/`: mã nguồn DeepSeek Harness, được dùng làm agent runtime.
 - `bridge/`: adapter và MCP bridge kết nối ChatGPT Sol với Harness.
+- `relay/chatgpt-bridge/`: browser relay đã audit và ghim commit; giữ ChatGPT Web chạy nền nhưng trả kết quả về đúng agent loop của DSH.
 - `desktop/`: cấu hình Pake và tài nguyên ứng dụng Windows.
 - `plugins/`: các plugin DSH đã audit và ghim đúng commit; mỗi thư mục là một Git submodule có thể đọc/chỉnh sửa.
 - `research/awesome-dsh-plugin/`: snapshot catalog đã ghim để Shiro tự nghiên cứu bên trong project root; catalog không được thực thi.
@@ -34,11 +35,17 @@ Plugin và catalog nghiên cứu được ghim commit trong `.gitmodules`/Git in
 
 ## Chạy trên máy này
 
-Nhấp đúp `Start-Shiro.cmd`. Lần đầu Shiro sẽ cài dependency và build engine; các lần sau sẽ khởi động nhanh hơn. Ứng dụng desktop mở cuộc trò chuyện ChatGPT Work đã gắn nguồn Shiro; hãy nhập yêu cầu ở đó để ChatGPT gọi Harness qua MCP.
+Nhấp đúp `Start-Shiro.cmd`. Lần đầu Shiro sẽ cài dependency và build engine; các lần sau sẽ khởi động nhanh hơn. Ứng dụng desktop mở giao diện DSH cục bộ tại `http://127.0.0.1:3080/`, gồm session, goal, workflow, subagent và các plugin đã ghim.
 
-`http://127.0.0.1:3080/` là bảng điều khiển Harness cục bộ để xem session và chẩn đoán. Không dùng ô chat tại địa chỉ này làm giao diện ChatGPT: MCP hoạt động theo chiều ChatGPT gọi Shiro nên một tin nhắn gửi trực tiếp tại bảng điều khiển sẽ chờ mà không có model đến nhận.
+Lần đầu, Shiro mở trang `http://127.0.0.1:23158/setup`. Trong Chrome:
 
-Để kết nối lại ChatGPT sau khi khởi động máy, chạy `Start-Shiro-Tunnel.cmd`. OpenAI runtime API key chỉ được giữ trong bộ nhớ của tiến trình tunnel và không được ghi vào repo.
+1. Mở `chrome://extensions`, bật Developer mode và chọn Load unpacked.
+2. Chọn đúng thư mục `E:\Project\.ShiroRuntime\chatgpt-extension`.
+3. Mở `chatgpt.com`, mở nút Bridge ở góc phải dưới, dán Bridge token hiển thị trên trang setup rồi chọn Save & connect.
+
+Đây là bước một lần. Từ đó luồng local là `DSH UI → GPT-5.6 Sol trong tab ChatGPT đã đăng nhập → DSH agent loop`; mọi file, terminal, test, Git, goal, workflow, subagent và plugin vẫn do DeepSeek Harness chạy và hiển thị trong Shiro.
+
+`Start-Shiro-Tunnel.cmd` chỉ còn là đường tùy chọn ngược lại để một cuộc chat trên ChatGPT gọi vào Shiro qua MCP. Direct chat trong Shiro không cần tunnel này. OpenAI runtime API key của tunnel chỉ được giữ trong bộ nhớ và không được ghi vào repo.
 
 Để build lại ứng dụng Windows:
 
@@ -55,8 +62,10 @@ PowerShell -ExecutionPolicy Bypass -File .\scripts\Start-Shiro.ps1 -Rebuild
 ## Ranh giới an toàn
 
 - Web UI và MCP chỉ lắng nghe trên loopback `127.0.0.1`.
+- Browser relay chỉ lắng nghe trên `127.0.0.1:23158`, dùng API token và Bridge token tách biệt. Extension chỉ được cấp host permission cho ChatGPT và loopback.
+- Mỗi tool call từ ChatGPT phải khớp đúng tên tool DSH đã cấp trong model request; tool lạ bị adapter từ chối trước khi đi vào Harness.
 - Agent chỉ được thao tác trong `ProjectRoot` đã chọn; mặc định là chính repo Shiro.
-- Token, session và cấu hình runtime nằm tại thư mục anh em `E:\Project\.ShiroRuntime`, ngoài project root.
+- Token, session, extension đã triển khai và cấu hình runtime nằm tại thư mục anh em `E:\Project\.ShiroRuntime`, ngoài project root.
 - Không có lệnh tự động push hoặc merge. Git vẫn hoạt động cục bộ trong project root.
 - Secure MCP Tunnel là kết nối outbound; MCP cục bộ không được mở trực tiếp ra LAN/Internet.
 - Plugin subagent monitor chỉ mở endpoint đọc trạng thái trên cùng web server loopback; không mở cổng mới.

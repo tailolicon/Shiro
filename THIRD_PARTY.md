@@ -40,3 +40,11 @@ Pake is used as a build tool to produce Shiro's Windows desktop shell. Pake's st
 - Reviewed revision: `48110ca2779b59d36edec46c8aff97b6a50322aa`
 - License: MIT
 - Scope: Shiro's bridge redaction patterns are an adapted, filesystem-free subset. The third-party plugin itself is not executed.
+
+## ChatGPT Browser Bridge
+
+- Source: https://github.com/DrA1ex/chatgpt-bridge
+- Pinned revision: `b6b9146`
+- Version: 6.3.14 / extension 2.3.11
+- License: MIT (`relay/chatgpt-bridge/LICENSE`)
+- Scope: loopback-only model relay between a logged-in ChatGPT browser tab and Shiro's DSH model adapter. Shiro does not use its project-apply or Git workflow surfaces.

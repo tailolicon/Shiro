@@ -1,6 +1,6 @@
 {
   "$schema": "https://raw.githubusercontent.com/tw93/Pake/main/schema/pake.schema.json",
-  "url": "https://chatgpt.com/c/6a8b3513-2f30-83ec-b6f6-f741dc7e047a",
+  "url": "http://127.0.0.1:3080/",
   "name": "Shiro",
   "identifier": "ai.shiro.desktop",
   "title": "Shiro",
@@ -9,7 +9,7 @@
   "height": 900,
   "minWidth": 1000,
   "minHeight": 700,
-  "appVersion": "0.1.1",
+  "appVersion": "0.1.2",
   "maximize": true,
   "darkMode": true,
   "showSystemTray": false,

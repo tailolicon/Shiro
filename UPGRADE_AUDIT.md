@@ -46,6 +46,16 @@ Verification: dependency install, TypeScript typecheck, production build and doc
 
 The catalog's `dsh-secret-redactor` design was reviewed at `48110ca2779b59d36edec46c8aff97b6a50322aa`. Shiro uses an adapted bridge-local subset that masks high-confidence vendor keys, bearer/JWT/private-key material, credential-bearing URLs, contextual key/value secrets and secret-named environment values before model requests leave for ChatGPT Web. It does not read SSH config or any file outside the project and preserves binary image/audio fields.
 
+### ChatGPT browser model relay
+
+Pinned revision: `b6b9146` (`chatgpt-browser-bridge-node` 6.3.14, extension 2.3.11).
+
+Why accepted: this supplies the missing DSH-to-ChatGPT direction while preserving the native DeepSeek Harness UI and agent loop. Shiro uses only its loopback chat transport; project apply, workflow command execution and Git surfaces from the third-party package are not called. API and browser tokens are separate, the HTTP/WebSocket server binds to `127.0.0.1`, and extension host permissions are limited to ChatGPT plus loopback.
+
+The next upstream commit was rejected because it added an unavailable `zipflow@1.9.0` package and duplicated DSH workflow ownership. The pinned dependency graph is hardened after install to patched `tar` and `undici` transitive releases, then the original pinned manifests are restored so the submodule stays reproducible.
+
+Verification: 41 focused upstream API, transport, extension-auth, model-selection and browser-safety tests passed. Shiro adds tests for loopback URL enforcement, unknown-tool rejection, effort mapping, plain-text fallback and direct adapter routing without MCP handoff. Live browser verification remains required after the one-time extension connection.
+
 ## Rejected or deferred
 
 - Effort/reasoning slider variants: redundant with the native Harness model contract and likely to conflict with one another.
@@ -72,3 +82,5 @@ The catalog's `dsh-secret-redactor` design was reviewed at `48110ca2779b59d36ede
 ## Known platform boundary
 
 Shiro can expose and enforce its requested operating profile, but an MCP server cannot guarantee a different ChatGPT service tier, quota or backend compute allocation. Those remain controlled by ChatGPT Web. The UI and tool contract state this explicitly instead of claiming a remote capability that cannot be verified locally.
+
+The browser relay is an unofficial UI adapter, so a future ChatGPT DOM/model-picker change can require an extension update. It fails closed on unknown model/tool structures and falls back to the authenticated MCP handoff instead of bypassing Harness.

@@ -10,6 +10,7 @@
   },
   "files": [
     "src/index.js",
+    "src/chatgpt-relay.js",
     "src/container-tool.js",
     "src/container-path.js",
     "cordis.patch.yml"

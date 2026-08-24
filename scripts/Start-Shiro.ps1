@@ -16,20 +16,27 @@ $DesktopRoot = Join-Path $RepoRoot 'desktop'
 $AutoContinueRoot = Join-Path $RepoRoot 'plugins\auto-continue'
 $SubagentMonitorRoot = Join-Path $RepoRoot 'plugins\subagent-monitor'
 $PluginCatalogRoot = Join-Path $RepoRoot 'research\awesome-dsh-plugin'
+$RelayRoot = Join-Path $RepoRoot 'relay\chatgpt-bridge'
 $RuntimeRoot = Join-Path (Split-Path -Parent $RepoRoot) '.ShiroRuntime'
 $DshHome = Join-Path $RuntimeRoot 'dsh-home'
 $ProfileRoot = Join-Path $DshHome 'profiles\web'
 $StateRoot = Join-Path $RuntimeRoot 'state'
 $LogRoot = Join-Path $RuntimeRoot 'logs'
 $TokenFile = Join-Path $StateRoot 'bridge-token.txt'
+$RelayEnvFile = Join-Path $StateRoot 'chatgpt-relay.env'
+$RelayDataRoot = Join-Path $RuntimeRoot 'chatgpt-relay'
+$RelayExtensionRoot = Join-Path $RuntimeRoot 'chatgpt-extension'
+$RelayPort = 23158
 $BuildMarker = Join-Path $EngineRoot '.shiro-build-ready'
 
 $AutoContinueManifest = Join-Path $AutoContinueRoot 'package.json'
 $SubagentMonitorManifest = Join-Path $SubagentMonitorRoot 'package.json'
 $PluginCatalogManifest = Join-Path $PluginCatalogRoot 'package.json'
+$RelayManifest = Join-Path $RelayRoot 'package.json'
 $MissingPlugin = -not (Test-Path -LiteralPath $AutoContinueManifest -PathType Leaf) `
     -or -not (Test-Path -LiteralPath $SubagentMonitorManifest -PathType Leaf) `
-    -or -not (Test-Path -LiteralPath $PluginCatalogManifest -PathType Leaf)
+    -or -not (Test-Path -LiteralPath $PluginCatalogManifest -PathType Leaf) `
+    -or -not (Test-Path -LiteralPath $RelayManifest -PathType Leaf)
 if ($MissingPlugin -and (Test-Path -LiteralPath (Join-Path $RepoRoot '.gitmodules') -PathType Leaf)) {
     $Git = Get-Command git -ErrorAction SilentlyContinue
     if ($null -eq $Git) { throw 'Git is required to initialize Shiro plugin submodules.' }
@@ -38,18 +45,18 @@ if ($MissingPlugin -and (Test-Path -LiteralPath (Join-Path $RepoRoot '.gitmodule
     if ($LASTEXITCODE -ne 0) { throw 'Shiro plugin submodule initialization failed.' }
 }
 
-foreach ($RequiredPath in @($EngineRoot, $BridgeRoot, $DesktopRoot, $AutoContinueRoot, $SubagentMonitorRoot, $PluginCatalogRoot, $ProjectRoot)) {
+foreach ($RequiredPath in @($EngineRoot, $BridgeRoot, $DesktopRoot, $AutoContinueRoot, $SubagentMonitorRoot, $PluginCatalogRoot, $RelayRoot, $ProjectRoot)) {
     if (-not (Test-Path -LiteralPath $RequiredPath -PathType Container)) {
         throw "Required Shiro directory is missing: $RequiredPath"
     }
 }
-foreach ($RequiredFile in @($AutoContinueManifest, $SubagentMonitorManifest, $PluginCatalogManifest)) {
+foreach ($RequiredFile in @($AutoContinueManifest, $SubagentMonitorManifest, $PluginCatalogManifest, $RelayManifest)) {
     if (-not (Test-Path -LiteralPath $RequiredFile -PathType Leaf)) {
         throw "Required pinned Shiro plugin manifest is missing: $RequiredFile"
     }
 }
 
-foreach ($Directory in @($RuntimeRoot, $DshHome, $ProfileRoot, $StateRoot, $LogRoot, (Join-Path $RuntimeRoot 'agents'))) {
+foreach ($Directory in @($RuntimeRoot, $DshHome, $ProfileRoot, $StateRoot, $LogRoot, $RelayDataRoot, $RelayExtensionRoot, (Join-Path $RuntimeRoot 'agents'))) {
     if (-not (Test-Path -LiteralPath $Directory)) {
         New-Item -ItemType Directory -Path $Directory | Out-Null
     }
@@ -57,9 +64,34 @@ foreach ($Directory in @($RuntimeRoot, $DshHome, $ProfileRoot, $StateRoot, $LogR
 
 if (-not (Test-Path -LiteralPath $TokenFile -PathType Leaf)) {
     $TokenBytes = [byte[]]::new(32)
-    [Security.Cryptography.RandomNumberGenerator]::Fill($TokenBytes)
+    $TokenRng = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $TokenRng.GetBytes($TokenBytes) } finally { $TokenRng.Dispose() }
     $Token = [Convert]::ToBase64String($TokenBytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
     [IO.File]::WriteAllText($TokenFile, $Token, [Text.UTF8Encoding]::new($false))
+}
+
+if (-not (Test-Path -LiteralPath $RelayEnvFile -PathType Leaf)) {
+    $RelayApiBytes = [byte[]]::new(48)
+    $RelayBridgeBytes = [byte[]]::new(48)
+    $RelayRng = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $RelayRng.GetBytes($RelayApiBytes)
+        $RelayRng.GetBytes($RelayBridgeBytes)
+    } finally { $RelayRng.Dispose() }
+    $RelayApiToken = [Convert]::ToBase64String($RelayApiBytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+    $RelayBridgeToken = [Convert]::ToBase64String($RelayBridgeBytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+    $RelayEnv = @(
+        'HOST=127.0.0.1'
+        "PORT=$RelayPort"
+        "PUBLIC_BASE_URL=http://127.0.0.1:$RelayPort"
+        "API_TOKEN=$RelayApiToken"
+        "BRIDGE_TOKEN=$RelayBridgeToken"
+        "DATA_DIR=$RelayDataRoot"
+        'AUTO_OPEN_TAB=1'
+        'ANSWER_TIMEOUT_MS=1800000'
+        'REQUEST_MEANINGFUL_PROGRESS_TIMEOUT_MS=300000'
+    ) -join [Environment]::NewLine
+    [IO.File]::WriteAllText($RelayEnvFile, $RelayEnv + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
 }
 
 $BridgeLink = ($BridgeRoot -replace '\\', '/')
@@ -127,6 +159,23 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'Bridge dependency installation failed.' }
     }
 
+    if (-not (Test-Path -LiteralPath (Join-Path $RelayRoot 'node_modules\express'))) {
+        Write-Host 'Installing the audited ChatGPT browser relay...'
+        Push-Location $RelayRoot
+        try {
+            & npm ci --ignore-scripts=false
+            if ($LASTEXITCODE -eq 0) { & npm audit fix --omit=dev }
+        } finally { Pop-Location }
+        if ($LASTEXITCODE -ne 0) { throw 'ChatGPT browser relay dependency installation failed.' }
+        & git -C $RelayRoot restore -- package.json package-lock.json
+        if ($LASTEXITCODE -ne 0) { throw 'Could not restore the pinned relay manifests after dependency hardening.' }
+    }
+
+    Write-Host 'Preparing the Shiro browser companion extension...'
+    Push-Location $RelayRoot
+    try { & node scripts/extension-install.js --target $RelayExtensionRoot } finally { Pop-Location }
+    if ($LASTEXITCODE -ne 0) { throw 'ChatGPT browser companion deployment failed.' }
+
     & (Join-Path $PSScriptRoot 'Setup-Shiro-Runner.ps1') -RepoRoot $RepoRoot
 
     Write-Host 'Linking the Shiro runtime profile...'
@@ -144,6 +193,40 @@ try {
     }
 } finally {
     $env:CI = $PreviousCi
+}
+
+$RelaySettings = @{}
+foreach ($Line in Get-Content -LiteralPath $RelayEnvFile) {
+    if ($Line -match '^\s*([^#=]+)=(.*)$') { $RelaySettings[$Matches[1].Trim()] = $Matches[2].Trim() }
+}
+$RelayHeaders = @{ Authorization = "Bearer $($RelaySettings.API_TOKEN)" }
+$RelayHealthy = $false
+try {
+    $RelayHealth = Invoke-RestMethod -Uri "http://127.0.0.1:$RelayPort/health" -Headers $RelayHeaders -TimeoutSec 2
+    $RelayHealthy = $null -ne $RelayHealth
+} catch {
+}
+if (-not $RelayHealthy) {
+    $RelayStdoutLog = Join-Path $LogRoot 'chatgpt-relay.stdout.log'
+    $RelayStderrLog = Join-Path $LogRoot 'chatgpt-relay.stderr.log'
+    $RelayRunner = Join-Path $PSScriptRoot 'Run-Shiro-Relay.ps1'
+    $RelayArguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $RelayRunner)
+    $RelayProcess = Start-Process -FilePath PowerShell.exe -ArgumentList $RelayArguments -WindowStyle Hidden -PassThru `
+        -RedirectStandardOutput $RelayStdoutLog -RedirectStandardError $RelayStderrLog
+    [IO.File]::WriteAllText((Join-Path $StateRoot 'chatgpt-relay-process-id.txt'), [string]$RelayProcess.Id, [Text.UTF8Encoding]::new($false))
+    for ($Attempt = 0; $Attempt -lt 60; $Attempt++) {
+        Start-Sleep -Milliseconds 500
+        if ($RelayProcess.HasExited) {
+            $Detail = if (Test-Path -LiteralPath $RelayStderrLog) { (Get-Content -Tail 30 -LiteralPath $RelayStderrLog) -join [Environment]::NewLine } else { '' }
+            throw "ChatGPT browser relay exited early.`n$Detail"
+        }
+        try {
+            $RelayHealth = Invoke-RestMethod -Uri "http://127.0.0.1:$RelayPort/health" -Headers $RelayHeaders -TimeoutSec 1
+            if ($null -ne $RelayHealth) { $RelayHealthy = $true; break }
+        } catch {
+        }
+    }
+    if (-not $RelayHealthy) { throw "ChatGPT browser relay did not become ready. Logs: $LogRoot" }
 }
 
 $Healthy = $false
@@ -189,13 +272,23 @@ if (-not $Healthy) {
 Write-Host "Shiro is ready: http://127.0.0.1:$WebPort/"
 Write-Host "Locked project root: $ProjectRoot"
 
+if (-not $NoDesktop -and [int]($RelayHealth.clients) -lt 1) {
+    Write-Host 'ChatGPT relay needs its one-time browser connection; opening the local setup page.'
+    Start-Process "http://127.0.0.1:$RelayPort/setup" | Out-Null
+}
+
 if (-not $NoDesktop) {
     $DesktopApp = Join-Path $DesktopRoot 'dist\Shiro.exe'
+    $DesktopNext = Join-Path $DesktopRoot 'dist\Shiro.next.exe'
+    $DesktopRunning = Get-Process Shiro -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $DesktopApp }
+    if ((Test-Path -LiteralPath $DesktopNext -PathType Leaf) -and $null -eq $DesktopRunning) {
+        Copy-Item -LiteralPath $DesktopNext -Destination $DesktopApp -Force
+        Remove-Item -LiteralPath $DesktopNext -Force
+    }
     if (Test-Path -LiteralPath $DesktopApp -PathType Leaf) {
         Start-Process -FilePath $DesktopApp | Out-Null
     } else {
-        $DesktopConfig = Get-Content -Raw -LiteralPath (Join-Path $DesktopRoot 'pake.config.json') | ConvertFrom-Json
-        Write-Host 'Desktop app is not built yet; opening the Shiro ChatGPT conversation in the browser.'
-        Start-Process $DesktopConfig.url | Out-Null
+        Write-Host 'Desktop app is not built yet; opening the local DSH interface in the browser.'
+        Start-Process "http://127.0.0.1:$WebPort/" | Out-Null
     }
 }

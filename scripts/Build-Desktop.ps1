@@ -42,10 +42,15 @@ if (-not (Test-Path -LiteralPath $PakeCommand -PathType Leaf)) {
 }
 
 Push-Location $DesktopRoot
+$PreviousErrorAction = $ErrorActionPreference
 try {
+    # Pake writes harmless package-manager notices to stderr on a successful
+    # build; capture them in the build log and decide from its exit code.
+    $ErrorActionPreference = 'Continue'
     & $PakeCommand --config $ConfigPath --json 1> $StdoutFile 2> $StderrFile
     $PakeExitCode = $LASTEXITCODE
 } finally {
+    $ErrorActionPreference = $PreviousErrorAction
     Pop-Location
 }
 
@@ -72,7 +77,15 @@ $Candidates = Get-ChildItem -LiteralPath $DesktopRoot -Recurse -File | Where-Obj
 }
 foreach ($Artifact in $Candidates) {
     $DestinationName = if ($Artifact.Extension -eq '.exe' -and $Artifact.Name -match '^Shiro(?:\.exe)?$') { 'Shiro.exe' } else { $Artifact.Name }
-    Copy-Item -LiteralPath $Artifact.FullName -Destination (Join-Path $DistRoot $DestinationName) -Force
+    $Destination = Join-Path $DistRoot $DestinationName
+    try {
+        Copy-Item -LiteralPath $Artifact.FullName -Destination $Destination -Force
+    } catch [System.IO.IOException] {
+        if ($DestinationName -ne 'Shiro.exe') { throw }
+        $Destination = Join-Path $DistRoot 'Shiro.next.exe'
+        Copy-Item -LiteralPath $Artifact.FullName -Destination $Destination -Force
+        Write-Host "The running desktop app kept Shiro.exe locked; the verified replacement is at $Destination"
+    }
 }
 
 $App = Join-Path $DistRoot 'Shiro.exe'

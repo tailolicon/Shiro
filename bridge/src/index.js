@@ -4,6 +4,7 @@ import { resolve } from 'node:path'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { z } from 'zod'
+import { ChatGptBrowserRelay } from './chatgpt-relay.js'
 import { redactSecrets } from './redact.js'
 
 const DEFAULT_PROVIDER = 'shiro-sol'
@@ -47,11 +48,17 @@ function normalizeConfig(config = {}) {
   const waitMs = Number(config.waitMs ?? 25_000)
   if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('port must be an integer from 1024 to 65535')
   if (!Number.isInteger(waitMs) || waitMs < 100 || waitMs > MAX_WAIT_MS) throw new Error(`waitMs must be an integer from 100 to ${MAX_WAIT_MS}`)
+  const relayUrl = typeof config.relayUrl === 'string' ? config.relayUrl.trim() : ''
+  const relayToken = typeof config.relayToken === 'string' ? config.relayToken.trim() : ''
+  if ((relayUrl === '') !== (relayToken === '')) throw new Error('relayUrl and relayToken must be configured together')
   return {
     provider: requiredString(config.provider ?? DEFAULT_PROVIDER, 'provider'),
     model: requiredString(config.model ?? DEFAULT_MODEL, 'model'),
     workspaceRoot: resolve(requiredString(config.workspaceRoot, 'workspaceRoot')),
     token: requiredString(config.token, 'token'),
+    relayUrl,
+    relayToken,
+    relayModel: requiredString(config.relayModel ?? 'GPT-5.6 Sol', 'relayModel'),
     port,
     waitMs,
   }
@@ -197,10 +204,11 @@ function normalizeBlock(block) {
 }
 
 export class ChatGptSolAdapter {
-  constructor(broker, provider, model) {
+  constructor(broker, provider, model, relay = null) {
     this.broker = broker
     this.provider = provider
     this.model = model
+    this.relay = relay
   }
 
   providerInfo(provider) {
@@ -227,14 +235,30 @@ export class ChatGptSolAdapter {
   }
 
   async *stream(options) {
-    const pending = this.broker.enqueue(options)
     let response
-    const onAbort = () => { this.broker.cancel(pending.id) }
-    options.signal?.addEventListener('abort', onAbort, { once: true })
-    try {
-      response = await pending.response
-    } finally {
-      options.signal?.removeEventListener('abort', onAbort)
+    if (this.relay !== null) {
+      const status = await this.relay.health(options.signal)
+      if (status.ready) {
+        try {
+          response = await this.relay.complete(publicRequest(randomUUID(), options), options.signal)
+        } catch (error) {
+          if (options.signal?.aborted) {
+            response = { kind: 'aborted', failure: { message: 'Harness cancelled the browser relay request', code: 'ABORTED' } }
+          } else {
+            process.stderr.write(`shiro-relay: ${asError(error).message}; falling back to MCP handoff\n`)
+          }
+        }
+      }
+    }
+    if (response === undefined) {
+      const pending = this.broker.enqueue(options)
+      const onAbort = () => { this.broker.cancel(pending.id) }
+      options.signal?.addEventListener('abort', onAbort, { once: true })
+      try {
+        response = await pending.response
+      } finally {
+        options.signal?.removeEventListener('abort', onAbort)
+      }
     }
 
     if (response.kind === 'aborted') {
@@ -681,6 +705,10 @@ function startHttpServer(ctx, broker, config) {
         provider: config.provider,
         model: config.model,
         workspaceRoot: config.workspaceRoot,
+        browserRelay: {
+          configured: config.relayUrl !== '',
+          url: config.relayUrl,
+        },
         speedProfiles: SPEED_PROFILES.map(({ id, name, description, defaultEffort }) => ({ id, name, description, defaultEffort })),
         reasoningEfforts: REASONING_EFFORTS,
       }))
@@ -708,7 +736,12 @@ export const inject = ['llm', 'apiProxy']
 export function apply(ctx, rawConfig = {}) {
   const config = normalizeConfig(rawConfig)
   const broker = new BridgeBroker()
-  const adapter = new ChatGptSolAdapter(broker, config.provider, config.model)
+  const relay = config.relayUrl === '' ? null : new ChatGptBrowserRelay({
+    url: config.relayUrl,
+    token: config.relayToken,
+    model: config.relayModel,
+  })
+  const adapter = new ChatGptSolAdapter(broker, config.provider, config.model, relay)
   ctx.llm.registerAdapter([config.provider], adapter)
   ctx.effect(() => {
     const runtime = startHttpServer(ctx, broker, config)
