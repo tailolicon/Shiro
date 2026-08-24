@@ -9,7 +9,12 @@ $Docker = Get-Command docker -ErrorAction SilentlyContinue
 if ($null -eq $Docker) { throw 'Docker Desktop is required for Shiro sandbox_exec.' }
 
 function Test-DockerReady {
-    & $Docker.Source info --format '{{.ServerVersion}}' 2>$null | Out-Null
+    # Probe through cmd.exe so a stopped Docker daemon's stderr never reaches
+    # PowerShell: under $ErrorActionPreference = 'Stop', Windows PowerShell 5.1
+    # turns redirected native stderr into a terminating NativeCommandError,
+    # which would abort the script here instead of letting the caller start
+    # Docker Desktop and retry.
+    & cmd.exe /d /c "`"$($Docker.Source)`" info --format `"{{.ServerVersion}}`" 1>nul 2>nul"
     return $LASTEXITCODE -eq 0
 }
 
