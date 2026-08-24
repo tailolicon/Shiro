@@ -155,8 +155,30 @@ $Profile = [ordered]@{
         }
     }
 }
+# Merge instead of overwrite: `dsh plugin add` (and the in-app market)
+# install user plugins by editing this same manifest, and a hard overwrite on
+# every launch would silently uninstall them. Shiro's own entries win for
+# their keys; unknown dependencies and bundles are preserved.
+$ProfileManifestPath = Join-Path $ProfileRoot 'package.json'
+if (Test-Path -LiteralPath $ProfileManifestPath -PathType Leaf) {
+    try {
+        $Existing = Get-Content -Raw -LiteralPath $ProfileManifestPath | ConvertFrom-Json
+        foreach ($Property in @($Existing.dependencies.PSObject.Properties)) {
+            if (-not $Profile.dependencies.Contains($Property.Name)) {
+                $Profile.dependencies[$Property.Name] = $Property.Value
+            }
+        }
+        foreach ($Bundle in @($Existing.dsh.profile.bundles)) {
+            if ($null -ne $Bundle -and $Profile.dsh.profile.bundles -notcontains $Bundle) {
+                $Profile.dsh.profile.bundles = @($Profile.dsh.profile.bundles) + $Bundle
+            }
+        }
+    } catch {
+        Write-Host "Existing profile manifest could not be merged; regenerating it. ($($_.Exception.Message))"
+    }
+}
 $ProfileJson = $Profile | ConvertTo-Json -Depth 8
-[IO.File]::WriteAllText((Join-Path $ProfileRoot 'package.json'), $ProfileJson + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+[IO.File]::WriteAllText($ProfileManifestPath, $ProfileJson + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
 foreach ($ConfigName in @('cordis.yml', 'cordis.patch.yml')) {
     $ConfigPath = Join-Path $ProfileRoot $ConfigName
     if (-not (Test-Path -LiteralPath $ConfigPath)) {
