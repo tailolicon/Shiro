@@ -56,8 +56,24 @@ The next upstream commit was rejected because it added an unavailable `zipflow@1
 
 Verification: 41 focused upstream API, transport, extension-auth, model-selection and browser-safety tests passed. Shiro adds tests for loopback URL enforcement, unknown-tool rejection, effort mapping, plain-text fallback and direct adapter routing without MCP handoff. Live browser verification remains required after the one-time extension connection.
 
+## Agent tool completeness (2026-08-25)
+
+Reviewed the `awesome-dsh-plugin` catalog and the `dsh-plugin` topic for tools that fill agent-capability gaps, prompted by the Grok model shelling out to pwsh for git. Two-track outcome: native capabilities the engine already ships were enabled/mounted rather than installed, and the one genuine external gap (a Git tool) was implemented first-party after the best third-party candidate failed audit.
+
+### Native capabilities enabled (no third-party code)
+
+- `web_fetch`: the first-party `@deepseek-ai/dsh-tool-web` fetch surface shipped disabled (`fetch: false`) in every full preset. Enabled (`fetch: true`) in `standard`/`code`/`cordis`, backed by the first-party hardened `@deepseek-ai/dsh-web-fetch-http` provider (http(s) only, credential-URL rejection, same-origin redirects, byte/char caps) inserted in `bridge/cordis.patch.yml`. The agent can now read a docs page / issue / PR it found via search.
+- `tool-session-query`: the first-party prior-session search/trace tools (`session_search`, `session_trace`, …) ship opt-in and were unmounted. Mounted in the three full presets over the `ctx.sessionQuery` service that `dsh-base` already provides via `session-query-sqlite`.
+- `dsh-mcp-client`: the first-party MCP client bridge is built but unmounted. A commented one-instance-per-server template is included in `bridge/cordis.patch.yml`; connecting an external MCP server is a per-deployment choice (each server's tools inherit full trust), so it is documented rather than pre-enabled.
+
+### Native Git tool (first-party)
+
+Implemented in `bridge/src/git-commands.js` (pure core) + `bridge/src/git-tool.js` (DSH wrapper), mounted as the `shiro-git-tool` preset row, rather than installing a third-party plugin — the same precedent as the native effort routing and container tool. Tools: `git_status`, `git_diff`, `git_log`, `git_show`, `git_branch` (list/create/switch), `git_add`, `git_commit`. Safety: every git call is an argv array through `spawn(shell:false)` (no shell string, so argument injection is structurally impossible); model paths are confined to the workspace root; ref/branch names are validated (no leading `-`, no ref-illegal characters); commit messages travel via stdin (`commit --file=-`); mutations (`git_add`/`git_commit`/branch create+switch) are gated through the `tools/pre-execute` → `{kind:'ask'}` approval seam; destructive/network ops (reset, restore, checkout, clean, stash, rebase, merge, push, config) are intentionally not exposed. Verified: 8 focused tests including a live reproduction of the exact injection PoC that failed `dsh-gitflow` (proven inert here) and a stdin-verbatim commit test; full bridge suite 64/64.
+
 ## Rejected or deferred
 
+- `dsh-gitflow` (`lonelymoon87`, pinned candidate `60f254e2af0ff09f55d602953e5bad7b3b637a95` / `v0.1.3`): the best third-party Git-tool candidate on design (approval-gated mutations, stdin commit, no add/reset/push, no network, MIT). Rejected: it builds git commands as **shell strings** and its Windows quoting is broken — the audit reproduced live command injection through the ungated `git_diff` `path` parameter, and 2/7 of the plugin's own tests fail on Windows (its CI only runs Ubuntu). Shiro ships the native Git tool above instead; re-auditable if upstream moves to argv-array execution.
+- `dsh-plugin-git-workflow` / `dsh-workspace-snapshot`: same shell-string execution model as `dsh-gitflow` (workspace-snapshot narrower/read-only); superseded by the native Git tool.
 - Effort/reasoning slider variants: redundant with the native Harness model contract and likely to conflict with one another.
 - `dsh-at-file`: Shiro already ships Harness file-reference support; the shortlisted revision failed clean build/typecheck against its declared checkout layout.
 - `dsh-injection-guard`: useful design, but the audited source checkout could not resolve an unpublished `@deepseek-ai/dsh-type-meta` dependency. Shiro keeps the fixed project-root boundary, no-network container and approval gates instead of installing an unverifiable build.

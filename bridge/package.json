@@ -6,13 +6,17 @@
   "main": "src/index.js",
   "exports": {
     ".": "./src/index.js",
-    "./container-tool": "./src/container-tool.js"
+    "./container-tool": "./src/container-tool.js",
+    "./git-tool": "./src/git-tool.js"
   },
   "files": [
     "src/index.js",
     "src/chatgpt-relay.js",
+    "src/grok-cli.js",
     "src/container-tool.js",
     "src/container-path.js",
+    "src/git-tool.js",
+    "src/redact.js",
     "cordis.patch.yml"
   ],
   "scripts": {

@@ -26,6 +26,12 @@ Mỗi profile cho phép chọn `Light`, `Standard`, `High` hoặc `Max`. Trên �
 
 Hai thông số trên điều khiển chính sách làm việc của Shiro và được chuyển nguyên vẹn trong từng model request. Model/compute thật của dịch vụ ChatGPT vẫn do model selector và entitlement của ChatGPT Web quyết định; MCP không thể tự nâng quota hay thay đổi compute phía máy chủ.
 
+### Công cụ Git và web
+
+Agent có bộ tool Git riêng (first-party, không cài plugin ngoài): `git_status`, `git_diff`, `git_log`, `git_show`, `git_branch`, `git_add`, `git_commit`. Mọi lệnh git chạy qua argv array (không dựng chuỗi shell nên không thể bị chèn lệnh), đường dẫn bị giới hạn trong project root, tên nhánh/ref được kiểm tra, message commit truyền qua stdin, và các thao tác thay đổi (`git_add`/`git_commit`/tạo+chuyển nhánh) phải qua phê duyệt. Các lệnh phá hủy hoặc mạng (reset, restore, checkout, clean, stash, rebase, merge, push, config) không được mở — dùng `pwsh`/`sandbox_exec` cho những việc đó.
+
+`web_fetch` đã được bật (đọc trọn nội dung một URL, không chỉ snippet search) qua provider first-party đã được làm cứng. Tool `session_search`/`session_trace` cho phép tìm lại phiên cũ. Muốn nối một MCP server ngoài, xem mẫu comment trong `bridge/cordis.patch.yml` (mỗi server một dòng, tool hiện dưới tên `mcp__<server>__<tool>`); Shiro không tự bật vì tool của server đó thừa hưởng toàn bộ quyền tin cậy.
+
 ### Grok Build CLI
 
 Nếu máy đã cài và đăng nhập Grok Build CLI (`%USERPROFILE%\.grok\bin\grok.exe`, xác thực qua grok.com), model selector có thêm provider `Shiro · Grok Build` với `grok-4.6` và `grok-4.5`. Bridge chạy CLI ở chế độ headless một lượt với toàn bộ tool/subagent/web-search của CLI bị tắt — DeepSeek Harness vẫn giữ trọn agent loop; Grok chỉ đóng vai trò model. Output bị ép đúng schema blocks qua `--json-schema`, effort `Light/Standard/High/Max` khớp thẳng `low/medium/high/xhigh`, usage token là số thật từ CLI, và mỗi request là một tiến trình riêng nên subagent song song chạy thật sự song song. Ghi đè đường dẫn CLI bằng biến môi trường `SHIRO_GROK_CLI`; không có CLI thì provider tự ẩn.
