@@ -103,7 +103,7 @@ export class GrokCliRunner {
     const workDir = mkdtempSync(join(tmpdir(), 'shiro-grok-'))
     const promptFile = join(workDir, 'prompt.txt')
     try {
-      writeFileSync(promptFile, relayPrompt(request), 'utf8')
+      writeFileSync(promptFile, relayPrompt(request, { fenced: false }), 'utf8')
       const args = [
         '--prompt-file', promptFile,
         '--json-schema', BLOCKS_SCHEMA,

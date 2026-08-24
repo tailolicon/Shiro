@@ -217,6 +217,36 @@ test('browser relay repairs unescaped double quotes embedded in tool-call argume
   assert.match(result.blocks[0].arguments.command, /Get-ChildItem "env:APPDATA\/npm" -Filter 'dsh\*'/)
 })
 
+test('browser relay retries when the extension returns only a fenced fragment of the reply', async () => {
+  // Regression: the ChatGPT DOM extractor once reconstructed a full JSON
+  // reply as nothing but the inline-code chip from its reasoning text.
+  const relay = new ChatGptBrowserRelay({
+    url: 'http://127.0.0.1:23158',
+    token: 'relay-test-token',
+    fetchImpl: async () => Response.json({ response: '```\n$PSItem\n```' }),
+  })
+  await assert.rejects(relay.complete({ ...request, tools: [] }), (error) => {
+    assert.ok(error instanceof RelayError)
+    assert.equal(error.code, 'EMPTY_RESPONSE')
+    return true
+  })
+})
+
+test('browser relay instructs a fully fenced reply while the Grok path stays unfenced', async () => {
+  const calls = []
+  const relay = new ChatGptBrowserRelay({
+    url: 'http://127.0.0.1:23158',
+    token: 'relay-test-token',
+    fetchImpl: async (url, init = {}) => {
+      calls.push(JSON.parse(init.body))
+      return Response.json({ response: '```json\n{"blocks":[{"type":"text","text":"ok"}]}\n```' })
+    },
+  })
+  const result = await relay.complete({ ...request, tools: [] })
+  assert.deepEqual(result.blocks, [{ type: 'text', text: 'ok' }])
+  assert.match(calls[0].message, /first line must be ```json/)
+})
+
 test('browser relay still falls back to a plain text block for genuine prose', async () => {
   const relay = new ChatGptBrowserRelay({
     url: 'http://127.0.0.1:23158',

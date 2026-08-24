@@ -190,6 +190,11 @@ function extractJson(text) {
 /** True when the raw reply attempted the `{"blocks":[...]}` protocol, whether or not it parses. */
 function looksLikeAttemptedJson(rawText) {
   const trimmed = String(rawText ?? '').trim()
+  // Any fenced reply counts as an attempt: the protocol instructs one fenced
+  // JSON block, and a fence holding something else is the signature of the
+  // browser extension reconstructing only a fragment of the real reply
+  // (e.g. a lone inline-code chip) -- retry, never deliver the fragment.
+  if (trimmed.startsWith('```')) return true
   const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)```$/i)?.[1]?.trim()
   return (fenced ?? trimmed).startsWith('{')
 }
@@ -252,12 +257,22 @@ export function parseReply(rawText, tools) {
   }
 }
 
-export function relayPrompt(request) {
+export function relayPrompt(request, { fenced = true } = {}) {
+  // fenced=true is essential on the browser path: a naked JSON reply gets
+  // markdown-rendered by the ChatGPT UI (math from $...$, autolinks, inline
+  // code chips), and the extension's DOM-to-markdown reconstruction can drop
+  // everything but a stray code chip. Inside one fenced block the reply stays
+  // verbatim and code blocks are the one shape the extractor always returns
+  // intact. The Grok CLI path passes fenced=false because --json-schema
+  // already constrains its output.
+  const formatLine = fenced
+    ? 'Wrap your ENTIRE reply in exactly one fenced code block: the first line must be ```json and the last line must be ```. Output nothing outside that fence, and exactly one JSON object inside it.'
+    : 'Return exactly one JSON object with no Markdown fence or surrounding prose.'
   return [
     'You are the language-model component inside Shiro, a DeepSeek Harness agent.',
     'The Harness owns every tool, plugin, permission, subagent, workflow, terminal, filesystem and Git operation.',
     'Never claim to execute a tool yourself. When a tool is needed, request it and let Harness execute it.',
-    'Return exactly one JSON object with no Markdown fence or surrounding prose.',
+    formatLine,
     'Schema: {"blocks":[{"type":"text","text":"..."}|{"type":"reasoning","text":"visible concise reasoning summary"}|{"type":"tool_call","id":"unique-id","name":"exact available tool name","arguments":{}}],"finishReason":"stop"|"tool-calls"|"max-tokens"}.',
     'The response must be strict JSON. Inside argument strings, use forward slashes for paths and never emit a raw Windows backslash.',
     'Escape every double quote inside a JSON string value as \\". In shell commands prefer single quotes so no escaping is needed.',

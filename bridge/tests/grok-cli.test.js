@@ -103,6 +103,8 @@ test('grok runner disables the CLI agent surface and maps efforts onto CLI level
   assert.equal(captured.args[captured.args.indexOf('--reasoning-effort') + 1], 'low')
   assert.match(captured.prompt, /EXACT_HARNESS_REQUEST_JSON/)
   assert.match(captured.prompt, /"request_id":"req-1"/)
+  // The CLI path is schema-constrained, so it keeps the unfenced instruction.
+  assert.match(captured.prompt, /no Markdown fence/)
 })
 
 test('grok runner rejects tool calls that are not in the Harness tool list', async () => {
