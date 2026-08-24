@@ -29,6 +29,15 @@ function assertTool(request, name) {
   if (tool === undefined) throw new Error(`Harness request does not expose ${name}; tools: ${request.tools.map(item => item.name).join(', ')}`)
 }
 
+function latestToolResult(request) {
+  const results = request.messages.flatMap(message => (
+    Array.isArray(message.content) ? message.content.filter(block => block?.type === 'tool-result') : []
+  ))
+  const result = results.at(-1)
+  if (result === undefined) throw new Error('expected the next model request to contain a tool result')
+  return result
+}
+
 async function submit(client, outcome, blocks) {
   const request = requestFrom(outcome)
   const next = await call(client, 'harness_continue', {
@@ -94,6 +103,19 @@ try {
   }])
 
   request = requestFrom(outcome)
+  assertTool(request, 'sandbox_exec')
+  outcome = await submit(client, outcome, [{
+    type: 'tool_call', id: 'bridge-call-readonly-deps', name: 'sandbox_exec', arguments: {
+      command: 'touch node_modules/.shiro-write-must-fail',
+      description: 'Prove shared dependency volumes are read-only',
+    },
+  }])
+  const readOnlyResult = latestToolResult(requestFrom(outcome))
+  if (!JSON.stringify(readOnlyResult).match(/read-only file system/i)) {
+    throw new Error(`dependency volume accepted a write or returned an unexpected result: ${JSON.stringify(readOnlyResult)}`)
+  }
+
+  request = requestFrom(outcome)
   assertTool(request, 'pwsh')
   outcome = await submit(client, outcome, [{
     type: 'tool_call', id: 'bridge-call-pwsh', name: 'pwsh', arguments: {
@@ -109,6 +131,10 @@ try {
       file_path: '..\\outside-denied.txt', content: 'THIS_MUST_NOT_EXIST\n',
     },
   }])
+  const outsideResult = latestToolResult(requestFrom(outcome))
+  if (outsideResult.isError !== true) {
+    throw new Error(`outside-root write was not rejected: ${JSON.stringify(outsideResult)}`)
+  }
 
   outcome = await submit(client, outcome, [{ type: 'text', text: 'SOL_BRIDGE_SMOKE_DONE' }])
   if (outcome.status !== 'completed') {

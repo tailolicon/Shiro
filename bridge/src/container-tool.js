@@ -1,9 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { workspaceRelative } from './container-path.js'
-
-const IMAGE = process.env.SHIRO_RUNNER_IMAGE || 'shiro-runner:0.1.0'
+import { containerArguments } from './container-path.js'
 const MAX_OUTPUT = 256 * 1024
 
 function appendBounded(state, chunk) {
@@ -21,18 +19,7 @@ function appendBounded(state, chunk) {
 function runContainer({ workspaceRoot, command, workdir, timeoutMs, signal }) {
   return new Promise((resolveRun, rejectRun) => {
     const containerName = `shiro-task-${randomUUID()}`
-    const args = [
-      'run', '--rm', '--name', containerName,
-      '--network', 'none', '--cap-drop', 'ALL',
-      '--security-opt', 'no-new-privileges',
-      '--pids-limit', '512', '--memory', '4g', '--cpus', '4',
-      '--mount', `type=bind,source=${workspaceRoot},target=/workspace`,
-      '--mount', 'type=volume,source=shiro-root-node-modules,target=/workspace/node_modules',
-      '--mount', 'type=volume,source=shiro-bridge-node-modules,target=/workspace/bridge/node_modules',
-      '--mount', 'type=volume,source=shiro-pnpm-store,target=/pnpm/store',
-      '--workdir', workspaceRelative(workspaceRoot, workdir),
-      '--env', 'CI=true', '--env', 'PNPM_STORE_DIR=/pnpm/store', IMAGE, command,
-    ]
+    const args = containerArguments({ workspaceRoot, command, workdir, containerName })
     const child = spawn('docker', args, {
       cwd: workspaceRoot,
       windowsHide: true,
