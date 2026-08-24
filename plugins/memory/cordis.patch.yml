@@ -1,0 +1,5 @@
+- insert:
+    - id: shiro-memory
+      name: '@shiro-ai/dsh-memory'
+      config:
+        memoryRoot: !!js process.env.SHIRO_MEMORY_ROOT

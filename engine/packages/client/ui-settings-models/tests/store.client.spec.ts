@@ -97,7 +97,7 @@ describe('ModelsSettingsStore', () => {
     })
     expect(byProvider.get('anthropic')).toMatchObject({ configured: false, removable: false })
     expect(byProvider.get('anthropic')?.apiKeyEnv).toBeUndefined()
-    expect(byProvider.get('ghost')).toMatchObject({ configured: false, removable: false })
+    expect(byProvider.get('ghost')).toMatchObject({ configured: true, removable: false })
     expect(state.namespaces.get('llm-pi-ai')?.ns).toBe('llm-pi-ai')
   })
 

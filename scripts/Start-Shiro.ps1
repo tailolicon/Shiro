@@ -12,9 +12,11 @@ if ([string]::IsNullOrWhiteSpace($ProjectRoot)) { $ProjectRoot = $RepoRoot }
 $ProjectRoot = (Resolve-Path -LiteralPath $ProjectRoot).Path
 $EngineRoot = Join-Path $RepoRoot 'engine'
 $BridgeRoot = Join-Path $RepoRoot 'bridge'
+$WebSearchExaRoot = Join-Path $EngineRoot 'packages\web\web-search-exa'
 $DesktopRoot = Join-Path $RepoRoot 'desktop'
 $AutoContinueRoot = Join-Path $RepoRoot 'plugins\auto-continue'
 $SubagentMonitorRoot = Join-Path $RepoRoot 'plugins\subagent-monitor'
+$MemoryRoot = Join-Path $RepoRoot 'plugins\memory'
 $PluginCatalogRoot = Join-Path $RepoRoot 'research\awesome-dsh-plugin'
 $RelayRoot = Join-Path $RepoRoot 'relay\chatgpt-bridge'
 $RuntimeRoot = Join-Path (Split-Path -Parent $RepoRoot) '.ShiroRuntime'
@@ -31,6 +33,7 @@ $BuildMarker = Join-Path $EngineRoot '.shiro-build-ready'
 
 $AutoContinueManifest = Join-Path $AutoContinueRoot 'package.json'
 $SubagentMonitorManifest = Join-Path $SubagentMonitorRoot 'package.json'
+$MemoryManifest = Join-Path $MemoryRoot 'package.json'
 $PluginCatalogManifest = Join-Path $PluginCatalogRoot 'package.json'
 $RelayManifest = Join-Path $RelayRoot 'package.json'
 $MissingPlugin = -not (Test-Path -LiteralPath $AutoContinueManifest -PathType Leaf) `
@@ -45,12 +48,12 @@ if ($MissingPlugin -and (Test-Path -LiteralPath (Join-Path $RepoRoot '.gitmodule
     if ($LASTEXITCODE -ne 0) { throw 'Shiro plugin submodule initialization failed.' }
 }
 
-foreach ($RequiredPath in @($EngineRoot, $BridgeRoot, $DesktopRoot, $AutoContinueRoot, $SubagentMonitorRoot, $PluginCatalogRoot, $RelayRoot, $ProjectRoot)) {
+foreach ($RequiredPath in @($EngineRoot, $BridgeRoot, $DesktopRoot, $AutoContinueRoot, $SubagentMonitorRoot, $MemoryRoot, $PluginCatalogRoot, $RelayRoot, $ProjectRoot)) {
     if (-not (Test-Path -LiteralPath $RequiredPath -PathType Container)) {
         throw "Required Shiro directory is missing: $RequiredPath"
     }
 }
-foreach ($RequiredFile in @($AutoContinueManifest, $SubagentMonitorManifest, $PluginCatalogManifest, $RelayManifest)) {
+foreach ($RequiredFile in @($AutoContinueManifest, $SubagentMonitorManifest, $MemoryManifest, $PluginCatalogManifest, $RelayManifest)) {
     if (-not (Test-Path -LiteralPath $RequiredFile -PathType Leaf)) {
         throw "Required pinned Shiro plugin manifest is missing: $RequiredFile"
     }
@@ -95,8 +98,10 @@ if (-not (Test-Path -LiteralPath $RelayEnvFile -PathType Leaf)) {
 }
 
 $BridgeLink = ($BridgeRoot -replace '\\', '/')
+$WebSearchExaLink = ($WebSearchExaRoot -replace '\\', '/')
 $AutoContinueLink = ($AutoContinueRoot -replace '\\', '/')
 $SubagentMonitorLink = ($SubagentMonitorRoot -replace '\\', '/')
+$MemoryLink = ($MemoryRoot -replace '\\', '/')
 $EngineLink = ($EngineRoot -replace '\\', '/')
 $Profile = [ordered]@{
     name = 'shiro-profile-web'
@@ -118,8 +123,10 @@ $Profile = [ordered]@{
         '@deepseek-ai/dsh-subagent' = "link:$EngineLink/packages/subagent/subagent"
         '@deepseek-ai/dsh-tools' = "link:$EngineLink/packages/core/tools"
         '@shiro-ai/harness-bridge' = "link:$BridgeLink"
+        '@deepseek-ai/dsh-web-search-exa' = "link:$WebSearchExaLink"
         'dsh-client-auto-continue' = "file:$AutoContinueLink"
         '@leetoners/dsh-ui-subagent-monitor' = "file:$SubagentMonitorLink"
+        '@shiro-ai/dsh-memory' = "link:$MemoryLink"
     }
     dsh = [ordered]@{
         profile = [ordered]@{
@@ -129,6 +136,7 @@ $Profile = [ordered]@{
                 '@shiro-ai/harness-bridge',
                 'dsh-client-auto-continue',
                 '@leetoners/dsh-ui-subagent-monitor'
+                '@shiro-ai/dsh-memory'
             )
         }
     }

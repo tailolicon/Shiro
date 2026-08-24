@@ -297,9 +297,7 @@ function Loaded({ injected }: { injected: ModelsSectionFace }): ReactNode {
         {configured.map((row) => {
           const target = targetOf(row)
           const namespace = state.namespaces.get(target.settingsNs)
-          /* v8 ignore next -- the join marks a row configured only when its namespace resolved */
-          if (namespace === undefined) return null
-          if (needsSetup(row, anyUsable) && !dismissedSetup.has(row.entry.provider)) {
+          if (namespace !== undefined && needsSetup(row, anyUsable) && !dismissedSetup.has(row.entry.provider)) {
             // First-run posture: the provider exists but has no key — the
             // setup card IS its presence on the page, until the user closes it.
             return (
@@ -316,7 +314,7 @@ function Loaded({ injected }: { injected: ModelsSectionFace }): ReactNode {
               </li>
             )
           }
-          const open = !adding && editing?.provider === row.entry.provider
+          const open = namespace !== undefined && !adding && editing?.provider === row.entry.provider
           const credentialConfigured = row.credential?.configured === true
           const credentialMissing = !credentialConfigured
             && row.apiKeyEnv !== undefined
@@ -353,22 +351,26 @@ function Loaded({ injected }: { injected: ModelsSectionFace }): ReactNode {
                       : null}
                 </span>
                 <span className={styles['rowActions']}>
-                  <button
-                    type="button"
-                    className={styles['secondaryButton']}
-                    aria-label={providerCopy(t('editProvider'), target)}
-                    onClick={() => {
-                      setSavedTarget(undefined)
-                      // One card at a time: leaving `declaring` set would show
-                      // the create card beside this editor, and closing either
-                      // one discards the other's draft.
-                      setDeclaring(false)
-                      setAdding(false)
-                      setEditing(open ? undefined : target)
-                    }}
-                  >
-                    {t('edit')}
-                  </button>
+                  {namespace === undefined
+                    ? null
+                    : (
+                      <button
+                        type="button"
+                        className={styles['secondaryButton']}
+                        aria-label={providerCopy(t('editProvider'), target)}
+                        onClick={() => {
+                          setSavedTarget(undefined)
+                          // One card at a time: leaving `declaring` set would show
+                          // the create card beside this editor, and closing either
+                          // one discards the other's draft.
+                          setDeclaring(false)
+                          setAdding(false)
+                          setEditing(open ? undefined : target)
+                        }}
+                      >
+                        {t('edit')}
+                      </button>
+                    )}
                   {row.removable
                     ? (
                       <button
@@ -388,7 +390,7 @@ function Loaded({ injected }: { injected: ModelsSectionFace }): ReactNode {
                     : null}
                 </span>
               </div>
-              {open
+              {open && namespace !== undefined
                 ? renderProviderEditor({
                   target,
                   namespace,

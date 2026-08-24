@@ -21,6 +21,9 @@ export const EXA_PROVIDER_ID = 'exa'
 /** Default Exa search endpoint; `/search` is the operation. */
 export const EXA_DEFAULT_BASE_URL = 'https://api.exa.ai'
 
+/** Hosted Exa MCP endpoint used when no API key is configured. */
+export const EXA_DEFAULT_MCP_URL = 'https://mcp.exa.ai/mcp'
+
 /** Default retrieval mode: let Exa pick between keyword and neural search. */
 export const EXA_DEFAULT_SEARCH_TYPE = 'auto'
 
@@ -30,12 +33,23 @@ export const EXA_DEFAULT_HIGHLIGHTS_PER_RESULT = 1
 /** Attribution header sent on every request. Bump with the package version. */
 const USER_AGENT = 'deepseek-harness/0.0.1'
 
+/** Attribution header for anonymous hosted-MCP requests. */
+const MCP_SOURCE = 'shiro'
+
+/** Exa's hosted MCP tool for ordinary web search. */
+const MCP_TOOL = 'web_search_exa'
+
+/** Keep model-facing snippets bounded even when MCP returns full page text. */
+const MAX_MCP_SNIPPET_CHARS = 500
+
 /** Resolved provider options (the plugin's `apply` supplies env-var and constant defaults). */
 export interface ExaSearchProviderOptions {
-  /** Exa API key. Empty/absent makes the provider unavailable. */
+  /** Exa API key. Empty selects the anonymous hosted-MCP path. */
   apiKey: string
   /** Endpoint base; `/search` is appended. */
   baseURL: string
+  /** Anonymous hosted-MCP endpoint used when `apiKey` is empty. */
+  mcpURL?: string
   /** Retrieval mode sent as Exa's `type`. */
   searchType: 'auto' | 'keyword' | 'neural'
   /** Default result count when a request carries no `maxResults`. */
@@ -87,13 +101,17 @@ export class ExaSearchProvider implements WebSearchProvider {
   constructor(private readonly options: ExaSearchProviderOptions) {}
 
   available(): boolean {
-    return this.options.apiKey.length > 0
-      && isValidBaseUrl(this.options.baseURL)
+    const endpointAvailable = this.options.apiKey.length > 0
+      ? isValidBaseUrl(this.options.baseURL)
+      : isValidBaseUrl(this.options.mcpURL ?? EXA_DEFAULT_MCP_URL)
+    return endpointAvailable
       && isPositiveInteger(this.options.highlightsPerResult)
       && (this.options.numResults === undefined || isPositiveInteger(this.options.numResults))
   }
 
   async search(request: WebSearchRequest, signal?: AbortSignal): Promise<WebSearchResult> {
+    if (this.options.apiKey.length === 0) return await this.searchAnonymous(request, signal)
+
     // A per-request bound wins over the configured default; either may be absent.
     const numResults = request.maxResults ?? this.options.numResults
     let response: Response
@@ -147,6 +165,115 @@ export class ExaSearchProvider implements WebSearchProvider {
       throw new WebError(`Exa returned an unprocessable response body: ${String(error)}`, 'WEB_PROVIDER_ERROR', { cause: error })
     }
   }
+
+  /** Search through Exa's credential-free hosted MCP endpoint. */
+  private async searchAnonymous(request: WebSearchRequest, signal?: AbortSignal): Promise<WebSearchResult> {
+    const numResults = request.maxResults ?? this.options.numResults
+    let response: Response
+    try {
+      response = await fetch(this.options.mcpURL ?? EXA_DEFAULT_MCP_URL, {
+        method: 'POST',
+        redirect: 'error',
+        headers: {
+          'content-type': 'application/json',
+          'accept': 'application/json, text/event-stream',
+          'x-exa-source': MCP_SOURCE,
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: `shiro-${crypto.randomUUID()}`,
+          method: 'tools/call',
+          params: {
+            name: MCP_TOOL,
+            arguments: {
+              query: request.query,
+              ...numResults !== undefined ? { numResults } : {},
+            },
+          },
+        }),
+        ...signal !== undefined ? { signal } : {},
+      })
+    } catch (error: unknown) {
+      if (isAbortError(error)) throw new WebError('Exa anonymous search aborted', 'WEB_ABORTED', { cause: error })
+      throw new WebError(`Exa anonymous search request failed: ${String(error)}`, 'WEB_PROVIDER_ERROR', { cause: error })
+    }
+
+    if (!response.ok) {
+      const detail = response.status === 429
+        ? 'Exa anonymous search rate limit reached; configure EXA_API_KEY for higher limits'
+        : `Exa anonymous MCP error (HTTP ${response.status})`
+      throw new WebError(detail, 'WEB_PROVIDER_ERROR')
+    }
+
+    try {
+      const payload = parseMcpPayload(await response.text())
+      if (payload === undefined) throw new Error('response was neither JSON nor MCP event-stream data')
+      if (payload.error !== undefined) {
+        throw new Error(String(payload.error.message ?? JSON.stringify(payload.error)))
+      }
+      const content = payload.result?.content
+      if (payload.result?.isError === true || !Array.isArray(content)) {
+        const detail = Array.isArray(content)
+          ? content.map(item => typeof item.text === 'string' ? item.text : '').filter(Boolean).join('\n')
+          : 'missing result content'
+        throw new Error(detail || 'MCP tool returned an error')
+      }
+      const text = content
+        .map(item => typeof item.text === 'string' ? item.text : '')
+        .filter(Boolean)
+        .join('\n\n')
+      return { sources: parseMcpSources(text), truncated: false }
+    } catch (error: unknown) {
+      if (isAbortError(error)) throw new WebError('Exa anonymous search aborted', 'WEB_ABORTED', { cause: error })
+      if (error instanceof WebError) throw error
+      throw new WebError(`Exa anonymous MCP returned an unprocessable response: ${String(error)}`, 'WEB_PROVIDER_ERROR', { cause: error })
+    }
+  }
+}
+
+interface McpPayload {
+  error?: { message?: unknown }
+  result?: {
+    isError?: boolean
+    content?: Array<{ text?: unknown }>
+  }
+}
+
+/** Parse either a plain JSON MCP response or the first event-stream data frame. */
+function parseMcpPayload(text: string): McpPayload | undefined {
+  const frames = text.split(/\r?\n\r?\n/)
+  for (const frame of frames) {
+    const data = frame.split(/\r?\n/)
+      .filter(line => line.startsWith('data:'))
+      .map(line => line.slice(5).trimStart())
+      .join('\n')
+    if (data.length === 0) continue
+    try { return JSON.parse(data) as McpPayload } catch {}
+  }
+  try { return JSON.parse(text) as McpPayload } catch { return undefined }
+}
+
+/** Normalize Exa's text sections into the provider-neutral source shape. */
+function parseMcpSources(text: string): WebSearchSource[] {
+  const sources: WebSearchSource[] = []
+  const sections = text.replace(/\r/g, '')
+    .split(/\n\s*---\s*\n(?=Title:\s*)|\n{2,}(?=Title:\s*)/)
+    .map(section => section.trim())
+    .filter(section => section.startsWith('Title:'))
+  for (const section of sections) {
+    const title = section.match(/^Title:\s*(.*)$/m)?.[1]?.trim()
+    const url = section.match(/^URL:\s*(.*)$/m)?.[1]?.trim()
+    const published = section.match(/^Published(?: Date)?:\s*(.*)$/m)?.[1]?.trim()
+    const highlights = section.match(/^Highlights:\s*\n([\s\S]*)$/m)?.[1]?.trim()
+    if (!url || !highlights) continue
+    sources.push({
+      url,
+      ...title ? { title } : {},
+      snippet: highlights.slice(0, MAX_MCP_SNIPPET_CHARS),
+      ...published && published !== 'N/A' ? { publishedAt: published } : {},
+    })
+  }
+  return sources
 }
 
 /** True when `baseURL` parses as an absolute URL (a cheap local config check). */

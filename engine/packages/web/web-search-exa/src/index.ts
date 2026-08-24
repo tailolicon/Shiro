@@ -16,12 +16,14 @@ import {
   ExaSearchProvider,
   EXA_DEFAULT_BASE_URL,
   EXA_DEFAULT_HIGHLIGHTS_PER_RESULT,
+  EXA_DEFAULT_MCP_URL,
   EXA_DEFAULT_SEARCH_TYPE,
 } from './provider.ts'
 
 export {
   EXA_DEFAULT_BASE_URL,
   EXA_DEFAULT_HIGHLIGHTS_PER_RESULT,
+  EXA_DEFAULT_MCP_URL,
   EXA_DEFAULT_SEARCH_TYPE,
   EXA_PROVIDER_ID,
   ExaSearchProvider,
@@ -36,10 +38,12 @@ export const inject = ['web']
 
 /** Plugin config (all optional — `apply` fills env-var and constant defaults). */
 export interface Config {
-  /** Exa API key. Falls back to `$EXA_API_KEY`. Empty → provider unavailable. */
+  /** Exa API key. Falls back to `$EXA_API_KEY`. Empty → anonymous MCP. */
   apiKey?: string
   /** Endpoint base; `/search` is appended. Defaults to the public API. */
   baseURL?: string
+  /** Hosted MCP endpoint used without a key. */
+  mcpURL?: string
   /** Retrieval mode sent as Exa's `type`. Defaults to `auto`. */
   searchType?: 'auto' | 'keyword' | 'neural'
   /** Default result count when a request carries no `maxResults`. Omitted = none. */
@@ -51,6 +55,7 @@ export interface Config {
 export const Config: z<Config> = z.object({
   apiKey: z.string(),
   baseURL: z.string(),
+  mcpURL: z.string(),
   searchType: z.union(['auto', 'keyword', 'neural'] as const),
   numResults: z.number().step(1).min(1),
   highlightsPerResult: z.number().step(1).min(1),
@@ -63,6 +68,7 @@ export function apply(ctx: Context, config: Config): void {
     // project it is launched in, and the managed store is not involved here.
     apiKey: config.apiKey ?? launchEnvironmentOf(ctx).get('EXA_API_KEY')?.value ?? '',
     baseURL: config.baseURL ?? EXA_DEFAULT_BASE_URL,
+    mcpURL: config.mcpURL ?? EXA_DEFAULT_MCP_URL,
     searchType: config.searchType ?? EXA_DEFAULT_SEARCH_TYPE,
     highlightsPerResult: config.highlightsPerResult ?? EXA_DEFAULT_HIGHLIGHTS_PER_RESULT,
     ...config.numResults !== undefined ? { numResults: config.numResults } : {},

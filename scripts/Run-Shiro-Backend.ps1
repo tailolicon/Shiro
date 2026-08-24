@@ -29,6 +29,7 @@ if ([string]::IsNullOrWhiteSpace($RelaySettings.API_TOKEN)) {
 
 $env:DSH_HOME = Join-Path $RuntimeRoot 'dsh-home'
 $env:DSH_AGENTS_HOME = Join-Path $RuntimeRoot 'agents'
+$env:SHIRO_MEMORY_ROOT = Join-Path $RuntimeRoot 'memory'
 $env:SHIRO_WORKSPACE_ROOT = (Resolve-Path -LiteralPath $ProjectRoot).Path
 $env:SHIRO_BRIDGE_TOKEN = (Get-Content -Raw -LiteralPath $TokenFile).Trim()
 $env:SHIRO_BRIDGE_PORT = [string]$McpPort

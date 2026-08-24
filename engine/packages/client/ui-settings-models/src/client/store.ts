@@ -162,8 +162,14 @@ export class ModelsSettingsStore {
     const namespaces = new Map(views.map(view => [view.ns, view]))
     const rows: ProviderRow[] = providers.map((entry) => {
       const namespace = namespaces.get(entry.settingsNs)
-      const configured = namespace !== undefined
-        && (entry.settingsPath.length === 0 || this.schema.getPath(namespace.value, entry.settingsPath) !== undefined)
+      // The host deliberately includes live adapter routes that own no
+      // settings surface (subscription/local transports such as Shiro). They
+      // are already configured by composition and must remain visible instead
+      // of falling into the addable/dormant bucket that excludes an empty ns.
+      const configured = entry.settingsNs === ''
+        ? entry.active
+        : namespace !== undefined
+          && (entry.settingsPath.length === 0 || this.schema.getPath(namespace.value, entry.settingsPath) !== undefined)
       const removable = namespace !== undefined
         && entry.settingsPath.length > 0
         && this.schema.hasPath(namespace.user, entry.settingsPath)

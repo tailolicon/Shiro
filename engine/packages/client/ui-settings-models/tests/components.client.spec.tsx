@@ -137,6 +137,7 @@ function fail<T>(message: string, code = 'settings-rejected'): RpcResponse<T> {
 }
 
 function scriptedFace(overrides: {
+  providers?: ReturnType<typeof vi.fn>
   update?: ReturnType<typeof vi.fn>
   replace?: ReturnType<typeof vi.fn>
   mutate?: ReturnType<typeof vi.fn>
@@ -150,7 +151,7 @@ function scriptedFace(overrides: {
   const unset = overrides.unset ?? vi.fn(() => Promise.resolve(ok({})))
   const face = {
     llm: {
-      providers: vi.fn(() => Promise.resolve(ok({
+      providers: overrides.providers ?? vi.fn(() => Promise.resolve(ok({
         providers: [
           { provider: 'deepseek-official', displayName: 'DeepSeek', settingsNs: 'llm-deepseek', settingsPath: [], active: true },
           { provider: 'openai', displayName: 'openai', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'openai'], active: true },
@@ -234,6 +235,17 @@ describe('ModelsSection', () => {
     const uninjected = {} as ModelsSectionProps
     render(<ModelsSection {...uninjected} />)
     expect(document.body.textContent).toBe('')
+  })
+
+  it('renders a live provider without settings as a non-editable row', async () => {
+    const provider = { provider: 'shiro-sol', displayName: 'Shiro · GPT-5.6 Sol', settingsNs: '', settingsPath: [], active: true }
+    await mountSection({
+      providers: vi.fn(() => Promise.resolve(ok({ providers: [provider] }))),
+    })
+    expect(screen.getByText(provider.displayName)).toBeTruthy()
+    expect(screen.queryByRole('button', {
+      name: providerCopy(en.editProvider, { provider: provider.provider, displayName: provider.displayName }),
+    })).toBeNull()
   })
 
   it('renders the unkeyed whole-section provider as an open setup card in the first-run posture', async () => {

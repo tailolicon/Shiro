@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import WebRuntime from '@deepseek-ai/dsh-web'
-import { ExaSearchProvider, EXA_PROVIDER_ID } from '@deepseek-ai/dsh-web-search-exa'
+import { ExaSearchProvider, EXA_DEFAULT_MCP_URL, EXA_PROVIDER_ID } from '@deepseek-ai/dsh-web-search-exa'
 import * as exaPlugin from '@deepseek-ai/dsh-web-search-exa'
 import { mapExaResponse, mapExaResult } from '../src/provider.ts'
 
-const options = { apiKey: 'exa-key', baseURL: 'https://api.exa.test', searchType: 'auto' as const, highlightsPerResult: 1 }
+const options = { apiKey: 'exa-key', baseURL: 'https://api.exa.test', mcpURL: EXA_DEFAULT_MCP_URL, searchType: 'auto' as const, highlightsPerResult: 1 }
 
 function jsonResponse(body: unknown, init: ResponseInit = {}): Response {
   return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' }, ...init })
@@ -63,8 +63,8 @@ describe('Exa result mapping', () => {
 })
 
 describe('ExaSearchProvider availability', () => {
-  it('is unavailable without a key', () => {
-    expect(new ExaSearchProvider({ ...options, apiKey: '' }).available()).toBe(false)
+  it('is available without a key through hosted MCP', () => {
+    expect(new ExaSearchProvider({ ...options, apiKey: '' }).available()).toBe(true)
   })
 
   it('is available with a key', () => {
@@ -73,6 +73,10 @@ describe('ExaSearchProvider availability', () => {
 
   it('is misconfigured when the base URL is unparseable', () => {
     expect(new ExaSearchProvider({ ...options, baseURL: 'not a url' }).available()).toBe(false)
+  })
+
+  it('is misconfigured when the keyless MCP URL is unparseable', () => {
+    expect(new ExaSearchProvider({ ...options, apiKey: '', mcpURL: 'not a url' }).available()).toBe(false)
   })
 
   it('is misconfigured when highlightsPerResult is not a positive integer', () => {
@@ -86,6 +90,24 @@ describe('ExaSearchProvider availability', () => {
 })
 
 describe('ExaSearchProvider request mapping', () => {
+  it('uses anonymous MCP without credentials and maps multiple result sections', async () => {
+    const fetchMock = vi.fn(async () => new Response(
+      'event: message\ndata: {"result":{"content":[{"type":"text","text":"Title: A\\nURL: https://a.test\\nPublished: N/A\\nHighlights:\\nFirst result\\n\\n---\\n\\nTitle: B\\nURL: https://b.test\\nPublished: 2026-08-24\\nHighlights:\\nSecond result"}]},"jsonrpc":"2.0","id":"test"}\n\n',
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    ))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await new ExaSearchProvider({ ...options, apiKey: '' }).search({ query: 'hello', maxResults: 2 })
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
+    expect(url).toBe(EXA_DEFAULT_MCP_URL)
+    expect((init.headers as Record<string, string>)['authorization']).toBeUndefined()
+    expect(JSON.parse(init.body as string).params.arguments).toEqual({ query: 'hello', numResults: 2 })
+    expect(result.sources).toEqual([
+      { url: 'https://a.test', title: 'A', snippet: 'First result' },
+      { url: 'https://b.test', title: 'B', snippet: 'Second result', publishedAt: '2026-08-24' },
+    ])
+  })
+
   it('sends query, type, highlights, numResults and bearer auth', async () => {
     const fetchMock = vi.fn(async () => jsonResponse({ results: [{ url: 'https://a.test', highlights: ['hi'] }] }))
     vi.stubGlobal('fetch', fetchMock)
@@ -245,15 +267,18 @@ describe('web-search-exa plugin registration', () => {
     }
   })
 
-  it('is unavailable when neither config nor env supplies a key', async () => {
+  it('uses anonymous MCP when neither config nor env supplies a key', async () => {
     const prev = process.env.EXA_API_KEY
     delete process.env.EXA_API_KEY
     try {
       const ctx = new Context()
       await ctx.plugin(WebRuntime, { searchProvider: EXA_PROVIDER_ID })
+      vi.stubGlobal('fetch', vi.fn(async () => new Response(
+        'event: message\ndata: {"result":{"content":[]},"jsonrpc":"2.0","id":"test"}\n\n',
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      )))
       await ctx.plugin(exaPlugin, {})
-      await expect(ctx.web.search({ query: 'q' }))
-        .rejects.toThrow(expect.objectContaining({ code: 'WEB_PROVIDER_CONFIGURED_UNAVAILABLE' }))
+      await expect(ctx.web.search({ query: 'q' })).resolves.toEqual({ sources: [], truncated: false })
     } finally {
       if (prev !== undefined) process.env.EXA_API_KEY = prev
     }
