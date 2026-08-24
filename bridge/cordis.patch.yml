@@ -16,6 +16,22 @@
       name: '@deepseek-ai/dsh-web-search-exa'
       config:
         mcpURL: https://mcp.exa.ai/mcp
+    # First-party anonymous HTTP fetch provider backing the web_fetch tool
+    # (enabled per-preset via tool-web `fetch: true`). Hardened upstream:
+    # http(s) only, credential-URL rejection, same-origin redirects, byte
+    # and char caps, product User-Agent.
+    - id: web-fetch-http
+      name: '@deepseek-ai/dsh-web-fetch-http'
+    # To connect an external MCP server, copy this row into
+    # E:\Project\.ShiroRuntime\dsh-home\profiles\web\cordis.patch.yml
+    # (one instance per server; tools appear as mcp__<serverName>__<tool>):
+    # - id: mcp-github
+    #   name: '@deepseek-ai/dsh-mcp-client'
+    #   config:
+    #     serverName: github
+    #     transport: stdio
+    #     command: npx
+    #     args: ['-y', '@modelcontextprotocol/server-github']
     - id: llm-shiro-harness-bridge
       name: '@shiro-ai/harness-bridge'
       config:

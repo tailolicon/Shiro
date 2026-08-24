@@ -55,6 +55,11 @@
   config:
     workspaceRoot: !!js process.env.SHIRO_WORKSPACE_ROOT
 
+- id: shiro-git-tool
+  name: '@shiro-ai/harness-bridge/git-tool'
+  config:
+    workspaceRoot: !!js process.env.SHIRO_WORKSPACE_ROOT
+
 # ── filesystem ──────────────────────────────────────────────────────────────
 
 # Both register into the host `tools` registry and provide nothing, so
@@ -241,7 +246,7 @@
 - id: tool-web
   name: '@deepseek-ai/dsh-tool-web'
   config:
-    fetch: false
+    fetch: true
     searchTimeoutMs: 60000
 
 # ── self-modification ───────────────────────────────────────────────────────
@@ -266,3 +271,9 @@
 
 - id: tool-skill
   name: '@deepseek-ai/dsh-tool-skill'
+
+# Prior-session search and trace tools over the host ctx.sessionQuery
+# service (mounted by dsh-base via session-query-sqlite). Opt-in upstream;
+# Shiro mounts it for agent completeness.
+- id: tool-session-query
+  name: '@deepseek-ai/dsh-tool-session-query'
