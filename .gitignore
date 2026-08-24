@@ -12,6 +12,8 @@ desktop/.pake/
 desktop/src-tauri/target/
 desktop/*.exe
 desktop/*.msi
+# One-click launcher binary (rebuild with scripts/Build-Launcher.ps1)
+/Shiro.exe
 
 # Local state and secrets must never enter Git
 .env

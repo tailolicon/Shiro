@@ -3,7 +3,8 @@ param(
     [int]$WebPort = 3080,
     [int]$McpPort = 23157,
     [switch]$Rebuild,
-    [switch]$NoDesktop
+    [switch]$NoDesktop,
+    [switch]$NoHiddenBrowser
 )
 
 $ErrorActionPreference = 'Stop'
@@ -63,6 +64,19 @@ foreach ($Directory in @($RuntimeRoot, $DshHome, $ProfileRoot, $StateRoot, $LogR
     if (-not (Test-Path -LiteralPath $Directory)) {
         New-Item -ItemType Directory -Path $Directory | Out-Null
     }
+}
+
+# pnpm can be absent from a non-interactive PATH (double-click launches,
+# services). corepack ships with Node.js, so fall back to a corepack shim
+# that child processes inherit through PATH.
+if ($null -eq (Get-Command pnpm -ErrorAction SilentlyContinue)) {
+    if ($null -eq (Get-Command corepack -ErrorAction SilentlyContinue)) {
+        throw 'Neither pnpm nor corepack is on PATH; install Node.js (with corepack) first.'
+    }
+    $ShimRoot = Join-Path $RuntimeRoot 'bin'
+    if (-not (Test-Path -LiteralPath $ShimRoot)) { New-Item -ItemType Directory -Path $ShimRoot | Out-Null }
+    [IO.File]::WriteAllText((Join-Path $ShimRoot 'pnpm.cmd'), "@corepack pnpm %*`r`n", [Text.UTF8Encoding]::new($false))
+    $env:Path = "$ShimRoot;$env:Path"
 }
 
 if (-not (Test-Path -LiteralPath $TokenFile -PathType Leaf)) {
@@ -280,9 +294,53 @@ if (-not $Healthy) {
 Write-Host "Shiro is ready: http://127.0.0.1:$WebPort/"
 Write-Host "Locked project root: $ProjectRoot"
 
+function Find-ChromePath {
+    $Candidates = @(
+        (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe' -ErrorAction SilentlyContinue).'(default)'
+        (Join-Path $env:ProgramFiles 'Google\Chrome\Application\chrome.exe')
+        (Join-Path ${env:ProgramFiles(x86)} 'Google\Chrome\Application\chrome.exe')
+        (Join-Path $env:LOCALAPPDATA 'Google\Chrome\Application\chrome.exe')
+    )
+    foreach ($Candidate in $Candidates) {
+        if ($Candidate -and (Test-Path -LiteralPath $Candidate -PathType Leaf)) { return $Candidate }
+    }
+    return $null
+}
+
 if (-not $NoDesktop -and [int]($RelayHealth.clients) -lt 1) {
-    Write-Host 'ChatGPT relay needs its one-time browser connection; opening the local setup page.'
-    Start-Process "http://127.0.0.1:$RelayPort/setup" | Out-Null
+    # Keep GPT-5.6 Sol reachable without a visible browser: run the companion
+    # extension inside a dedicated, minimized Chrome profile. Login and the
+    # one-time Bridge-token connection persist in that profile, so after the
+    # first setup this starts silently.
+    $ChromeProfileRoot = Join-Path $RuntimeRoot 'chrome-profile'
+    $Chrome = Find-ChromePath
+    $ProfileChromeRunning = $null -ne (Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like "*$ChromeProfileRoot*" } | Select-Object -First 1)
+    if (-not $NoHiddenBrowser -and $null -ne $Chrome -and -not $ProfileChromeRunning) {
+        Write-Host 'Starting the dedicated ChatGPT browser profile (minimized)...'
+        $ChromeArguments = @(
+            "--user-data-dir=$ChromeProfileRoot",
+            "--load-extension=$RelayExtensionRoot",
+            '--no-first-run',
+            '--no-default-browser-check',
+            '--disable-background-timer-throttling',
+            'https://chatgpt.com/'
+        )
+        Start-Process -FilePath $Chrome -ArgumentList $ChromeArguments -WindowStyle Minimized | Out-Null
+        for ($Attempt = 0; $Attempt -lt 40; $Attempt++) {
+            Start-Sleep -Milliseconds 500
+            try {
+                $RelayHealth = Invoke-RestMethod -Uri "http://127.0.0.1:$RelayPort/health" -Headers $RelayHeaders -TimeoutSec 1
+                if ([int]($RelayHealth.clients) -ge 1) { break }
+            } catch {
+            }
+        }
+    }
+    if ([int]($RelayHealth.clients) -lt 1) {
+        Write-Host 'ChatGPT relay needs its one-time browser connection; opening the local setup page.'
+        Write-Host 'Log in to chatgpt.com in the minimized "Shiro" Chrome window, then paste the Bridge token from the setup page into the extension.'
+        Start-Process "http://127.0.0.1:$RelayPort/setup" | Out-Null
+    }
 }
 
 if (-not $NoDesktop) {
