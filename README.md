@@ -26,6 +26,10 @@ Mỗi profile cho phép chọn `Light`, `Standard`, `High` hoặc `Max`. Trên �
 
 Hai thông số trên điều khiển chính sách làm việc của Shiro và được chuyển nguyên vẹn trong từng model request. Model/compute thật của dịch vụ ChatGPT vẫn do model selector và entitlement của ChatGPT Web quyết định; MCP không thể tự nâng quota hay thay đổi compute phía máy chủ.
 
+### Grok Build CLI
+
+Nếu máy đã cài và đăng nhập Grok Build CLI (`%USERPROFILE%\.grok\bin\grok.exe`, xác thực qua grok.com), model selector có thêm provider `Shiro · Grok Build` với `grok-4.6` và `grok-4.5`. Bridge chạy CLI ở chế độ headless một lượt với toàn bộ tool/subagent/web-search của CLI bị tắt — DeepSeek Harness vẫn giữ trọn agent loop; Grok chỉ đóng vai trò model. Output bị ép đúng schema blocks qua `--json-schema`, effort `Light/Standard/High/Max` khớp thẳng `low/medium/high/xhigh`, usage token là số thật từ CLI, và mỗi request là một tiến trình riêng nên subagent song song chạy thật sự song song. Ghi đè đường dẫn CLI bằng biến môi trường `SHIRO_GROK_CLI`; không có CLI thì provider tự ẩn.
+
 ## Nâng cấp đã chọn lọc
 
 - `dsh-auto-continue`: tự phục hồi lỗi tạm thời/max-token với backoff, giới hạn số lần, phát hiện vòng lặp và không tiếp tục sau khi người dùng dừng.

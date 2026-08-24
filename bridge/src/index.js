@@ -5,6 +5,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { z } from 'zod'
 import { ChatGptBrowserRelay, RelayError, RELAY_RETRYABLE_CODES } from './chatgpt-relay.js'
+import { GrokCliRunner, resolveGrokCliPath } from './grok-cli.js'
 import { redactSecrets } from './redact.js'
 
 const DEFAULT_PROVIDER = 'shiro-sol'
@@ -59,6 +60,11 @@ function normalizeConfig(config = {}) {
     relayUrl,
     relayToken,
     relayModel: requiredString(config.relayModel ?? 'GPT-5.6 Sol', 'relayModel'),
+    grokProvider: requiredString(config.grokProvider ?? 'shiro-grok', 'grokProvider'),
+    grokCliPath: typeof config.grokCliPath === 'string' ? config.grokCliPath.trim() : '',
+    grokModels: Array.isArray(config.grokModels) && config.grokModels.length > 0
+      ? config.grokModels.map(model => requiredString(model, 'grokModels[]'))
+      : ['grok-4.6', 'grok-4.5'],
     port,
     waitMs,
   }
@@ -398,6 +404,81 @@ export class ChatGptSolAdapter {
     const blocks = response.blocks.map(normalizeBlock)
     const streamedIndex = streamedFirstBlock && blocks[0]?.type === 'text' ? 0 : -1
     yield* emitBlocks(blocks, response.usage, response.finishReason, streamedIndex)
+  }
+}
+
+function grokModelInfo(provider, model) {
+  return {
+    provider,
+    id: model,
+    name: `Shiro · Grok Build · ${model}`,
+    description: 'Grok Build CLI (đăng nhập grok.com) chạy headless làm model cho Harness.',
+    inputModalities: ['text'],
+    reasoning: {
+      efforts: REASONING_EFFORTS,
+      defaultEffort: 'standard',
+    },
+  }
+}
+
+/**
+ * Second model route: the local Grok Build CLI in headless single-turn mode.
+ * Every request is its own process, so unlike the single ChatGPT tab this
+ * route serves concurrent subagents in parallel and reports real token usage.
+ */
+export class GrokBuildAdapter {
+  constructor(runner, provider, models) {
+    this.runner = runner
+    this.provider = provider
+    this.models = models
+  }
+
+  providerInfo(provider) {
+    return { id: provider, name: 'Shiro · Grok Build' }
+  }
+
+  providerRetryPolicy() {
+    return {
+      mode: 'normal',
+      maxRetries: 3,
+      retryableCodes: [...RELAY_RETRYABLE_CODES],
+      initialDelayMs: 500,
+      maxDelayMs: 10_000,
+      jitterRatio: 0.1,
+    }
+  }
+
+  async listModels(provider) {
+    return this.models.map(model => grokModelInfo(provider, model))
+  }
+
+  async resolveModel(provider, model) {
+    if (!this.models.includes(model)) throw new Error(`unknown Grok model: ${model}`)
+    return grokModelInfo(provider, model)
+  }
+
+  async prepareCall(provider, model, signal) {
+    return {
+      model: await this.resolveModel(provider, model, signal),
+      stream: options => this.stream(options),
+    }
+  }
+
+  async *stream(options) {
+    let response
+    try {
+      response = await this.runner.complete(publicRequest(randomUUID(), options), options.signal, {
+        model: options.model,
+        effort: options.reasoningEffort,
+      })
+    } catch (error) {
+      if (options.signal?.aborted) {
+        yield { type: 'finish', reason: { kind: 'aborted', failure: { message: 'Harness cancelled the Grok CLI request', code: 'ABORTED' } } }
+        return
+      }
+      throw error
+    }
+    yield* emitBlocks(response.blocks.map(normalizeBlock), response.usage, response.finishReason, -1)
   }
 }
 
@@ -862,6 +943,13 @@ export function apply(ctx, rawConfig = {}) {
   // /adapter.ts resolves it (`resolveAttachments: () => ctx.get('attachments')`).
   const adapter = new ChatGptSolAdapter(broker, config.provider, config.model, relay, () => ctx.get('attachments'))
   ctx.llm.registerAdapter([config.provider], adapter)
+  const grokCliPath = resolveGrokCliPath(config.grokCliPath)
+  if (grokCliPath !== null) {
+    const grokRunner = new GrokCliRunner({ cliPath: grokCliPath })
+    ctx.llm.registerAdapter([config.grokProvider], new GrokBuildAdapter(grokRunner, config.grokProvider, config.grokModels))
+  } else if (config.grokCliPath !== '') {
+    process.stderr.write(`shiro-grok: configured Grok CLI not found at ${config.grokCliPath}; route disabled\n`)
+  }
   ctx.effect(() => {
     const runtime = startHttpServer(ctx, broker, config)
     return async () => {

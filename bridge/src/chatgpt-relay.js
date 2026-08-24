@@ -227,12 +227,12 @@ function normalizeBlocks(payload, rawText, allowedTools) {
 }
 
 /**
- * Parse one raw ChatGPT reply into Harness blocks. Shared by the buffered
- * `complete()` and the final settlement of `streamComplete()`, so both paths
- * classify failures identically and produce byte-identical results for the
- * same raw text.
+ * Parse one raw structured model reply into Harness blocks. Shared by the
+ * buffered `complete()`, the final settlement of `streamComplete()`, and the
+ * Grok CLI runner, so every backend classifies failures identically and
+ * produces byte-identical results for the same raw text.
  */
-function parseReply(rawText, tools) {
+export function parseReply(rawText, tools) {
   if (rawText.trim() === '') throw new RelayError('ChatGPT browser relay returned an empty response', EMPTY_RESPONSE_CODE)
   const payload = extractJson(rawText)
   if (payload === null && looksLikeAttemptedJson(rawText)) {
@@ -252,7 +252,7 @@ function parseReply(rawText, tools) {
   }
 }
 
-function relayPrompt(request) {
+export function relayPrompt(request) {
   return [
     'You are the language-model component inside Shiro, a DeepSeek Harness agent.',
     'The Harness owns every tool, plugin, permission, subagent, workflow, terminal, filesystem and Git operation.',
