@@ -6,6 +6,12 @@
 // the Pake desktop shell (desktop\dist\Shiro.exe). The script is idempotent,
 // so clicking the launcher while Shiro already runs just reopens the app.
 //
+// The script's output goes to a log FILE via PowerShell redirection, never
+// through redirected pipes: the background services the script spawns
+// inherit their parent's stdio handles, and an inherited pipe would keep
+// Process.WaitForExit() blocked for as long as any service lives (which is
+// exactly the hang the first version of this launcher had).
+//
 // Build with scripts\Build-Launcher.ps1 (uses the .NET Framework csc.exe
 // that ships with Windows; no SDK install required).
 
@@ -44,29 +50,18 @@ internal static class ShiroLauncher
         var psi = new ProcessStartInfo
         {
             FileName = "PowerShell.exe",
-            Arguments = "-NoProfile -ExecutionPolicy Bypass -File \"" + script + "\"",
+            Arguments = "-NoProfile -ExecutionPolicy Bypass -Command \"try { & '" + script + "' *> '" + log + "' } catch { $_ | Out-File -Append '" + log + "'; exit 1 }; exit 0\"",
             WindowStyle = ProcessWindowStyle.Hidden,
             CreateNoWindow = true,
             UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
             WorkingDirectory = root,
         };
 
         int exitCode;
-        using (var writer = new StreamWriter(log, false))
+        using (var process = Process.Start(psi))
         {
-            var sync = new object();
-            using (var process = Process.Start(psi))
-            {
-                process.OutputDataReceived += (s, e) => { if (e.Data != null) lock (sync) writer.WriteLine(e.Data); };
-                process.ErrorDataReceived += (s, e) => { if (e.Data != null) lock (sync) writer.WriteLine(e.Data); };
-                process.BeginOutputReadLine();
-                process.BeginErrorReadLine();
-                process.WaitForExit();
-                exitCode = process.ExitCode;
-            }
-            writer.Flush();
+            process.WaitForExit();
+            exitCode = process.ExitCode;
         }
 
         if (exitCode != 0)
