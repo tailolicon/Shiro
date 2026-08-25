@@ -240,9 +240,22 @@ test('relay-integration: newSession rotates across calls as the tracked Harness 
   })
   try {
     const adapter = makeAdapter(server.url)
-    await collect(adapter.stream({ ...baseOptions, sessionId: 'session-a' }))
-    await collect(adapter.stream({ ...baseOptions, sessionId: 'session-a' }))
-    await collect(adapter.stream({ ...baseOptions, sessionId: 'session-b' }))
+    // The real agent loop appends to the transcript each turn; a delta
+    // continuation is only legal for a strict extension, so grow it here too.
+    const grown = (turn, sessionId) => ({
+      ...baseOptions,
+      sessionId,
+      messages: [
+        ...baseOptions.messages,
+        ...Array.from({ length: turn }, (_, i) => ([
+          { role: 'assistant', content: [{ type: 'text', text: `step ${i}` }], source: { kind: 'model' } },
+          { role: 'user', content: [{ type: 'text', text: `result ${i}` }], source: { kind: 'user' } },
+        ])).flat(),
+      ],
+    })
+    await collect(adapter.stream(grown(0, 'session-a')))
+    await collect(adapter.stream(grown(1, 'session-a')))
+    await collect(adapter.stream(grown(2, 'session-b')))
     // Cold start rotates the first call; a changed session id rotates again.
     assert.deepEqual(seen, [true, false, true])
   } finally {

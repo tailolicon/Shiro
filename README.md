@@ -26,6 +26,12 @@ Mỗi profile cho phép chọn `Light`, `Standard`, `High` hoặc `Max`. Trên �
 
 Hai thông số trên điều khiển chính sách làm việc của Shiro và được chuyển nguyên vẹn trong từng model request. Model/compute thật của dịch vụ ChatGPT vẫn do model selector và entitlement của ChatGPT Web quyết định; MCP không thể tự nâng quota hay thay đổi compute phía máy chủ.
 
+### Bối cảnh gửi cho ChatGPT
+
+Shiro không gửi lại toàn bộ lịch sử hội thoại mỗi lượt. Lượt đầu của một thread gửi đầy đủ; các lượt sau chỉ gửi những sự kiện mới kể từ câu trả lời trước, vì thread ChatGPT đã giữ phần cũ. Đo thực tế trên 40 lượt: giảm từ ~2.24 MB (≈588K token) xuống ~0.16 MB (≈41K token), tức **14x**.
+
+Cách này chỉ được dùng khi Shiro chứng minh được thread vẫn khớp với transcript của Harness. Mọi trường hợp nghi ngờ đều quay về gửi đầy đủ trên một thread mới: khởi động lạnh, đổi phiên, sau compaction/rewind (Harness cắt bớt lịch sử nhưng thread vẫn giữ bản gốc), đổi system prompt, sau một lượt lỗi (prompt có thể đã kịp vào khung chat), và khi xoay thread định kỳ. Danh sách tool đổi thì đi kèm trong delta chứ không cần gửi lại transcript.
+
 ### Công cụ Git và web
 
 Agent có bộ tool Git riêng (first-party, không cài plugin ngoài): `git_status`, `git_diff`, `git_log`, `git_show`, `git_branch`, `git_add`, `git_commit`. Mọi lệnh git chạy qua argv array (không dựng chuỗi shell nên không thể bị chèn lệnh), đường dẫn bị giới hạn trong project root, tên nhánh/ref được kiểm tra, message commit truyền qua stdin, và các thao tác thay đổi (`git_add`/`git_commit`/tạo+chuyển nhánh) phải qua phê duyệt. Các lệnh phá hủy hoặc mạng (reset, restore, checkout, clean, stash, rebase, merge, push, config) không được mở — dùng `pwsh`/`sandbox_exec` cho những việc đó.

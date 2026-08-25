@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000
 const DEFAULT_MAX_THREAD_TURNS = 40
@@ -285,6 +285,56 @@ export function relayPrompt(request, { fenced = true } = {}) {
   ].join('\n')
 }
 
+/**
+ * Continuation form: the browser conversation already holds every earlier turn
+ * of this Harness session, so only the events recorded since the last accepted
+ * reply travel over the wire. Resending the whole transcript every turn makes
+ * the thread grow quadratically (the tab keeps each prior full-history prompt
+ * on top of the new one), which burns the ChatGPT-side context window, slows
+ * time-to-first-token, and pushes the composer toward the large-paste path
+ * that ChatGPT converts into a file attachment.
+ *
+ * Only used once the relay has proven the thread is still in sync with the
+ * Harness transcript. Every uncertainty (compaction, rewind, changed system
+ * prompt or tools, a failed dispatch, session change, rotation) falls back to
+ * relayPrompt() on a fresh thread, so correctness never depends on this
+ * optimization holding.
+ */
+export function relayDeltaPrompt(request, delta, { fenced = true } = {}) {
+  const formatLine = fenced
+    ? 'Wrap your ENTIRE reply in exactly one fenced code block: the first line must be ```json and the last line must be ```. Output nothing outside that fence, and exactly one JSON object inside it.'
+    : 'Return exactly one JSON object with no Markdown fence or surrounding prose.'
+  const toolsChanged = delta.tools !== null && delta.tools !== undefined
+  const continuation = {
+    request_id: request.request_id,
+    session_id: request.session_id ?? null,
+    purpose: request.purpose ?? 'conversation',
+    provider: request.provider,
+    model: request.model,
+    generation: request.generation,
+    new_messages: delta.messages,
+    ...(toolsChanged ? { tools: delta.tools } : {}),
+  }
+  return [
+    'Continue the same Shiro / DeepSeek Harness session from earlier in this conversation.',
+    'The complete prior context is already above. Reuse it; never ask for it to be repeated.',
+    'Below are ONLY the Harness events recorded since your last reply, in order.',
+    'The Harness owns every tool, plugin, permission, subagent, workflow, terminal, filesystem and Git operation.',
+    'Never claim to execute a tool yourself. When a tool is needed, request it and let Harness execute it.',
+    formatLine,
+    'Schema: {"blocks":[{"type":"text","text":"..."}|{"type":"reasoning","text":"visible concise reasoning summary"}|{"type":"tool_call","id":"unique-id","name":"exact available tool name","arguments":{}}],"finishReason":"stop"|"tool-calls"|"max-tokens"}.',
+    'The response must be strict JSON. Inside argument strings, use forward slashes for paths and never emit a raw Windows backslash.',
+    'Escape every double quote inside a JSON string value as \". In shell commands prefer single quotes so no escaping is needed.',
+    toolsChanged
+      ? 'The available tool list CHANGED. Use only the tool names listed below.'
+      : 'The available tools are unchanged from earlier in this conversation. Use only those tool names.',
+    'If tools are required, prefer tool_call blocks and set finishReason to tool-calls. Do not fabricate tool results.',
+    '',
+    'NEW_HARNESS_EVENTS_JSON',
+    JSON.stringify(continuation),
+  ].join('\n')
+}
+
 function toBase64(data) {
   if (typeof data === 'string') return data
   return Buffer.from(data).toString('base64')
@@ -431,10 +481,26 @@ class IncrementalTextExtractor {
   }
 }
 
+/** Stable fingerprint of any JSON-serializable value, for cheap prefix comparison. */
+function fingerprint(value) {
+  return createHash('sha1').update(JSON.stringify(value ?? null)).digest('hex')
+}
+
 export class ChatGptBrowserRelay {
   #lastSessionId = null
   #turnsOnThread = 0
   #started = false
+  // Delta bookkeeping: how much of the Harness transcript the live browser
+  // thread has already received, and fingerprints proving it is still the
+  // same transcript (not compacted, rewound, or re-prompted underneath us).
+  #deliveredCount = 0
+  #prefixHash = ''
+  #systemHash = ''
+  #toolsHash = ''
+  // Set immediately before a dispatch and cleared only on a committed reply.
+  // A failed turn may or may not have reached the composer, so the thread's
+  // contents become unknown and the next turn must resend everything fresh.
+  #forceFull = false
 
   constructor({ url, token, model = 'GPT-5.6 Sol', timeoutMs = DEFAULT_TIMEOUT_MS, fetchImpl = fetch, maxThreadTurns }) {
     this.url = normalizeLoopbackUrl(url)
@@ -485,21 +551,69 @@ export class ChatGptBrowserRelay {
     // continue whatever conversation the browser tab was left on by a
     // previous Shiro run -- that history belongs to another lifetime.
     else if (!this.#started) newSession = true
+    // A previous dispatch failed after the prompt may already have reached the
+    // composer, so the thread's contents are unknown: start over cleanly.
+    else if (this.#forceFull) newSession = true
     else if (sessionId !== null && this.#lastSessionId !== null && sessionId !== this.#lastSessionId) newSession = true
     else if (this.#turnsOnThread >= this.maxThreadTurns) newSession = true
-    return { newSession, sessionId, isSideTask }
+
+    // Only an in-sync continuation thread may receive a delta. When the
+    // transcript diverged (compaction dropped or rewrote earlier turns, a
+    // rewind moved the head, the system prompt changed), the live thread still
+    // holds the superseded originals, so continuing it would show the model a
+    // context the Harness no longer intends. Rotating to a fresh thread and
+    // resending in full is the only correct repair -- and it reclaims the
+    // ChatGPT-side context window at the same time.
+    let delta = null
+    if (!newSession) {
+      delta = this.#planDelta(request)
+      if (delta === null) newSession = true
+    }
+    return { newSession, sessionId, isSideTask, delta }
   }
 
-  #commitThread(plan) {
-    if (plan.isSideTask) return
+  /** The messages recorded since the last committed turn, or null when a delta is unsafe. */
+  #planDelta(request) {
+    const messages = Array.isArray(request.messages) ? request.messages : []
+    if (this.#deliveredCount === 0 || messages.length <= this.#deliveredCount) return null
+    if (fingerprint(messages.slice(0, this.#deliveredCount)) !== this.#prefixHash) return null
+    if (fingerprint(request.system ?? '') !== this.#systemHash) return null
+    const toolsHash = fingerprint(request.tools ?? [])
+    return {
+      messages: messages.slice(this.#deliveredCount),
+      tools: toolsHash === this.#toolsHash ? null : (request.tools ?? []),
+    }
+  }
+
+  #commitThread(plan, request) {
+    if (plan.isSideTask) {
+      // The side task ran in its own fresh browser conversation, which is now
+      // the tab's active thread -- the main session's thread is no longer the
+      // one a `newSession: false` call would continue. Under full resend that
+      // was merely untidy; a delta continuation would append to the wrong
+      // conversation, so the next main turn must open a fresh thread and
+      // resend everything.
+      this.#deliveredCount = 0
+      this.#prefixHash = ''
+      this.#forceFull = true
+      return
+    }
     this.#started = true
     this.#lastSessionId = plan.sessionId
     this.#turnsOnThread = plan.newSession ? 1 : this.#turnsOnThread + 1
+    const messages = Array.isArray(request.messages) ? request.messages : []
+    this.#deliveredCount = messages.length
+    this.#prefixHash = fingerprint(messages)
+    this.#systemHash = fingerprint(request.system ?? '')
+    this.#toolsHash = fingerprint(request.tools ?? [])
+    this.#forceFull = false
   }
 
   #buildBody(request, plan, attachments, stream) {
     return {
-      message: relayPrompt(request),
+      message: plan.delta === null || plan.delta === undefined
+        ? relayPrompt(request)
+        : relayDeltaPrompt(request, plan.delta),
       model: this.model,
       effort: effortForRelay(request.generation?.reasoning_effort),
       newSession: plan.newSession,
@@ -566,11 +680,14 @@ export class ChatGptBrowserRelay {
     const combined = signal ? AbortSignal.any([signal, timeout]) : timeout
     const plan = this.#planThread(request)
     const attachments = images.length > 0 ? await this.#uploadImages(images, combined, signal) : undefined
+    // From here the prompt may reach the composer; only a committed reply
+    // proves what the thread now holds.
+    this.#forceFull = true
     const response = await this.#post('/chat', this.#buildBody(request, plan, attachments, false), combined, signal)
     const body = await response.json().catch(() => ({}))
     const rawText = String(body.response ?? body.answer ?? '')
     const result = parseReply(rawText, request.tools)
-    this.#commitThread(plan)
+    this.#commitThread(plan, request)
     return result
   }
 
@@ -594,6 +711,8 @@ export class ChatGptBrowserRelay {
     const combined = signal ? AbortSignal.any([signal, timeout]) : timeout
     const plan = this.#planThread(request)
     const attachments = images.length > 0 ? await this.#uploadImages(images, combined, signal) : undefined
+    // Same rule as complete(): the thread's contents are unknown until commit.
+    this.#forceFull = true
     const response = await this.#post('/chat', this.#buildBody(request, plan, attachments, true), combined, signal)
 
     const body = response.body
@@ -602,7 +721,7 @@ export class ChatGptBrowserRelay {
       const parsed = await response.json().catch(() => null)
       const rawText = parsed === null ? '' : String(parsed.response ?? parsed.answer ?? '')
       const result = parseReply(rawText, request.tools)
-      this.#commitThread(plan)
+      this.#commitThread(plan, request)
       yield { type: 'final', value: result }
       return
     }
@@ -656,7 +775,7 @@ export class ChatGptBrowserRelay {
     }
     const rawText = String(finalResult.answer ?? '')
     const result = parseReply(rawText, request.tools)
-    this.#commitThread(plan)
+    this.#commitThread(plan, request)
     yield { type: 'final', value: result }
   }
 }

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { ChatGptBrowserRelay, RelayError } from '../src/chatgpt-relay.js'
+import { ChatGptBrowserRelay, RelayError, relayPrompt } from '../src/chatgpt-relay.js'
 
 const request = {
   request_id: 'request-test',
@@ -8,6 +8,20 @@ const request = {
   messages: [{ role: 'user', content: [{ type: 'text', text: 'Read package.json' }] }],
   tools: [{ name: 'read', description: 'Read a file', inputSchema: { type: 'object' } }],
   generation: { reasoning_effort: 'standard' },
+}
+
+/**
+ * A Harness transcript after `turn` completed exchanges. The real loop only
+ * ever appends (assistant reply + its tool result), which is what makes a
+ * delta continuation legal; fixtures must grow the same way.
+ */
+function transcript(turn, extra = {}) {
+  const messages = [...request.messages]
+  for (let i = 0; i < turn; i++) {
+    messages.push({ role: 'assistant', content: [{ type: 'text', text: `step ${i}` }] })
+    messages.push({ role: 'user', content: [{ type: 'tool-result', id: `c${i}`, text: `result ${i}` }] })
+  }
+  return { ...request, tools: [], messages, ...extra }
 }
 
 test('browser relay stays loopback-only and maps a Harness tool call', async () => {
@@ -269,9 +283,9 @@ test('browser relay rotates the browser thread when the tracked Harness session 
       return Response.json({ response: 'ok' })
     },
   })
-  await relay.complete({ ...request, tools: [], session_id: 'session-a' })
-  await relay.complete({ ...request, tools: [], session_id: 'session-a' })
-  await relay.complete({ ...request, tools: [], session_id: 'session-b' })
+  await relay.complete(transcript(0, { session_id: 'session-a' }))
+  await relay.complete(transcript(1, { session_id: 'session-a' }))
+  await relay.complete(transcript(2, { session_id: 'session-b' }))
   // Cold start rotates too: the first call of a fresh process must not
   // continue a conversation left over from a previous run.
   assert.deepEqual(calls.map(body => body.newSession), [true, false, true])
@@ -288,7 +302,7 @@ test('browser relay rotates after a bounded number of turns on the same thread a
       return Response.json({ response: 'ok' })
     },
   })
-  for (let i = 0; i < 7; i++) await relay.complete({ ...request, tools: [] })
+  for (let i = 0; i < 7; i++) await relay.complete(transcript(i))
   // The cold-start turn opens thread 1 and counts as its turn 1; turns 2-3
   // share it; the 4th turn (turnsOnThread at the maxThreadTurns=3 bound)
   // rotates and counts as turn 1 of the next thread, and so on.
@@ -305,12 +319,14 @@ test('browser relay always starts a fresh thread for compaction and session-titl
       return Response.json({ response: 'ok' })
     },
   })
-  await relay.complete({ ...request, tools: [], session_id: 'session-a' })
-  await relay.complete({ ...request, tools: [], session_id: 'session-a', purpose: 'compaction' })
-  await relay.complete({ ...request, tools: [], session_id: 'session-a' })
-  // Cold start rotates the first main-thread call; the side task always
-  // rotates; the main thread then continues where it left off.
-  assert.deepEqual(calls.map(body => body.newSession), [true, true, false])
+  await relay.complete(transcript(0, { session_id: 'session-a' }))
+  await relay.complete(transcript(1, { session_id: 'session-a', purpose: 'compaction' }))
+  await relay.complete(transcript(1, { session_id: 'session-a' }))
+  // Cold start rotates the first main-thread call; the side task always gets
+  // its own thread -- and because that side thread becomes the tab's active
+  // conversation, the following main turn cannot continue the old one either,
+  // so it rotates and resends in full.
+  assert.deepEqual(calls.map(body => body.newSession), [true, true, true])
 })
 
 // --- Task 5: bounded incremental streaming ----------------------------------
@@ -434,4 +450,145 @@ test('streamComplete does not stream deltas when the reply is not the anchored t
   }))
   assert.deepEqual(deltas, [])
   assert.deepEqual(final.blocks, [{ type: 'tool_call', id: 'call-1', name: 'read', arguments: { file_path: 'package.json' } }])
+})
+
+// --- Delta continuation: send only what the thread has not seen -------------
+
+/** Capture the bodies the relay POSTs to /chat. */
+function recordingRelay(overrides = {}) {
+  const calls = []
+  const relay = new ChatGptBrowserRelay({
+    url: 'http://127.0.0.1:23158',
+    token: 'relay-test-token',
+    fetchImpl: async (_url, init = {}) => {
+      calls.push(JSON.parse(init.body))
+      return Response.json({ response: 'ok' })
+    },
+    ...overrides,
+  })
+  return { relay, calls }
+}
+
+test('a continuation turn sends only the new events, not the whole transcript', async () => {
+  const { relay, calls } = recordingRelay()
+  await relay.complete(transcript(0))
+  await relay.complete(transcript(1))
+  await relay.complete(transcript(2))
+
+  // Turn 1 is the cold start: full transcript on a fresh thread.
+  assert.equal(calls[0].newSession, true)
+  assert.match(calls[0].message, /EXACT_HARNESS_REQUEST_JSON/)
+
+  // Turns 2 and 3 continue the same thread with only the fresh events.
+  for (const body of calls.slice(1)) {
+    assert.equal(body.newSession, false)
+    assert.match(body.message, /NEW_HARNESS_EVENTS_JSON/)
+    assert.doesNotMatch(body.message, /EXACT_HARNESS_REQUEST_JSON/)
+  }
+  const third = JSON.parse(calls[2].message.split('NEW_HARNESS_EVENTS_JSON\n')[1])
+  assert.equal(third.new_messages.length, 2, 'exactly the assistant reply + its tool result')
+  assert.equal(third.new_messages[1].content[0].text, 'result 1')
+  // The superseded turns are not repeated on the wire.
+  assert.doesNotMatch(calls[2].message, /result 0/)
+  // The meaningful comparison is against a full resend of the SAME turn; the
+  // delta's fixed instruction header only pays off once a transcript exists.
+  assert.ok(
+    calls[2].message.length < relayPrompt(transcript(2)).length,
+    'a continuation must cost less than resending the transcript',
+  )
+})
+
+test('a compacted or rewound transcript rotates to a fresh thread and resends in full', async () => {
+  const { relay, calls } = recordingRelay()
+  await relay.complete(transcript(0))
+  await relay.complete(transcript(3))
+  // Compaction rewrites earlier turns: the delivered prefix no longer matches.
+  const compacted = transcript(3)
+  compacted.messages[1] = { role: 'assistant', content: [{ type: 'text', text: 'summary of earlier work' }] }
+  compacted.messages.push({ role: 'user', content: [{ type: 'text', text: 'next' }] })
+  await relay.complete(compacted)
+
+  assert.deepEqual(calls.map(body => body.newSession), [true, false, true])
+  assert.match(calls[2].message, /EXACT_HARNESS_REQUEST_JSON/, 'diverged transcript must be resent in full')
+})
+
+test('a shortened transcript (rewind) also forces a full resend', async () => {
+  const { relay, calls } = recordingRelay()
+  await relay.complete(transcript(0))
+  await relay.complete(transcript(4))
+  await relay.complete(transcript(2)) // head moved backwards
+  assert.deepEqual(calls.map(body => body.newSession), [true, false, true])
+  assert.match(calls[2].message, /EXACT_HARNESS_REQUEST_JSON/)
+})
+
+test('a changed system prompt forces a full resend', async () => {
+  const { relay, calls } = recordingRelay()
+  await relay.complete({ ...transcript(0), system: 'first' })
+  await relay.complete({ ...transcript(1), system: 'first' })
+  await relay.complete({ ...transcript(2), system: 'CHANGED' })
+  assert.deepEqual(calls.map(body => body.newSession), [true, false, true])
+  assert.match(calls[2].message, /EXACT_HARNESS_REQUEST_JSON/)
+})
+
+test('a changed tool list is carried inside the delta without resending the transcript', async () => {
+  const { relay, calls } = recordingRelay()
+  const tools = [{ name: 'read', description: 'Read a file' }]
+  await relay.complete({ ...transcript(0), tools })
+  await relay.complete({ ...transcript(1), tools })
+  await relay.complete({ ...transcript(2), tools: [...tools, { name: 'git_status', description: 'Status' }] })
+
+  assert.deepEqual(calls.map(body => body.newSession), [true, false, false])
+  const second = JSON.parse(calls[1].message.split('NEW_HARNESS_EVENTS_JSON\n')[1])
+  assert.equal(second.tools, undefined, 'unchanged tools are not repeated')
+  assert.match(calls[1].message, /tools are unchanged/)
+  const third = JSON.parse(calls[2].message.split('NEW_HARNESS_EVENTS_JSON\n')[1])
+  assert.equal(third.tools.length, 2, 'the changed tool list rides along with the delta')
+  assert.match(calls[2].message, /tool list CHANGED/)
+})
+
+test('a failed dispatch makes the next turn resend in full on a fresh thread', async () => {
+  const calls = []
+  let failNext = false
+  const relay = new ChatGptBrowserRelay({
+    url: 'http://127.0.0.1:23158',
+    token: 'relay-test-token',
+    fetchImpl: async (_url, init = {}) => {
+      calls.push(JSON.parse(init.body))
+      if (failNext) return new Response(JSON.stringify({ detail: 'boom' }), { status: 503 })
+      return Response.json({ response: 'ok' })
+    },
+  })
+  await relay.complete(transcript(0))
+  await relay.complete(transcript(1))
+  assert.equal(calls[1].newSession, false)
+
+  // The prompt may already have reached the composer, so the thread contents
+  // are unknown after a failure.
+  failNext = true
+  await assert.rejects(relay.complete(transcript(2)), /SERVER|503/)
+  failNext = false
+  await relay.complete(transcript(3))
+
+  assert.equal(calls[3].newSession, true, 'recovery turn opens a clean thread')
+  assert.match(calls[3].message, /EXACT_HARNESS_REQUEST_JSON/)
+})
+
+test('a rotation turn resends in full so the fresh thread has the whole context', async () => {
+  const { relay, calls } = recordingRelay({ maxThreadTurns: 3 })
+  for (let i = 0; i < 5; i++) await relay.complete(transcript(i))
+  assert.deepEqual(calls.map(body => body.newSession), [true, false, false, true, false])
+  // Every rotation carries the complete transcript; only continuations delta.
+  assert.match(calls[3].message, /EXACT_HARNESS_REQUEST_JSON/)
+  assert.match(calls[4].message, /NEW_HARNESS_EVENTS_JSON/)
+})
+
+test('delta continuation keeps the strict-JSON protocol instructions', async () => {
+  const { relay, calls } = recordingRelay()
+  await relay.complete(transcript(0))
+  await relay.complete(transcript(1))
+  const delta = calls[1].message
+  assert.match(delta, /first line must be ```json/)
+  assert.match(delta, /"blocks"/)
+  assert.match(delta, /never emit a raw Windows backslash/)
+  assert.match(delta, /Never claim to execute a tool yourself/)
 })
