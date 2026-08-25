@@ -254,6 +254,11 @@ export function parseReply(rawText, tools) {
     blocks,
     finishReason: ['stop', 'tool-calls', 'max-tokens'].includes(payload?.finishReason) ? payload.finishReason : inferred,
     usage: { inputTokens: 0, outputTokens: 0 },
+    // A reply that never attempted the structured protocol is still delivered
+    // as text (a genuine prose answer must not become a hard failure), but the
+    // caller is told, because on a continuation turn it is the signature of
+    // the model drifting off-protocol in a long thread.
+    protocolDrift: payload === null,
   }
 }
 
@@ -324,7 +329,7 @@ export function relayDeltaPrompt(request, delta, { fenced = true } = {}) {
     formatLine,
     'Schema: {"blocks":[{"type":"text","text":"..."}|{"type":"reasoning","text":"visible concise reasoning summary"}|{"type":"tool_call","id":"unique-id","name":"exact available tool name","arguments":{}}],"finishReason":"stop"|"tool-calls"|"max-tokens"}.',
     'The response must be strict JSON. Inside argument strings, use forward slashes for paths and never emit a raw Windows backslash.',
-    'Escape every double quote inside a JSON string value as \". In shell commands prefer single quotes so no escaping is needed.',
+    'Escape every double quote inside a JSON string value as \\". In shell commands prefer single quotes so no escaping is needed.',
     toolsChanged
       ? 'The available tool list CHANGED. Use only the tool names listed below.'
       : 'The available tools are unchanged from earlier in this conversation. Use only those tool names.',
@@ -497,6 +502,8 @@ export class ChatGptBrowserRelay {
   #prefixHash = ''
   #systemHash = ''
   #toolsHash = ''
+  // Count of replies that arrived without the structured protocol.
+  #driftCount = 0
   // Set immediately before a dispatch and cleared only on a committed reply.
   // A failed turn may or may not have reached the composer, so the thread's
   // contents become unknown and the next turn must resend everything fresh.
@@ -583,6 +590,30 @@ export class ChatGptBrowserRelay {
       messages: messages.slice(this.#deliveredCount),
       tools: toolsHash === this.#toolsHash ? null : (request.tools ?? []),
     }
+  }
+
+  /**
+   * Record an off-protocol reply. Repeating the protocol in every continuation
+   * makes drift unlikely, but a long thread can still dilute it. Drift on a
+   * continuation is self-healed by re-anchoring: the next turn opens a fresh
+   * thread carrying the full transcript and the protocol at its head. Drift on
+   * a turn that was already a full resend has no stronger remedy, so it is
+   * only reported.
+   */
+  #noteDrift(plan) {
+    this.#driftCount += 1
+    const wasContinuation = plan.delta !== null && plan.delta !== undefined
+    process.stderr.write(
+      `shiro-relay: reply ${this.#driftCount} ignored the structured protocol `
+      + `(${wasContinuation ? 'continuation turn; re-anchoring on a fresh thread' : 'full-context turn'})
+`,
+    )
+    if (wasContinuation) this.#forceFull = true
+  }
+
+  /** Replies so far that arrived without the structured protocol. */
+  get driftCount() {
+    return this.#driftCount
   }
 
   #commitThread(plan, request) {
@@ -688,6 +719,7 @@ export class ChatGptBrowserRelay {
     const rawText = String(body.response ?? body.answer ?? '')
     const result = parseReply(rawText, request.tools)
     this.#commitThread(plan, request)
+    if (result.protocolDrift) this.#noteDrift(plan)
     return result
   }
 
@@ -722,6 +754,7 @@ export class ChatGptBrowserRelay {
       const rawText = parsed === null ? '' : String(parsed.response ?? parsed.answer ?? '')
       const result = parseReply(rawText, request.tools)
       this.#commitThread(plan, request)
+      if (result.protocolDrift) this.#noteDrift(plan)
       yield { type: 'final', value: result }
       return
     }
@@ -776,6 +809,7 @@ export class ChatGptBrowserRelay {
     const rawText = String(finalResult.answer ?? '')
     const result = parseReply(rawText, request.tools)
     this.#commitThread(plan, request)
+    if (result.protocolDrift) this.#noteDrift(plan)
     yield { type: 'final', value: result }
   }
 }

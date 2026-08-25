@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { ChatGptBrowserRelay, RelayError, relayPrompt } from '../src/chatgpt-relay.js'
+import { ChatGptBrowserRelay, RelayError, relayDeltaPrompt, relayPrompt } from '../src/chatgpt-relay.js'
 
 const request = {
   request_id: 'request-test',
@@ -9,6 +9,9 @@ const request = {
   tools: [{ name: 'read', description: 'Read a file', inputSchema: { type: 'object' } }],
   generation: { reasoning_effort: 'standard' },
 }
+
+/** A minimal protocol-conforming reply; fixtures must not look like drift. */
+const PROTOCOL_OK = '```json\n{"blocks":[{"type":"text","text":"ok"}],"finishReason":"stop"}\n```'
 
 /**
  * A Harness transcript after `turn` completed exchanges. The real loop only
@@ -280,7 +283,7 @@ test('browser relay rotates the browser thread when the tracked Harness session 
     token: 'relay-test-token',
     fetchImpl: async (url, init = {}) => {
       calls.push(JSON.parse(init.body))
-      return Response.json({ response: 'ok' })
+      return Response.json({ response: PROTOCOL_OK })
     },
   })
   await relay.complete(transcript(0, { session_id: 'session-a' }))
@@ -299,7 +302,7 @@ test('browser relay rotates after a bounded number of turns on the same thread a
     maxThreadTurns: 3,
     fetchImpl: async (url, init = {}) => {
       calls.push(JSON.parse(init.body))
-      return Response.json({ response: 'ok' })
+      return Response.json({ response: PROTOCOL_OK })
     },
   })
   for (let i = 0; i < 7; i++) await relay.complete(transcript(i))
@@ -316,7 +319,7 @@ test('browser relay always starts a fresh thread for compaction and session-titl
     token: 'relay-test-token',
     fetchImpl: async (url, init = {}) => {
       calls.push(JSON.parse(init.body))
-      return Response.json({ response: 'ok' })
+      return Response.json({ response: PROTOCOL_OK })
     },
   })
   await relay.complete(transcript(0, { session_id: 'session-a' }))
@@ -462,7 +465,7 @@ function recordingRelay(overrides = {}) {
     token: 'relay-test-token',
     fetchImpl: async (_url, init = {}) => {
       calls.push(JSON.parse(init.body))
-      return Response.json({ response: 'ok' })
+      return Response.json({ response: PROTOCOL_OK })
     },
     ...overrides,
   })
@@ -555,7 +558,7 @@ test('a failed dispatch makes the next turn resend in full on a fresh thread', a
     fetchImpl: async (_url, init = {}) => {
       calls.push(JSON.parse(init.body))
       if (failNext) return new Response(JSON.stringify({ detail: 'boom' }), { status: 503 })
-      return Response.json({ response: 'ok' })
+      return Response.json({ response: PROTOCOL_OK })
     },
   })
   await relay.complete(transcript(0))
@@ -591,4 +594,100 @@ test('delta continuation keeps the strict-JSON protocol instructions', async () 
   assert.match(delta, /"blocks"/)
   assert.match(delta, /never emit a raw Windows backslash/)
   assert.match(delta, /Never claim to execute a tool yourself/)
+})
+
+test('every protocol rule is stated identically in the full and delta prompts', () => {
+  // A continuation carries the whole protocol, because a long thread must not
+  // be allowed to drift back into prose. Any wording that exists in only one
+  // of the two forms -- or that differs character-for-character between them,
+  // as a lost backslash in the escaping rule once did -- is a real defect: the
+  // model would be told different things depending on which form it received.
+  const req = { request_id: 'r', model: 'm', messages: [], tools: [], generation: {} }
+  const full = relayPrompt(req).split('\n')
+  const delta = relayDeltaPrompt(req, { messages: [], tools: null }).split('\n')
+  const shared = [
+    'Never claim to execute a tool yourself.',
+    'Wrap your ENTIRE reply in exactly one fenced code block',
+    'Schema: {"blocks"',
+    'The response must be strict JSON.',
+    'Escape every double quote inside a JSON string value',
+    'If tools are required, prefer tool_call blocks',
+  ]
+  for (const needle of shared) {
+    const inFull = full.find(line => line.includes(needle))
+    const inDelta = delta.find(line => line.includes(needle))
+    assert.ok(inFull, `full prompt lost: ${needle}`)
+    assert.ok(inDelta, `delta prompt lost: ${needle}`)
+    assert.equal(inDelta, inFull, `wording drifted between prompt forms: ${needle}`)
+  }
+  // The escaping rule must survive as a literal backslash-quote, not a bare quote.
+  assert.ok(delta.some(line => line.includes('as \\".')), 'delta escaping rule lost its backslash')
+})
+
+// --- Protocol drift in a long thread ---------------------------------------
+
+test('a prose reply on a continuation is reported and re-anchors the next turn', async () => {
+  const calls = []
+  let prose = false
+  const relay = new ChatGptBrowserRelay({
+    url: 'http://127.0.0.1:23158',
+    token: 'relay-test-token',
+    fetchImpl: async (_url, init = {}) => {
+      calls.push(JSON.parse(init.body))
+      return Response.json({
+        response: prose
+          ? 'Chắc rồi, tôi đã xem qua và thấy ổn.'
+          : '```json\n{"blocks":[{"type":"text","text":"ok"}],"finishReason":"stop"}\n```',
+      })
+    },
+  })
+  await relay.complete(transcript(0))
+  await relay.complete(transcript(1))
+  assert.equal(calls[1].newSession, false, 'a healthy continuation stays on the thread')
+  assert.equal(relay.driftCount, 0)
+
+  // The model forgets the protocol on a continuation turn.
+  prose = true
+  const drifted = await relay.complete(transcript(2))
+  assert.deepEqual(drifted.blocks, [{ type: 'text', text: 'Chắc rồi, tôi đã xem qua và thấy ổn.' }],
+    'a genuine prose answer is still delivered, never a hard failure')
+  assert.equal(relay.driftCount, 1, 'drift is counted, not silent')
+
+  // The next turn re-anchors: fresh thread carrying the whole transcript and
+  // the protocol at its head.
+  prose = false
+  await relay.complete(transcript(3))
+  assert.equal(calls[3].newSession, true, 'drift on a continuation forces a re-anchor')
+  assert.match(calls[3].message, /EXACT_HARNESS_REQUEST_JSON/)
+  assert.match(calls[3].message, /first line must be ```json/)
+})
+
+test('drift on a full-context turn is reported without a pointless extra rotation', async () => {
+  const calls = []
+  const relay = new ChatGptBrowserRelay({
+    url: 'http://127.0.0.1:23158',
+    token: 'relay-test-token',
+    fetchImpl: async (_url, init = {}) => {
+      calls.push(JSON.parse(init.body))
+      return Response.json({ response: 'trả lời bằng văn xuôi' })
+    },
+  })
+  // Turn 1 is the cold start: already a full resend, so nothing stronger to do.
+  await relay.complete(transcript(0))
+  assert.equal(relay.driftCount, 1)
+  await relay.complete(transcript(1))
+  assert.equal(calls[1].newSession, false, 'a full-turn drift does not force rotation by itself')
+  assert.equal(relay.driftCount, 2)
+})
+
+test('a fenced reply that is not valid JSON still fails loudly rather than drifting', async () => {
+  const relay = new ChatGptBrowserRelay({
+    url: 'http://127.0.0.1:23158',
+    token: 'relay-test-token',
+    fetchImpl: async () => Response.json({ response: '```\nkhông phải JSON\n```' }),
+  })
+  await assert.rejects(relay.complete(transcript(0)), (error) => {
+    assert.equal(error.code, 'EMPTY_RESPONSE')
+    return true
+  })
 })
