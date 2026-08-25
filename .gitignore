@@ -28,3 +28,7 @@ desktop/*.msi
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# linux migration backup excludes
+node_modules/
+.shiro-smoke/
