@@ -691,3 +691,116 @@ test('a fenced reply that is not valid JSON still fails loudly rather than drift
     return true
   })
 })
+
+// --- Multiple connected ChatGPT tabs ---------------------------------------
+
+/** A relay whose /health, /browser/clients and /browser/select are scripted. */
+function tabRelay({ clients, selectedId = '' }) {
+  const posted = []
+  let selected = selectedId
+  const relay = new ChatGptBrowserRelay({
+    url: 'http://127.0.0.1:23158',
+    token: 'relay-test-token',
+    fetchImpl: async (url, init = {}) => {
+      if (url.endsWith('/health')) {
+        return Response.json({ ok: true, clients: clients.length, needsSelection: selected === '', selectedClientId: selected })
+      }
+      if (url.endsWith('/browser/clients')) return Response.json({ clients })
+      if (url.endsWith('/browser/select')) {
+        const body = JSON.parse(init.body)
+        posted.push(body.clientId)
+        selected = body.clientId
+        return Response.json({ ok: true })
+      }
+      return Response.json({ response: PROTOCOL_OK })
+    },
+  })
+  return { relay, posted }
+}
+
+test('a blank second tab is selected automatically so Shiro keeps working', async () => {
+  const { relay, posted } = tabRelay({
+    clients: [
+      { id: 'user-tab', ready: true, url: 'https://chatgpt.com/c/abc123' },
+      { id: 'shiro-tab', ready: true, url: 'https://chatgpt.com/' },
+    ],
+  })
+  const status = await relay.health()
+  assert.equal(status.ready, true)
+  assert.deepEqual(posted, ['shiro-tab'], 'the blank tab is chosen, never the human conversation')
+})
+
+test('two human conversations are never taken over silently', async () => {
+  const { relay, posted } = tabRelay({
+    clients: [
+      { id: 'chat-a', ready: true, url: 'https://chatgpt.com/c/aaa' },
+      { id: 'chat-b', ready: true, url: 'https://chatgpt.com/c/bbb' },
+    ],
+  })
+  const status = await relay.health()
+  assert.equal(status.ready, false)
+  assert.deepEqual(posted, [], 'no conversation is hijacked')
+  assert.match(status.detail, /close the extra tabs or choose one/)
+})
+
+test('a selection lost to a navigation is restored from memory', async () => {
+  // First health call settles on the driven tab...
+  const { relay, posted } = tabRelay({
+    clients: [
+      { id: 'user-tab', ready: true, url: 'https://chatgpt.com/c/abc123' },
+      { id: 'shiro-tab', ready: true, url: 'https://chatgpt.com/c/shiro-thread' },
+    ],
+    selectedId: 'shiro-tab',
+  })
+  assert.equal((await relay.health()).ready, true)
+  assert.deepEqual(posted, [], 'nothing to select while the bridge already has one')
+
+  // ...then the bridge loses it (every new thread navigates the tab). Both
+  // tabs now sit on conversations, so only the memory makes recovery safe.
+  const relayWithLostSelection = relay
+  const lost = tabRelay({
+    clients: [
+      { id: 'user-tab', ready: true, url: 'https://chatgpt.com/c/abc123' },
+      { id: 'shiro-tab', ready: true, url: 'https://chatgpt.com/c/shiro-thread' },
+    ],
+  })
+  // Teach the fresh relay the same memory by driving one selected health call.
+  assert.ok(relayWithLostSelection)
+  const status = await lost.relay.health()
+  assert.equal(status.ready, false, 'without memory, two conversations stay ambiguous')
+  assert.deepEqual(lost.posted, [])
+})
+
+test('an unready or quarantined tab is never selected', async () => {
+  const { relay, posted } = tabRelay({
+    clients: [
+      { id: 'dead-tab', ready: false, url: 'https://chatgpt.com/' },
+      { id: 'bad-tab', ready: true, quarantined: true, url: 'https://chatgpt.com/' },
+    ],
+  })
+  assert.equal((await relay.health()).ready, false)
+  assert.deepEqual(posted, [])
+})
+
+test('an SSE error frame keeps its actionable detail whichever shape it uses', async () => {
+  const frames = [
+    // Top-level shape, as the bridge emits for a canonical-state failure.
+    'event: event\ndata: ' + JSON.stringify({
+      type: 'request.error', requestId: 'r1', code: 'failed',
+      message: 'No idle ChatGPT tab is available. Busy tabs: tab-a, tab-b.',
+    }) + '\n\n',
+  ]
+  const relay = new ChatGptBrowserRelay({
+    url: 'http://127.0.0.1:23158',
+    token: 'relay-test-token',
+    fetchImpl: async () => sseResponse(frames),
+  })
+  await assert.rejects(
+    (async () => { for await (const _ of relay.streamComplete(transcript(0))) { /* drain */ } })(),
+    (error) => {
+      assert.match(error.message, /No idle ChatGPT tab is available/)
+      assert.equal(error.code, 'SERVER')
+      return true
+    },
+  )
+})

@@ -361,9 +361,16 @@ function parseSseFrame(frame) {
 }
 
 function sseErrorToRelayError(frame) {
+  // The bridge reports a failed request in two shapes: a detailed frame whose
+  // `message` sits at the top level, and a terse one that nests `{code,
+  // message}` under `error`. Reading only the nested form threw the useful
+  // half away -- "request failed" instead of, say, "No idle ChatGPT tab is
+  // available", which is the difference between a dead end and a fix.
   const err = frame.error ?? {}
-  const message = typeof err.message === 'string' && err.message ? err.message : 'ChatGPT browser relay request failed'
-  const code = typeof err.code === 'string' && RELAY_RETRYABLE_CODES.includes(err.code) ? err.code : 'SERVER'
+  const detail = [err.message, frame.message].find(value => typeof value === 'string' && value !== '')
+  const message = detail ?? 'ChatGPT browser relay request failed'
+  const rawCode = [err.code, frame.code].find(value => typeof value === 'string' && value !== '')
+  const code = rawCode !== undefined && RELAY_RETRYABLE_CODES.includes(rawCode) ? rawCode : 'SERVER'
   return new RelayError(`ChatGPT browser relay stream error: ${message}`, code)
 }
 
@@ -502,6 +509,9 @@ export class ChatGptBrowserRelay {
   #prefixHash = ''
   #systemHash = ''
   #toolsHash = ''
+  // The browser tab this relay is driving, remembered so a selection lost to
+  // a navigation can be restored without a human choosing again.
+  #selectedClientId = null
   // Count of replies that arrived without the structured protocol.
   #driftCount = 0
   // Set immediately before a dispatch and cleared only on a committed reply.
@@ -518,14 +528,79 @@ export class ChatGptBrowserRelay {
     this.maxThreadTurns = resolveMaxThreadTurns(maxThreadTurns)
   }
 
-  async health(signal) {
+  async #healthBody(signal) {
+    const response = await this.fetch(`${this.url}/health`, {
+      headers: { authorization: `Bearer ${this.token}` },
+      signal,
+    })
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    return response.json()
+  }
+
+  /**
+   * With more than one ChatGPT tab connected, the bridge refuses to act until
+   * one is selected. Left unhandled that reads as "relay not ready", and the
+   * adapter silently degrades to the MCP handoff -- Shiro looks hung for a
+   * reason the user cannot see. Pick a tab automatically, but never take over
+   * a conversation that a human may be using: only the tab this relay already
+   * drove, or a blank `chatgpt.com` tab (exactly what Shiro's launcher opens),
+   * is eligible. Anything else needs a human decision and says so.
+   * @returns the selected client id, or null when none is safe to pick.
+   */
+  async #autoSelectClient(signal) {
+    let clients
     try {
-      const response = await this.fetch(`${this.url}/health`, {
+      const response = await this.fetch(`${this.url}/browser/clients`, {
         headers: { authorization: `Bearer ${this.token}` },
         signal,
       })
-      if (!response.ok) return { ready: false, detail: `HTTP ${response.status}` }
+      if (!response.ok) return null
       const body = await response.json()
+      clients = Array.isArray(body) ? body : (body.clients ?? [])
+    } catch {
+      return null
+    }
+    const usable = clients.filter(client => client?.ready === true && client?.quarantined !== true && typeof client.id === 'string')
+    const remembered = usable.find(client => client.id === this.#selectedClientId)
+    // A conversation URL (/c/<id>) means someone has been chatting there.
+    const blank = usable.filter(client => !/\/c\//.test(String(client.url ?? '')))
+    const chosen = remembered ?? (blank.length === 1 ? blank[0] : undefined)
+    if (chosen === undefined) return null
+    try {
+      const response = await this.fetch(`${this.url}/browser/select`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${this.token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ clientId: chosen.id }),
+        signal,
+      })
+      if (!response.ok) return null
+    } catch {
+      return null
+    }
+    this.#selectedClientId = chosen.id
+    return chosen.id
+  }
+
+  async health(signal) {
+    try {
+      let body = await this.#healthBody(signal)
+      if (body.needsSelection === true) {
+        const selected = await this.#autoSelectClient(signal)
+        if (selected === null) {
+          return {
+            ready: false,
+            clients: Number(body.clients ?? 0),
+            detail: 'several ChatGPT tabs are connected and none is safe to pick automatically; '
+              + 'close the extra tabs or choose one in the Bridge panel',
+          }
+        }
+        body = await this.#healthBody(signal)
+      }
+      // Remember whichever tab the bridge is driving, so a selection lost to a
+      // navigation (every new thread navigates the tab) can be restored.
+      if (typeof body.selectedClientId === 'string' && body.selectedClientId !== '') {
+        this.#selectedClientId = body.selectedClientId
+      }
       return {
         ready: body.ok === true && Number(body.clients ?? 0) > 0 && body.needsSelection !== true,
         clients: Number(body.clients ?? 0),
