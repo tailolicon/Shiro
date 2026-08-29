@@ -6,6 +6,8 @@
   "scripts": {
     "test": "node --test bridge/tests/*.test.js",
     "build:desktop": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/Build-Desktop.ps1",
-    "start": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/Start-Shiro.ps1"
+    "start": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/Start-Shiro.ps1",
+    "prompt:repeat": "node scripts/Repeat-ChatGPT-Prompt.mjs",
+    "fleet:temporary": "node scripts/Run-Hachimi-Temporary-Fleet.mjs"
   }
 }

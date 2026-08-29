@@ -74,6 +74,22 @@ Nếu đã sửa mã engine, chạy lại với `-Rebuild`:
 PowerShell -ExecutionPolicy Bypass -File .\scripts\Start-Shiro.ps1 -Rebuild
 ```
 
+### Tự gửi prompt định kỳ vào ChatGPT Web
+
+Sau khi Shiro đã chạy và tab ChatGPT đã kết nối bridge, có thể gửi cùng một prompt ngay lập tức rồi lặp lại mỗi 27 phút:
+
+```powershell
+npm run prompt:repeat -- --prompt "Tiếp tục công việc hiện tại và báo cáo tiến độ."
+```
+
+Với prompt nhiều dòng, nên đặt nội dung trong file để không phải xử lý dấu nháy ở command line:
+
+```powershell
+npm run prompt:repeat -- --prompt-file .\prompt.txt
+```
+
+Script tự đọc URL và API token từ `.ShiroRuntime/state/chatgpt-relay.env`, không in token ra màn hình. Thêm `--wait-first` nếu muốn chờ đủ 27 phút trước lần gửi đầu, `--session <conversation-id>` để cố định một cuộc chat, hoặc `--once` để thử một lần. Nhấn Ctrl+C để dừng. Mỗi lần chạy dùng endpoint `POST /browser/passive-prompt`, tức là bridge điền prompt và bấm gửi trên ChatGPT Web; nếu tab đang bận, lần gửi đó thất bại an toàn và scheduler tiếp tục ở mốc 27 phút kế tiếp.
+
 ## Ranh giới an toàn
 
 - Web UI và MCP chỉ lắng nghe trên loopback `127.0.0.1`.

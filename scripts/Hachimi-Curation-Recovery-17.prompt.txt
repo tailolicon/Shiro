@@ -1,0 +1,18 @@
+Continue tailolicon/hachimi-tl-vi as curation recovery worker slot {{FLEET_SLOT}} of {{FLEET_SIZE}}. Work only on main and do not rely on chat history. This is a repair/merge task, not a new translation or curation pass.
+
+First refresh and read GAME_CONTEXT.md, CONTEXT_MAINTENANCE.md, PARALLEL_CURATION.md, work/curation/active_plan.json, the active plan, scripts/prepare_curation_merge.py, scripts/drain_curation_backlog.py, scripts/merge_parallel_curation.py, scripts/apply_terminology_reviews.py, and .github/workflows/merge-curation.yml. Repository state is authoritative.
+
+Your exclusive batch allocation is determined by the slot number:
+- slot 1: term-0120, term-0157, term-0161, term-0162
+- slot 2: term-0163, term-0164, term-0165, term-0175
+- slot 3: term-0188, term-0201, term-0202
+- slot 4: term-0203, term-0204, term-0205
+- slot 5: term-0227, term-0232, term-0233
+
+Never edit a batch allocated to another slot. Before each batch, refresh main and skip it if work/curation/merged/<batch_id>.json already exists. For the 15 isolated batches, inspect work/curation/merge_failures/<batch_id>.json, its referenced result, the matching current claim and completion, the exact plan items, and canonical terminology state. Preserve the existing claim_id and repair/migrate the referenced result in place with the smallest defensible change needed to satisfy current schema, exact coverage, and apply_terminology_reviews conflict validation. Old `updates[]` must be migrated to current `decisions[]`. Missing/extra coverage must be reconciled against all and only the plan's source_zh_cn items. For a lock that conflicts with an already canonical alias or mapping, never overwrite canonical data and never guess: remove the conflicting alias from that decision when the target itself is sound, otherwise change that item to `defer` with a compact note explaining the ambiguity. Proper names must not be literal-calqued from Chinese, and UmaTL English translation text must not be used as AI input.
+
+After a repaired result validates, delete only its matching work/curation/merge_failures/<batch_id>.json marker and refresh the matching completion's completed_at timestamp without changing plan_id, batch_id, claim_id or result_path; this completion update triggers the official merge workflow. Do not create a new claim, result, or completion when the existing matching envelope is recoverable. Commit the repair to main with a focused message. Do not directly edit glossary/speech_bible.json, glossary/terminology_reviews.json, glossary/term_registry.json, either review queue, localized_data, translation progress, or work/curation/merged; the merge workflow owns those files.
+
+term-0232 and term-0233 already have valid matching claim/result/completion envelopes and no failure marker. Do not rewrite their decisions merely to create activity. Slot 5 should verify their exact coverage/envelopes and let any repair completion update from this fleet or the scheduled workflow feed them to the merger. If needed and supported, dispatch the existing Merge parallel curation results workflow; do not fabricate a no-op data change.
+
+After each commit, watch the official workflow result. If it creates a new failure marker for one of your allocated batches, inspect that exact error, repair minimally, retrigger via its matching completion, and repeat. Continue until every allocated batch has work/curation/merged/<batch_id>.json and no matching merge_failures marker, or until a genuine repository/tool permission blocker is proven. Report exact batch IDs merged, still failing, and the commits/workflow evidence. Do not broaden scope.
