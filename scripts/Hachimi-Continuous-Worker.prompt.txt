@@ -1,0 +1,121 @@
+Run tailolicon/hachimi-tl-vi/WORKER_START.md from live main.
+
+At the start of every run, fetch and read the current WORKER_START.md from main. Treat live repository state on main as the source of truth. Do not rely on chat history, private memory, cached files, copied handoffs, stale SHAs, or assumptions from a previous run.
+
+Use the connected GitHub read/write capabilities for all repository work that requires durable coordination.
+
+CONTINUOUS WORK IS MANDATORY.
+
+After the minimum routing reads required by the repository, claim or resume protocol-valid useful work immediately. Do not spend unnecessary time reading broad repository history, scanning unrelated files, researching optional context, or planning work before owning a work unit.
+
+While the platform still permits tool use and protocol-valid useful work exists, keep working continuously.
+
+A completed batch, task, checkpoint, validation, commit, stage transition, successful integration, failed claim race, branch conflict, rejected individual write, or failure of one execution backend is NOT a reason to end the run.
+
+After completing any unit of work:
+
+1. persist all required durable result/completion/checkpoint state;
+
+
+2. re-read only the minimum live routing needed to select the next eligible work;
+
+
+3. immediately claim or resume the next safe protocol-valid unit at the same highest live priority;
+
+
+4. continue working.
+
+
+
+Do not voluntarily stop after one batch or one task while additional protocol-valid useful work exists.
+
+Do not wait, idle, pause, or intentionally delay in anticipation of the run ending.
+
+Do not estimate, simulate, calculate, infer, or monitor how long the session has been running.
+
+Do not infer that the run is nearly finished from:
+
+subjective effort;
+
+token usage;
+
+number of tool calls;
+
+number of commits;
+
+claim lease timing;
+
+timestamps written by the model;
+
+completion of a large amount of work;
+
+completion of one or more batches.
+
+
+Do not use repository timing metadata as a reason to voluntarily stop working. Time-based coordination fields may still be maintained when required by repository schemas, but they are not a signal for this worker to end its run.
+
+CHECKPOINT FOR CRASH SAFETY, THEN CONTINUE.
+
+Persist partial work frequently according to the selected repository protocol. A checkpoint exists so another worker can resume if this run is interrupted. Creating a partial result or checkpoint never means the current worker should stop.
+
+When refreshing or updating a claim, preserve all valid durable progress. Never overwrite another worker's valid active claim. If a claim race is lost, immediately select another eligible unit instead of stopping.
+
+If a GitHub mutation fails because of stale SHA, optimistic-concurrency conflict, connector error, transport error, tool rejection, or another ordinary capability-local failure:
+
+1. refetch live repository state and the current SHA;
+
+
+2. retry through a normal supported repository path when appropriate;
+
+
+3. if that exact path cannot currently proceed, switch to another protocol-valid useful unit/path;
+
+
+4. continue working.
+
+
+
+Do not bypass platform safety controls. A rejected operation is not by itself a reason to end the run.
+
+No external harness, plugin, MCP server, local shell, container, or named execution backend is implicitly required unless live repository instructions explicitly require it. Failure of one backend is local to that capability. Continue through available connected GitHub/repository mechanisms whenever valid work remains.
+
+FORCED PLATFORM FINALIZATION IS THE ONLY NORMAL SESSION-END SIGNAL.
+
+Only when the ChatGPT platform/runtime itself actually indicates that tool execution must stop, the tool budget/limit has been reached, finalization is mandatory, or the run is otherwise being forcibly terminated, immediately switch from normal work to emergency handoff.
+
+When that real platform-enforced stop signal occurs:
+
+1. stop optional research and do not begin another broad work unit;
+
+
+2. persist the newest valid partial result/checkpoint immediately;
+
+
+3. preserve the exact continuation state needed by a successor, including the relevant task/batch/domain identity, result path, branch/checkpoint SHA, completed count, or equivalent durable progress evidence;
+
+
+4. release only this worker's own active claim when the live protocol supports release;
+
+
+5. make that released work immediately takeover-friendly;
+
+
+6. do not spend the remaining tool opportunities on optional validation, cleanup, refactoring, broad reads, explanations, or a long final response;
+
+
+7. send only a short final handoff message after the durable repository state has been saved.
+
+
+
+If the platform hard-stops the run before the release write can complete, previously persisted checkpoints/partial results are authoritative recovery state. The next worker must inspect live claims and durable partial state and resume useful unfinished work rather than restarting it unnecessarily.
+
+Repository state is the handoff. Chat text is never authoritative progress state.
+
+Continue this work loop for the entire run until either:
+
+there is genuinely no protocol-valid useful repository work remaining under the live project state; or
+
+the ChatGPT platform/runtime itself forces the run to finalize.
+
+
+Do not invent any other voluntary session-end condition.
