@@ -8,6 +8,7 @@ import {
   DEFAULT_MAX_SESSION_RUNS,
   DEFAULT_STAGGER_SECONDS,
   extractEmbeddedPrompt,
+  fleetSizeArgument,
   promptFileArgument,
   renderFleetPrompt,
   cleanupBusyEvidence,
@@ -23,6 +24,7 @@ import {
   sessionRunCount,
   selectFleetClients,
   selectStatusFleet,
+  statusNameArgument,
 } from '../../scripts/Run-Hachimi-Temporary-Fleet.mjs'
 
 const inactive = '<button aria-label="Trò chuyện tạm thời"><span><svg class="icon"></svg><svg class="icon opacity-0"></svg></span></button>'
@@ -136,4 +138,9 @@ test('fleet prompt file and slot placeholders are deterministic', () => {
   assert.equal(promptFileArgument(['--once', '--prompt-file=.\\repair.txt']), '.\\repair.txt')
   assert.equal(promptFileArgument(['--once']), '')
   assert.equal(renderFleetPrompt('slot {{FLEET_SLOT}}/{{FLEET_SIZE}}', 3), 'slot 3/5')
+  assert.equal(fleetSizeArgument(['--fleet-size=3']), 3)
+  assert.equal(fleetSizeArgument([]), 5)
+  assert.throws(() => fleetSizeArgument(['--fleet-size=0']), /integer from 1 to 20/)
+  assert.equal(statusNameArgument(['--status-name=echoes-web-trial.json']), 'echoes-web-trial.json')
+  assert.throws(() => statusNameArgument(['--status-name=../escape.json']), /simple \.json filename/)
 })

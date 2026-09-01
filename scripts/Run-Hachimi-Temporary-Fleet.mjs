@@ -53,6 +53,27 @@ export function promptFileArgument(args = []) {
   return value.trim()
 }
 
+export function fleetSizeArgument(args = [], fallback = DEFAULT_FLEET_SIZE) {
+  const prefix = '--fleet-size='
+  const raw = args.find((argument) => argument.startsWith(prefix))?.slice(prefix.length) || ''
+  if (!raw) return fallback
+  const value = Number(raw)
+  if (!Number.isInteger(value) || value < 1 || value > 20) {
+    throw new Error('--fleet-size must be an integer from 1 to 20')
+  }
+  return value
+}
+
+export function statusNameArgument(args = [], fallback = path.basename(statusPath)) {
+  const prefix = '--status-name='
+  const value = args.find((argument) => argument.startsWith(prefix))?.slice(prefix.length).trim() || ''
+  if (!value) return fallback
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*\.json$/.test(value)) {
+    throw new Error('--status-name must be a simple .json filename')
+  }
+  return value
+}
+
 export function renderFleetPrompt(template, slot, fleetSize = DEFAULT_FLEET_SIZE) {
   return String(template)
     .replaceAll('{{FLEET_SLOT}}', String(slot))
@@ -250,9 +271,9 @@ class RelayClient {
   }
 }
 
-async function writeStatus(status) {
-  await fs.mkdir(path.dirname(statusPath), { recursive: true })
-  await fs.writeFile(statusPath, `${JSON.stringify(status, null, 2)}\n`, 'utf8')
+async function writeStatus(status, targetPath = statusPath) {
+  await fs.mkdir(path.dirname(targetPath), { recursive: true })
+  await fs.writeFile(targetPath, `${JSON.stringify(status, null, 2)}\n`, 'utf8')
 }
 
 function isGenerating(client) {
@@ -347,14 +368,15 @@ async function adoptChatTarget(relay, tabId, signal, temporaryOnly = true) {
   }
 }
 
-async function launchRound({ relay, promptTemplate, adopted = [], staggerMs, signal, log, temporaryOnly = true }) {
+async function launchRound({ relay, promptTemplate, adopted = [], staggerMs, signal, log, temporaryOnly = true,
+  fleetSize = DEFAULT_FLEET_SIZE }) {
   const results = [...adopted]
   let successful = results.filter(isSuccessfulSession).length
   let launchAttempts = 0
-  while (!signal.aborted && successful < DEFAULT_FLEET_SIZE && launchAttempts < DEFAULT_MAX_LAUNCH_ATTEMPTS) {
+  while (!signal.aborted && successful < fleetSize && launchAttempts < DEFAULT_MAX_LAUNCH_ATTEMPTS) {
     if (launchAttempts > 0) await delay(staggerMs, signal)
     const slot = successful + 1
-    const prompt = renderFleetPrompt(promptTemplate, slot)
+    const prompt = renderFleetPrompt(promptTemplate, slot, fleetSize)
     const launched = await launchChatTarget({ relay, prompt, signal, log, temporaryOnly })
     const result = isSuccessfulSession(launched)
       ? { ...launched, slot, runCount: 1 }
@@ -396,11 +418,11 @@ async function inspectReusableFleet(relay, fleet, signal, temporaryOnly = true) 
 }
 
 async function reuseFleetRound({ relay, fleet, promptTemplate, signal, log, temporaryOnly = true,
-  staggerMs = DEFAULT_STAGGER_SECONDS * 1000 }) {
+  staggerMs = DEFAULT_STAGGER_SECONDS * 1000, fleetSize = DEFAULT_FLEET_SIZE }) {
   const attempts = fleet.map(async (owned, index) => {
     if (index > 0) await delay(index * staggerMs, signal)
     const slot = Number.isInteger(owned.slot) ? owned.slot : index + 1
-    const prompt = renderFleetPrompt(promptTemplate, slot)
+    const prompt = renderFleetPrompt(promptTemplate, slot, fleetSize)
     try {
       const response = await relay.submit(owned.id, prompt, signal, { temporaryOnly, allowWindowBlur: true })
       const session = {
@@ -435,9 +457,12 @@ async function main() {
   const resumeStatus = args.has('--resume-status')
   const temporaryOnly = !args.has('--normal-chat')
   const chatMode = temporaryOnly ? 'temporary' : 'normal'
+  const fleetSize = fleetSizeArgument(rawArgs)
+  const runStatusPath = path.join(path.dirname(statusPath), statusNameArgument(rawArgs))
   const adoptValue = rawArgs.find((argument) => argument.startsWith('--adopt-tabs='))?.split('=', 2)[1]
     || rawArgs.find((argument) => argument.startsWith('--adopt-tab='))?.split('=', 2)[1]
   const adoptTabIds = String(adoptValue || '').split(',').map((value) => value.trim()).filter(Boolean).map(Number).filter(Number.isInteger)
+  if (adoptTabIds.length > fleetSize) throw new Error('adopted tab count exceeds --fleet-size')
   const env = parseEnvFile(await fs.readFile(runtimeEnvPath, 'utf8'))
   if (!env.API_TOKEN) throw new Error(`Relay token is missing from ${runtimeEnvPath}`)
   const promptFile = promptFileArgument(rawArgs)
@@ -460,7 +485,7 @@ async function main() {
     let round = 0
     if (resumeStatus) {
       try {
-        const previousStatus = JSON.parse(await fs.readFile(statusPath, 'utf8'))
+        const previousStatus = JSON.parse(await fs.readFile(runStatusPath, 'utf8'))
         fleet = selectStatusFleet(previousStatus)
         round = Number.isInteger(Number(previousStatus.round)) ? Number(previousStatus.round) : 0
         if (fleet.length) log(`Resuming ${fleet.length} runner-owned ${chatMode} tabs at completed round ${round}.`)
@@ -484,7 +509,7 @@ async function main() {
           await writeStatus({
             running: true,
             pid: process.pid,
-            fleetSize: fleet.length,
+            fleetSize,
             intervalMinutes: DEFAULT_INTERVAL_MINUTES,
             maxSessionRuns: DEFAULT_MAX_SESSION_RUNS,
             chatMode,
@@ -494,7 +519,7 @@ async function main() {
             sessions: fleet,
             retry,
             nextRetryAt: new Date(Date.now() + BUSY_RETRY_MS).toISOString(),
-          })
+          }, runStatusPath)
           log(`No safely reusable ${chatMode} session is available; retrying in ${BUSY_RETRY_MS / 60_000} minutes.`)
           await delay(BUSY_RETRY_MS, controller.signal)
           continue
@@ -507,7 +532,7 @@ async function main() {
             await writeStatus({
               running: true,
               pid: process.pid,
-              fleetSize: fleet.length,
+              fleetSize,
               intervalMinutes: DEFAULT_INTERVAL_MINUTES,
               maxSessionRuns: DEFAULT_MAX_SESSION_RUNS,
               chatMode,
@@ -517,7 +542,7 @@ async function main() {
               sessions: fleet,
               cleanup,
               nextRetryAt: new Date(Date.now() + BUSY_RETRY_MS).toISOString(),
-            })
+            }, runStatusPath)
             log(`The expiring cohort is not safely closable; retrying in ${BUSY_RETRY_MS / 60_000} minutes.`)
             await delay(BUSY_RETRY_MS, controller.signal)
             continue
@@ -545,6 +570,7 @@ async function main() {
           signal: controller.signal,
           log,
           temporaryOnly,
+          fleetSize,
         })
         results = [...reused.results, ...deferredResults]
         if (reusableTargets) {
@@ -562,6 +588,7 @@ async function main() {
           signal: controller.signal,
           log,
           temporaryOnly,
+          fleetSize,
         })
         fleet = results.filter((result) => isSuccessfulSession(result) && Number.isInteger(result.tabId))
       }
@@ -569,7 +596,8 @@ async function main() {
       const status = {
         running: !once && hasRemainingRounds(round) && !controller.signal.aborted,
         pid: process.pid,
-        fleetSize: fleet.length,
+        fleetSize,
+        activeFleetSize: fleet.length,
         intervalMinutes: DEFAULT_INTERVAL_MINUTES,
         maxSessionRuns: DEFAULT_MAX_SESSION_RUNS,
         chatMode,
@@ -583,7 +611,7 @@ async function main() {
         results,
         nextRunAt: once || !hasRemainingRounds(round) ? null : new Date(Date.now() + DEFAULT_INTERVAL_MINUTES * 60_000).toISOString(),
       }
-      await writeStatus(status)
+      await writeStatus(status, runStatusPath)
       log(`Round ${round} result: ${JSON.stringify(status.summary)}.`)
       if (once || !hasRemainingRounds(round) || controller.signal.aborted) break
       await delay(DEFAULT_INTERVAL_MINUTES * 60_000, controller.signal)
