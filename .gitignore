@@ -43,6 +43,8 @@ node_modules/
 /hachimi-tl-vi/
 /hachimi-throughput-fix/
 /hachimi-dual-lane-live/
+/aiko-validation/
+/aiko-validation2/
 /live-b*.json
 /current-screen*.png
 /tmp/

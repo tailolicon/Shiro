@@ -73,7 +73,12 @@ test('the documented public entrypoints are all exported', async () => {
 test('npm pack ships every reachable module', async t => {
   // The real check, against npm's own file selection rather than a re-reading
   // of files[]: .npmignore, defaults and negations all get a vote here.
-  const listed = execFileSync('npm', ['pack', '--dry-run', '--json'], { cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+  const cache = await mkdtemp(join(tmpdir(), 'shiro-npm-cache-'))
+  t.after(() => rm(cache, { recursive: true, force: true }))
+  const listed = execFileSync('npm', ['pack', '--dry-run', '--json'], {
+    cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+    env: { ...process.env, npm_config_cache: cache },
+  })
   const packed = new Set(JSON.parse(listed)[0].files.map(entry => entry.path))
 
   const pkg = await manifest()
@@ -91,17 +96,21 @@ test('a packed tarball installs into an empty directory and every export imports
   const staging = await mkdtemp(join(tmpdir(), 'shiro-pack-'))
   t.after(() => rm(staging, { recursive: true, force: true }))
 
+  // npm's default cache lives in $HOME, which is read-only whenever this suite
+  // itself runs confined -- point it inside the staging directory so the test
+  // is hermetic and passes under `test_run` with a narrowed sandbox_mode too.
+  const hermetic = { ...process.env, npm_config_cache: join(staging, 'npm-cache') }
   const packed = JSON.parse(execFileSync('npm', ['pack', '--json', '--pack-destination', staging], {
-    cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+    cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], env: hermetic,
   }))[0].filename
   const tarball = join(staging, packed)
 
   const consumer = join(staging, 'consumer')
   execFileSync('mkdir', ['-p', consumer])
-  execFileSync('npm', ['init', '-y'], { cwd: consumer, stdio: 'ignore' })
+  execFileSync('npm', ['init', '-y'], { cwd: consumer, stdio: 'ignore', env: hermetic })
   // --no-package-lock keeps this from touching any shared store; the engine
   // peer stays absent on purpose, since it is optional.
-  execFileSync('npm', ['install', '--no-audit', '--no-fund', '--no-package-lock', tarball], { cwd: consumer, stdio: 'ignore' })
+  execFileSync('npm', ['install', '--no-audit', '--no-fund', '--no-package-lock', tarball], { cwd: consumer, stdio: 'ignore', env: hermetic })
 
   const pkg = await manifest()
   for (const subpath of Object.keys(pkg.exports)) {

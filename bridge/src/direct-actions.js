@@ -283,6 +283,7 @@ export function registerDirectActions(server, options) {
   // The process registry is bridge-lifetime state built in index.js, so the
   // confinement is attached here rather than passed on every call.
   if (processes !== undefined && processes !== null && processes.confinement === null) processes.confinement = confinement
+  if (terminals !== undefined && terminals !== null && terminals.confinement === null) terminals.confinement = confinement
   const define = (name, spec, handler) => defineAction(server, registry, metrics, name, spec, handler, policy)
   // Every workspace-scoped handler resolves its Sandbox here: an unknown id
   // fails with NOT_FOUND before a single path is touched, and omitting the
@@ -1306,6 +1307,7 @@ export function registerDirectActions(server, options) {
     argv: z.array(z.string()).optional(),
     cwd: z.string(),
     workspace: z.string().optional(),
+    sandbox: z.object({ mode: z.string(), enforcement: z.string(), backend: z.string().optional() }).optional().describe('The confinement this terminal runs under. Everything typed into it is a descendant of the confined PTY host.'),
     label: z.string().optional(),
     pid: z.number().nullable().optional(),
     cols: z.number(),
@@ -1332,6 +1334,7 @@ export function registerDirectActions(server, options) {
       cols: z.number().int().min(20).max(TERMINAL_LIMITS.max_cols).optional(),
       rows: z.number().int().min(4).max(TERMINAL_LIMITS.max_rows).optional(),
       label: z.string().max(120).optional(),
+      sandbox_mode: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional().describe('OS-level confinement for the whole terminal session, through the engine sandbox provider. Everything typed in later inherits it. Can only NARROW the permission profile.'),
     },
     output: TERMINAL_SHAPE,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
@@ -1464,7 +1467,7 @@ export function registerDirectActions(server, options) {
       ...truncationShape,
     },
     annotations: READ_ONLY,
-  }, (args, extra) => review.reviewDiff(sandboxOf(args), args, { signal: extra?.signal }))
+  }, (args, extra) => review.reviewDiff(sandboxOf(args), args, { signal: extra?.signal, confinement }))
 
   define('review_stage_hunk', {
     family: 'review',
@@ -1481,7 +1484,7 @@ export function registerDirectActions(server, options) {
       deletions: z.number(),
     },
     annotations: WRITE,
-  }, (args, extra) => review.stageHunk(sandboxOf(args), args, { signal: extra?.signal }))
+  }, (args, extra) => review.stageHunk(sandboxOf(args), args, { signal: extra?.signal, confinement }))
 
   define('review_revert_hunk', {
     family: 'review',
@@ -1501,7 +1504,7 @@ export function registerDirectActions(server, options) {
     requiresConfirmation: true,
   }, async (args, extra) => {
     requireConfirmation(args.confirm, `Revert hunk ${args.hunk_id}`)
-    return await review.revertHunk(sandboxOf(args), args, { signal: extra?.signal })
+    return await review.revertHunk(sandboxOf(args), args, { signal: extra?.signal, confinement })
   })
 
   define('review_findings', {
@@ -1527,7 +1530,7 @@ export function registerDirectActions(server, options) {
       by_priority: looseObject(),
     },
     annotations: READ_ONLY,
-  }, (args, extra) => review.checkFindings(sandboxOf(args), args, { signal: extra?.signal }))
+  }, (args, extra) => review.checkFindings(sandboxOf(args), args, { signal: extra?.signal, confinement }))
 
   // ------------------------------------------------------------------ git --
 
@@ -1546,7 +1549,7 @@ export function registerDirectActions(server, options) {
     },
     output: GIT_STATUS_SHAPE,
     annotations: READ_ONLY,
-  }, args => git.status(sandboxOf(args), args))
+  }, args => git.status(sandboxOf(args), args, { confinement }))
 
   define('git_repo_info', {
     family: 'git',
@@ -1568,7 +1571,7 @@ export function registerDirectActions(server, options) {
       remotes: z.array(looseObject()).describe('{name, fetch_url, push_url} with credentials masked.'),
     },
     annotations: READ_ONLY,
-  }, args => git.repoInfo(sandboxOf(args), args))
+  }, args => git.repoInfo(sandboxOf(args), args, { confinement }))
 
   define('git_diff', {
     family: 'git',
@@ -1599,7 +1602,7 @@ export function registerDirectActions(server, options) {
       ...truncationShape,
     },
     annotations: READ_ONLY,
-  }, args => git.diff(sandboxOf(args), args))
+  }, args => git.diff(sandboxOf(args), args, { confinement }))
 
   define('git_log', {
     family: 'git',
@@ -1623,7 +1626,7 @@ export function registerDirectActions(server, options) {
       ...truncationShape,
     },
     annotations: READ_ONLY,
-  }, args => git.log(sandboxOf(args), args))
+  }, args => git.log(sandboxOf(args), args, { confinement }))
 
   define('git_show', {
     family: 'git',
@@ -1648,7 +1651,7 @@ export function registerDirectActions(server, options) {
       ...truncationShape,
     },
     annotations: READ_ONLY,
-  }, args => git.show(sandboxOf(args), args))
+  }, args => git.show(sandboxOf(args), args, { confinement }))
 
   define('git_compare', {
     family: 'git',
@@ -1675,7 +1678,7 @@ export function registerDirectActions(server, options) {
       ...truncationShape,
     },
     annotations: READ_ONLY,
-  }, args => git.compare(sandboxOf(args), args))
+  }, args => git.compare(sandboxOf(args), args, { confinement }))
 
   define('git_branch_list', {
     family: 'git',
@@ -1694,7 +1697,7 @@ export function registerDirectActions(server, options) {
       ...truncationShape,
     },
     annotations: READ_ONLY,
-  }, args => git.branchList(sandboxOf(args), args))
+  }, args => git.branchList(sandboxOf(args), args, { confinement }))
 
   define('git_branch_create', {
     family: 'git',
@@ -1715,7 +1718,7 @@ export function registerDirectActions(server, options) {
       sha: z.string(),
     },
     annotations: IDEMPOTENT_WRITE,
-  }, args => git.branchCreate(sandboxOf(args), args))
+  }, args => git.branchCreate(sandboxOf(args), args, { confinement }))
 
   define('git_checkout', {
     family: 'git',
@@ -1735,7 +1738,7 @@ export function registerDirectActions(server, options) {
       dirty: z.boolean(),
     },
     annotations: WRITE,
-  }, args => git.checkout(sandboxOf(args), args))
+  }, args => git.checkout(sandboxOf(args), args, { confinement }))
 
   define('git_add', {
     family: 'git',
@@ -1755,7 +1758,7 @@ export function registerDirectActions(server, options) {
       untracked: z.number(),
     },
     annotations: WRITE,
-  }, args => git.add(sandboxOf(args), args))
+  }, args => git.add(sandboxOf(args), args, { confinement }))
 
   define('git_commit', {
     family: 'git',
@@ -1776,7 +1779,7 @@ export function registerDirectActions(server, options) {
       all: z.boolean(),
     },
     annotations: WRITE,
-  }, args => git.commit(sandboxOf(args), args))
+  }, args => git.commit(sandboxOf(args), args, { confinement }))
 
   define('git_restore', {
     family: 'git',
@@ -1799,7 +1802,7 @@ export function registerDirectActions(server, options) {
     },
     annotations: DESTRUCTIVE,
     requiresConfirmation: true,
-  }, args => git.restore(sandboxOf(args), args))
+  }, args => git.restore(sandboxOf(args), args, { confinement }))
 
   define('git_reset', {
     family: 'git',
@@ -1822,7 +1825,7 @@ export function registerDirectActions(server, options) {
     },
     annotations: DESTRUCTIVE,
     requiresConfirmation: true,
-  }, args => git.reset(sandboxOf(args), args))
+  }, args => git.reset(sandboxOf(args), args, { confinement }))
 
   define('git_merge', {
     family: 'git',
@@ -1845,7 +1848,7 @@ export function registerDirectActions(server, options) {
       output: z.string().optional(),
     },
     annotations: WRITE,
-  }, args => git.merge(sandboxOf(args), args))
+  }, args => git.merge(sandboxOf(args), args, { confinement }))
 
   define('git_rebase', {
     family: 'git',
@@ -1867,7 +1870,7 @@ export function registerDirectActions(server, options) {
     },
     annotations: DESTRUCTIVE,
     requiresConfirmation: true,
-  }, args => git.rebase(sandboxOf(args), args))
+  }, args => git.rebase(sandboxOf(args), args, { confinement }))
 
   define('git_tag_list', {
     family: 'git',
@@ -1877,7 +1880,7 @@ export function registerDirectActions(server, options) {
     input: { path: gitPath(), limit: z.number().int().min(1).max(git.GIT_LIMITS.tag_max).optional() },
     output: { tags: z.array(looseObject()).describe('{name, sha, created_at, subject}'), total: z.number(), ...truncationShape },
     annotations: READ_ONLY,
-  }, args => git.tagList(sandboxOf(args), args))
+  }, args => git.tagList(sandboxOf(args), args, { confinement }))
 
   define('git_tag_create', {
     family: 'git',
@@ -1892,7 +1895,7 @@ export function registerDirectActions(server, options) {
     },
     output: { name: z.string(), created: z.boolean(), annotated: z.boolean(), ref: z.string().optional(), sha: z.string() },
     annotations: WRITE,
-  }, args => git.tagCreate(sandboxOf(args), args))
+  }, args => git.tagCreate(sandboxOf(args), args, { confinement }))
 
   define('git_remote_list', {
     family: 'git',
@@ -1902,7 +1905,7 @@ export function registerDirectActions(server, options) {
     input: { path: gitPath() },
     output: { remotes: z.array(looseObject()).describe('{name, fetch_url, push_url} with credentials masked.') },
     annotations: READ_ONLY,
-  }, args => git.remoteList(sandboxOf(args), args))
+  }, args => git.remoteList(sandboxOf(args), args, { confinement }))
 
   define('git_fetch', {
     family: 'git',
@@ -1925,7 +1928,7 @@ export function registerDirectActions(server, options) {
       output: z.string(),
     },
     annotations: NETWORK_READ,
-  }, args => git.fetch(sandboxOf(args), args))
+  }, args => git.fetch(sandboxOf(args), args, { confinement }))
 
   define('git_pull', {
     family: 'git',
@@ -1941,7 +1944,7 @@ export function registerDirectActions(server, options) {
     },
     output: { pulled: z.boolean(), remote: z.string(), strategy: z.string(), head: z.string(), output: z.string() },
     annotations: NETWORK_WRITE,
-  }, args => git.pull(sandboxOf(args), args))
+  }, args => git.pull(sandboxOf(args), args, { confinement }))
 
   define('git_push', {
     family: 'git',
@@ -1968,7 +1971,7 @@ export function registerDirectActions(server, options) {
     },
     annotations: NETWORK_WRITE,
     requiresConfirmation: true,
-  }, args => git.push(sandboxOf(args), args))
+  }, args => git.push(sandboxOf(args), args, { confinement }))
 
   // ----------------------------------------------------------------- tasks --
 
@@ -1998,10 +2001,11 @@ export function registerDirectActions(server, options) {
       timeout_ms: z.number().int().min(100).max(EXEC_LIMITS.timeout_max_ms).optional(),
       max_output_bytes: z.number().int().min(1024).max(EXEC_LIMITS.output_max_bytes).optional(),
       env: z.record(z.string(), z.string()).optional(),
+      sandbox_mode: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional().describe('OS-level confinement for this run, through the engine sandbox provider. Can only NARROW the permission profile. The result reports what was enforced.'),
     },
     output: { task: z.string(), source: z.string(), passed: z.boolean(), ...EXEC_OUTPUT_SHAPE },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
-  }, (args, extra) => tasks.runTask(sandboxOf(args), args, { signal: extra?.signal }))
+  }, (args, extra) => tasks.runTask(sandboxOf(args), args, { signal: extra?.signal, confinement }))
 
   define('test_run', {
     family: 'task',
@@ -2015,10 +2019,11 @@ export function registerDirectActions(server, options) {
       timeout_ms: z.number().int().min(100).max(EXEC_LIMITS.timeout_max_ms).optional(),
       max_output_bytes: z.number().int().min(1024).max(EXEC_LIMITS.output_max_bytes).optional(),
       env: z.record(z.string(), z.string()).optional(),
+      sandbox_mode: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional().describe('OS-level confinement for this run, through the engine sandbox provider. Can only NARROW the permission profile. The result reports what was enforced.'),
     },
     output: { task: z.string(), source: z.string(), passed: z.boolean(), ...EXEC_OUTPUT_SHAPE },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
-  }, (args, extra) => tasks.runTests(sandboxOf(args), args, { signal: extra?.signal }))
+  }, (args, extra) => tasks.runTests(sandboxOf(args), args, { signal: extra?.signal, confinement }))
 
   // ------------------------------------------------- harness control plane --
 

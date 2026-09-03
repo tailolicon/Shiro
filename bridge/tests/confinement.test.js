@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Confinement, sandboxModeForProfile } from '../src/confinement.js'
@@ -138,4 +138,102 @@ test('without a confinement the command still runs, reported as unconfined', asy
   const result = await runCommand(new Sandbox(root), { argv: ['node', '-e', 'console.log("plain")'] }, {})
   assert.match(result.stdout, /plain/)
   assert.equal(result.sandbox.enforcement, 'none')
+})
+
+// -- the other spawn paths ---------------------------------------------------
+
+test('a terminal confines the PTY HOST, so everything typed later inherits it', async t => {
+  // The shell inside a terminal is not spawned by the bridge -- the PTY host
+  // spawns it, and the user types more commands into it afterwards. Wrapping
+  // individual commands could never cover those; wrapping the host covers the
+  // whole session because every one of them is its descendant.
+  const { TerminalRegistry } = await import('../src/terminal-actions.js')
+  const root = await mkdtemp(join(tmpdir(), 'shiro-confine-tty-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+
+  // A pass-through provider: it records WHAT it was asked to confine, then
+  // hands the argv back unchanged so the real PTY host still starts and speaks
+  // its own protocol. Substituting a stand-in binary here would only prove the
+  // stand-in cannot talk to the registry.
+  let confinedArgv = null
+  const provider = {
+    confine(argv) {
+      confinedArgv = [...argv]
+      return { argv: [...argv], enforcement: 'complete', denialSignatures: [], runnerFailureRules: [] }
+    },
+  }
+  const terminals = new TerminalRegistry({
+    confinement: new Confinement({ provider, policy: new PermissionPolicy({ profile: 'workspace-write' }) }),
+  })
+  const started = await terminals.start({ argv: ['bash'] }, { sandbox: new Sandbox(root) })
+  t.after(async () => { await terminals.stop({ terminal_id: started.terminal_id, force: true }).catch(() => {}) })
+
+  assert.notEqual(confinedArgv, null, 'the PTY host was confined')
+  assert.match(confinedArgv[0], /python/, 'it is the python PTY helper that gets wrapped, not bash')
+  assert.equal(started.sandbox.mode, 'workspace-write')
+  assert.equal(started.sandbox.enforcement, 'complete')
+})
+
+test('git takes the boundary as an argument, and worktree work deliberately does not', async () => {
+  // Measured against the real engine provider: under workspace-write, `git
+  // worktree add` into an allowlisted SIBLING directory fails with
+  // "Read-only file system" -- correct enforcement, wrong outcome, because
+  // creating a checkout in another allowed root is exactly what
+  // worktree_create is for. So the boundary is opt-in per caller: actions that
+  // stay inside one workspace pass it, worktree actions do not.
+  const { runGit } = await import('../src/git-commands.js')
+  assert.equal(typeof runGit, 'function')
+
+  const wired = await readFile(new URL('../src/direct-actions.js', import.meta.url), 'utf8')
+  const gitCalls = [...wired.matchAll(/git\.\w+\(sandboxOf\(args\), args.*$/gm)].map(match => match[0])
+  assert.ok(gitCalls.length > 15, `expected the git family, saw ${gitCalls.length}`)
+  for (const call of gitCalls) {
+    assert.match(call, /confinement/, `git call site not confined: ${call}`)
+  }
+  // The deliberate exception, asserted so it cannot be "fixed" by accident.
+  const worktreeCalls = [...wired.matchAll(/worktrees\.\w+\(sandboxOf\(args\).*$/gm)].map(match => match[0])
+  assert.ok(worktreeCalls.length > 0)
+  for (const call of worktreeCalls) {
+    assert.doesNotMatch(call, /confinement/, `worktree must stay unconfined to reach other allowed roots: ${call}`)
+  }
+})
+
+test('task and test runs inherit the exec boundary', async () => {
+  const wired = await readFile(new URL('../src/direct-actions.js', import.meta.url), 'utf8')
+  for (const name of ['runTask', 'runTests']) {
+    const call = wired.match(new RegExp(`tasks\\.${name}\\(.*$`, 'm'))?.[0]
+    assert.ok(call, `${name} call site not found`)
+    assert.match(call, /confinement/, `${name} runs package scripts and must be confined`)
+  }
+})
+
+test('every action that spawns declares sandbox_mode, so a caller can narrow one call', async () => {
+  const wired = await readFile(new URL('../src/direct-actions.js', import.meta.url), 'utf8')
+  // Reading the parameter without declaring it is how it silently did nothing.
+  const declared = (wired.match(/sandbox_mode: z\.enum/g) ?? []).length
+  assert.equal(declared, 5, 'exec_run, process_start, task_run, test_run, terminal_start')
+})
+
+test('a task run forwards sandbox_mode to the command it actually spawns', async t => {
+  // task-actions rebuilds the runCommand arguments field by field instead of
+  // spreading, so an unnamed field is dropped in silence: sandbox_mode was
+  // declared on test_run, accepted, threaded down, and still had no effect on
+  // the spawn. Caught by running it live, not by any unit test.
+  const { runTests } = await import('../src/task-actions.js')
+  const root = await mkdtemp(join(tmpdir(), 'shiro-confine-task-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const { writeFile } = await import('node:fs/promises')
+  await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'probe', scripts: { test: 'node -e "process.exit(0)"' } }))
+
+  let seenMode = null
+  const provider = {
+    confine(argv, policy) {
+      seenMode = policy.mode
+      return { argv: ['node', '-e', 'process.exit(0)'], enforcement: 'complete', denialSignatures: [], runnerFailureRules: [] }
+    },
+  }
+  const confinement = new Confinement({ provider, policy: new PermissionPolicy({ profile: 'full' }) })
+  const result = await runTests(new Sandbox(root), { sandbox_mode: 'read-only' }, { confinement })
+  assert.equal(seenMode, 'read-only', 'the per-call mode reached the provider')
+  assert.equal(result.sandbox.mode, 'read-only')
 })

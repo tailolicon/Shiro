@@ -623,6 +623,42 @@ không chỉ spec của protocol.
     `verify-runtime-closure` xanh. Sửa thêm hai nhiễu khởi động cùng loại với `jq` ở mục 39:
     probe tunnel in `curl: (22) 503` vì `--show-error` giữa vòng retry.
 
+46. **Nối confinement cho terminal / task / git — và một ranh giới cố ý KHÔNG nối.**
+    Mục 45 để nợ 4 đường spawn. Nay đủ 5 action khai `sandbox_mode`: `exec_run`,
+    `process_start`, `task_run`, `test_run`, `terminal_start`.
+
+    **Terminal confine PTY HOST, không phải shell.** Shell trong terminal không do bridge
+    spawn — PTY host spawn nó, và người dùng còn gõ thêm lệnh vào sau. Bọc từng lệnh không
+    bao giờ với tới được những lệnh gõ sau; bọc host thì cả phiên nằm trong biên vì mọi thứ
+    đều là con cháu của nó. Chứng minh live: `enforcement: full, backend: bwrap`.
+
+    **Task/test đi qua `runCommand` sẵn** nên chỉ cần truyền `confinement` — nhưng lộ ra
+    một bug thứ hai: `execute()` trong `task-actions.js` **dựng lại** args field-by-field
+    thay vì spread, nên `sandbox_mode` được khai trong schema, được nhận, được truyền xuống,
+    rồi **bị đánh rơi im lặng** trước khi tới spawn. Chỉ chạy thật mới thấy: unit test không
+    bắt được vì nó không đi qua đường dựng args đó.
+
+    **Git: đo trước, rồi mới quyết.** Confine git theo workspace root nghe hợp lý cho tới
+    khi đo bằng provider thật:
+    ```
+    ghi $HOME                              → BLOCKED  ✓ biên hoạt động
+    git worktree add <sibling đã allowlist> → BLOCKED  ✗ phá đúng chức năng worktree_create
+    ```
+    Nên ranh giới chia **theo module, theo mục đích**, không theo danh sách ngoại lệ tay:
+    `git-actions` và `review-actions` (thao tác nằm gọn trong một workspace) **có** confine;
+    `worktree-actions` (mục đích chính là tạo checkout ở root khác) **không**. `runGit` nhận
+    confinement như tham số opt-in chứ không tự áp — có test khẳng định cả hai chiều, để
+    không ai "sửa" cái ngoại lệ này bằng thiện chí.
+
+    **Bằng chứng mạnh nhất**: chạy nguyên bộ test của chính Shiro *bên trong* bwrap —
+    `test_run` với `sandbox_mode: workspace-write` → **exit 0, 490/490**. Trên đường đó bắt
+    thêm một lỗi thật: gate đóng gói ở mục 45 ghi cache npm vào `$HOME`, bị chặn đúng như
+    thiết kế; đã trỏ `npm_config_cache` vào staging để test hermetic.
+
+    **Còn lại, nói thẳng**: poppler (PDF) và vài probe phụ vẫn spawn ngoài biên; và
+    confinement này quản **file effect**, không quản network của tiến trình con — cần egress
+    proxy/netns, chưa làm.
+
 ## Lộ trình còn lại (thứ tự cập nhật 2026-09-03)
 
 ### ~~P0 — Harness workspace support~~ ✅ làm xong 2026-09-03 (mục 22)

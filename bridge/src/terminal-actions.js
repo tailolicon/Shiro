@@ -172,8 +172,9 @@ function defaultShell(source = process.env) {
 }
 
 export class TerminalRegistry {
-  constructor({ limits = TERMINAL_LIMITS, now = () => Date.now(), python = process.env.SHIRO_PYTHON ?? 'python3', helper = HELPER } = {}) {
+  constructor({ limits = TERMINAL_LIMITS, now = () => Date.now(), python = process.env.SHIRO_PYTHON ?? 'python3', helper = HELPER, confinement = null } = {}) {
     this.limits = limits
+    this.confinement = confinement
     this.now = now
     this.python = python
     this.helper = helper
@@ -202,6 +203,7 @@ export class TerminalRegistry {
       argv: entry.argv,
       cwd: entry.cwd,
       workspace: entry.workspaceId,
+      sandbox: entry.sandbox,
       label: entry.label,
       pid: entry.pid,
       cols: entry.cols,
@@ -246,7 +248,7 @@ export class TerminalRegistry {
    * alive, so a missing interpreter or a bad cwd is an error here rather than
    * a terminal id the caller would have to poll to discover is dead.
    */
-  async start(args = {}, { sandbox, workspaceId } = {}) {
+  async start(args = {}, { sandbox, workspaceId, confinement = this.confinement } = {}) {
     if (sandbox === undefined) fail('INTERNAL', 'terminal_start requires a workspace sandbox')
     const live = [...this.terminals.values()].filter(entry => entry.state === 'running')
     if (live.length >= this.limits.max_terminals) {
@@ -273,9 +275,19 @@ export class TerminalRegistry {
     }
 
     const id = randomUUID()
+    // The PTY HOST is what gets confined, not the shell inside it: everything
+    // the terminal ever runs is a descendant of this process, so one boundary
+    // here covers the whole session -- including commands typed later, which
+    // is the only place a per-spawn wrapper could not reach.
+    const plan = confinement === null
+      ? { argv: [this.python, this.helper], sandbox: { mode: 'danger-full-access', enforcement: 'none' } }
+      : (() => {
+        const confined = confinement.confine([this.python, this.helper], { workspaceRoot: sandbox.root, mode: args.sandbox_mode })
+        return { argv: confined.argv, sandbox: confinement.describe(confined) }
+      })()
     let host
     try {
-      host = spawn(this.python, [this.helper], {
+      host = spawn(plan.argv[0], plan.argv.slice(1), {
         cwd: cwd.absolute,
         env: { PATH: process.env.PATH ?? '', LANG: process.env.LANG ?? 'C.UTF-8' },
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -294,6 +306,7 @@ export class TerminalRegistry {
       argv,
       cwd: cwd.relative,
       workspaceId,
+      sandbox: plan.sandbox,
       label: typeof args.label === 'string' && args.label !== '' ? args.label.slice(0, 120) : undefined,
       cols,
       rows,

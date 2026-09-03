@@ -165,6 +165,11 @@ async function execute(sandbox, task, extra, args, options) {
     timeout_ms: args.timeout_ms,
     max_output_bytes: args.max_output_bytes,
     env: args.env,
+    // Forwarded explicitly: this object is rebuilt field by field rather than
+    // spread, so anything not named here is silently dropped -- which is how
+    // sandbox_mode reached the schema, reached this function, and still had no
+    // effect on the command that actually ran.
+    sandbox_mode: args.sandbox_mode,
   }, options)
   return {
     task: task.name,

@@ -172,9 +172,17 @@ function boundedString(parts, length) {
 }
 
 /** Run one git invocation with an argv array (never a shell string). Rejects only on spawn failure. */
-export function runGit(workspaceRoot, args, { stdin, signal, env } = {}) {
+export function runGit(workspaceRoot, args, { stdin, signal, env, confinement, confinementRoot } = {}) {
+  // Confinement is OPTIONAL here and applied by the caller, not assumed: git's
+  // argv is always built by Shiro (never free-form model text), and some git
+  // work legitimately writes outside the calling workspace -- worktree_create
+  // puts a checkout in a sibling directory the operator allowlisted. A caller
+  // that wants the boundary passes it, and says which root it applies to.
+  const plan = confinement === undefined || confinement === null
+    ? { argv: ['git', ...args] }
+    : { argv: confinement.confine(['git', ...args], { workspaceRoot: confinementRoot ?? workspaceRoot }).argv }
   return new Promise((resolveRun, rejectRun) => {
-    const child = spawn('git', args, {
+    const child = spawn(plan.argv[0], plan.argv.slice(1), {
       cwd: workspaceRoot,
       windowsHide: true,
       shell: false,

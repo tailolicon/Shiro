@@ -59,10 +59,10 @@ function gitError(argv, result) {
   return new ActionError('PROCESS_FAILED', summary)
 }
 
-export async function git(root, argv, { stdin, signal, allowFailure = false, env } = {}) {
+export async function git(root, argv, { stdin, signal, allowFailure = false, env, confinement, confinementRoot } = {}) {
   let result
   try {
-    result = await runGit(root, argv, { stdin, signal, env })
+    result = await runGit(root, argv, { stdin, signal, env, confinement, confinementRoot })
   } catch (error) {
     if (error?.code === 'ENOENT') throw new ActionError('UNSUPPORTED', 'git is not installed on this host')
     throw asActionError(error, 'PROCESS_FAILED', 'git')
