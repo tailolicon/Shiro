@@ -4,6 +4,13 @@ import {
   assertUnchanged, BUSY_POLICY, ownerOfTab, recheckOwnedBrowserTab, resolveOwnedBrowserTab,
 } from '../src/browser-ownership.js'
 import { isChatGptUrl, navigateOwnedTab, parseTargetUrl } from '../src/browser-navigate.js'
+import { setConfirmationPolicy } from '../src/action-errors.js'
+
+// This file exercises the confirmation brake, which ships OFF: a destructive
+// action no longer costs a refusal-then-repeat round trip on an operator's own
+// machine. The tests below are what an operator gets back with
+// SHIRO_REQUIRE_CONFIRMATIONS=1, so they turn it on for this file.
+setConfirmationPolicy({ required: true })
 
 const OWNED_TAB = 7
 const FOREIGN_TAB = 8

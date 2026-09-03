@@ -393,6 +393,53 @@ không chỉ spec của protocol.
     chẳng có gì cũ. `.gitignore` vẫn là câu trả lời của repo cho "cái này có thuộc công việc
     không"; `staged`/`base` không kèm untracked vì ở đó khái niệm đó vô nghĩa.
 
+41. **Biến ChatGPT Web thành coding-agent model thật — xong, 118 → 122 action.**
+    Bốn quyết định của yêu cầu này, mỗi cái một đánh đổi rõ ràng:
+
+    **Bỏ mọi `confirm: true` mặc định.** Đây là môi trường riêng của người vận hành: một
+    vòng "gọi → bị từ chối vì thiếu confirm → gọi lại y hệt kèm `confirm: true`" không cản
+    được gì, vì cùng một client trả lời chính câu hỏi nó tự đặt ra — chỉ tốn một round-trip.
+    Đặt module-level (`confirmationsAreRequired()` trong `action-errors.js`) thay vì threading
+    qua 11 call site không bao giờ đổi giá trị. **Mặc định tắt, `SHIRO_REQUIRE_CONFIRMATIONS=1`
+    bật lại** — không xoá cơ chế, chỉ đổi giá trị mặc định; `bridge_capabilities` báo
+    `requires_confirmation` đúng như nó sẽ hành xử thay vì quảng cáo một phanh đã tắt.
+
+    **Kho plugin DSH lộ ra bằng cách soi gương, không phải cổng gateway.** Người dùng chọn
+    "mirror native: mỗi tool DSH thành MCP tool riêng" thay vì `plugin_call(name, args)` —
+    gần với cảm giác "skill" của Codex hơn. `bridge/src/engine-tools.js` đọc
+    `ctx.tools.schemas()` của engine (chính registry agent loop dùng) và đăng ký từng cái
+    qua `ctx.tools.execute()` — không danh sách tay, tự lớn theo plugin mount thêm.
+    `bridge/src/json-schema-zod.js` là phần khó: schema tham số của DSH là JSON Schema
+    thô, còn MCP SDK build `inputSchema` từ Zod shape. Converter **lệch có chủ đích về một
+    hướng** — thứ không hiểu thành `z.unknown()` permissive chứ không đoán liều: một schema
+    sai-mà-cụ-thể sẽ khiến connector từ chối lời gọi mà plugin lẽ ra chấp nhận; một schema
+    permissive chỉ khiến model thấy ít gợi ý hơn, còn engine tự validate argument của nó.
+    Tên trùng action Shiro có sẵn đổi thành `dsh_<tên>` thay vì ghi đè, và **soi gương chạy
+    sau cùng** để `taken` là tập tên đầy đủ. Mọi tool mirror qua **đúng permission gate**
+    của mục 40 (P0.1) — khai bảo thủ `read_only: false` vì bridge không biết trước plugin
+    bất kỳ làm gì.
+
+    **Watchdog "phút 27" gõ vào tab cá nhân của người dùng, không vào fleet.** Người dùng
+    chọn phương án nudge trực tiếp hội thoại đang chạy — giữ nguyên workflow "bạn chat, nó
+    tự hồi sinh" — thay vì chuyển agent sang chạy trong tab fleet. Đây là quyết định có chủ
+    ý nới ownership gate: `continuation_set` là **action browser duy nhất** nhận một tab
+    không thuộc fleet, và chỉ nhận đúng một quyền hẹp (gõ đúng một dòng text đã cấu hình,
+    không phải quyền chung của automation) — designation sống trong bộ nhớ, mất khi bridge
+    restart, không phải standing config. `ContinuationWatchdog` (`bridge/src/continuation.js`)
+    quét mỗi 30s qua `BridgeBroker.waiting()` (mới thêm: tuổi từng pending model request);
+    một turn vượt `after_minutes` (mặc định 27 — sau mốc cắt ~25 phút của nền tảng, đủ xa để
+    không ngắt một câu trả lời chỉ đang chậm) mới bị nudge, **mỗi vòng quét đúng một nudge**
+    dù nhiều turn cùng treo (nudge turn cũ nhất; hai dòng "continue" liên tiếp đọc như nhiễu
+    với model phải hành động theo đó). **Nudge thất bại không trừ ngân sách và không bắt đầu
+    cooldown** — turn vẫn đang treo, từ chối thử lại là bỏ rơi nó. `max_nudges` (mặc định 8)
+    tự dừng thay vì gõ vô hạn vào một turn đã chết hẳn.
+
+    **Xác nhận trực tiếp trên máy đang chạy 3 turn treo thật**: hai turn ~10 tiếng, một
+    ~99 phút, đúng những gì watchdog này nhắm tới — không phải kịch bản giả định.
+
+    433 bridge test (416 → 433), 122 action. Toàn bộ implementation (97 file, những gì tồn
+    tại trước đó chỉ trên một đĩa) và round này đã commit lên `feat/coding-sandbox-parity`.
+
 ## Lộ trình còn lại (thứ tự cập nhật 2026-09-03)
 
 ### ~~P0 — Harness workspace support~~ ✅ làm xong 2026-09-03 (mục 22)

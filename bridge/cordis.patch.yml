@@ -50,6 +50,9 @@
         # Coarse permission dial: read-only | workspace-write | full. This is a
         # CEILING -- permission_set may narrow it at runtime, never widen it.
         permissionProfile: !!js process.env.SHIRO_PERMISSION_PROFILE ?? 'full'
+        # Destructive actions run without a separate confirm=true round trip.
+        # Set SHIRO_REQUIRE_CONFIRMATIONS=1 to put that brake back.
+        requireConfirmations: !!js process.env.SHIRO_REQUIRE_CONFIRMATIONS === '1'
         permissionRules:
           commandAllow: !!js process.env.SHIRO_COMMAND_ALLOW ?? ''
           commandDeny: !!js process.env.SHIRO_COMMAND_DENY ?? ''

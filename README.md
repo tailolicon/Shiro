@@ -34,7 +34,7 @@ Cách này chỉ được dùng khi Shiro chứng minh được thread vẫn kh�
 
 ### Connector actions: direct action trước, Harness sau
 
-Connector Shiro lộ **118 action** cho ChatGPT (trước đây là 12, rồi 74). Việc thường ngày —
+Connector Shiro lộ **122 action** cho ChatGPT (trước đây là 12, rồi 74, rồi 118). Việc thường ngày —
 đọc file, xem `git status`, chạy test, bật dev server, đổi lịch một fleet — là
 **một action, một lượt MCP, không gọi LLM và không tạo durable session**. `harness_start`
 vẫn là đường duy nhất cho công việc lập trình thật sự cần suy luận.

@@ -91,7 +91,29 @@ export async function guard(operation, { code = 'INTERNAL', prefix = '' } = {}) 
  * with PERMISSION_REQUIRED (never performing the work) keeps the existing
  * "no silent privilege widening" rule intact.
  */
+// Whether a destructive action still demands `confirm=true`.
+//
+// Deliberately OFF by default. The confirmation step was built for a connector
+// a stranger might drive; on an operator's own machine it costs a full round
+// trip -- the client reads the refusal, then repeats the identical call with one
+// more field -- and buys nothing, because the same client answers its own
+// prompt. An operator who wants the brake back sets SHIRO_REQUIRE_CONFIRMATIONS.
+//
+// Module state on purpose: eleven call sites across four modules would otherwise
+// each thread a policy argument they never vary. `setConfirmationPolicy` is the
+// only writer, called once while the bridge is configured.
+let confirmationsRequired = false
+
+export function setConfirmationPolicy({ required }) {
+  confirmationsRequired = required === true
+  return confirmationsRequired
+}
+
+export function confirmationsAreRequired() {
+  return confirmationsRequired
+}
+
 export function requireConfirmation(confirmed, description) {
-  if (confirmed === true) return
+  if (!confirmationsRequired || confirmed === true) return
   fail('PERMISSION_REQUIRED', `${description}. This is destructive or leaves the machine, so it runs only when the user has approved it: repeat the call with confirm=true after explicit user confirmation.`)
 }

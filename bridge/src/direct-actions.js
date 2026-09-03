@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { ERROR_CODES, fail, requireConfirmation } from './action-errors.js'
+import { confirmationsAreRequired, ERROR_CODES, fail, requireConfirmation } from './action-errors.js'
 import { classifyByExtension } from './artifact-kind.js'
 import { CLICK_BUTTONS, clickOwnedTabElement, DOM_LIMITS, evaluateInOwnedTab, EVALUATE_LIMITS, queryOwnedTabDom, TYPE_MODES, typeIntoOwnedTabElement } from './browser-dom.js'
 import { navigateOwnedTab, NAVIGATE_LIMITS, WAIT_UNTIL } from './browser-navigate.js'
@@ -113,7 +113,9 @@ function defineAction(server, registry, metrics, name, spec, handler, policy) {
     title: spec.title,
     read_only: spec.annotations.readOnlyHint === true,
     destructive: spec.annotations.destructiveHint === true,
-    requires_confirmation: spec.requiresConfirmation === true,
+    // Reported as it will actually behave: advertising a confirmation the
+    // bridge no longer enforces would make discovery lie.
+    requires_confirmation: spec.requiresConfirmation === true && confirmationsAreRequired(),
     workspace_scoped: spec.workspaceScoped === true,
     family: spec.family,
   }
@@ -2768,6 +2770,79 @@ export function registerDirectActions(server, options) {
     policy.assertHost(args.url)
     return await downloadFile(sandboxOf(args), args, { signal: extra?.signal })
   })
+
+  // ------------------------------------------------------- continuation --
+
+  const continuation = options.continuation ?? null
+  const requireContinuation = () => {
+    if (continuation === null) fail('UNSUPPORTED', 'the continuation watchdog is unavailable because the browser relay is not configured')
+    return continuation
+  }
+  const CONTINUATION_SHAPE = {
+    designated: z.boolean(),
+    browser_client_id: z.string().optional(),
+    url: z.string().optional(),
+    text: z.string().optional(),
+    after_minutes: z.number().optional(),
+    cooldown_minutes: z.number().optional(),
+    max_nudges: z.number().optional(),
+    nudges: z.number().optional(),
+    nudges_remaining: z.number().optional(),
+    designated_at: z.number().optional(),
+    last_nudge_at: z.number().nullable().optional(),
+    last_error: z.string().optional(),
+    recent: z.array(looseObject()).optional(),
+    defaults: looseObject().optional(),
+  }
+
+  define('continuation_set', {
+    family: 'config',
+    title: 'Keep a turn alive past the 25-minute cut-off',
+    description: 'Names the ChatGPT tab holding THIS conversation as the one Shiro may nudge. When ChatGPT is stopped by the platform mid-turn, the turn is left waiting for a model answer that never arrives; after after_minutes (27 by default, past the ~25-minute cut-off) Shiro submits text ("continue") into that tab so the turn resumes. Get browser_client_id from browser_owned_tabs with include_foreign=true -- your own conversation tab is not fleet-owned, and naming it here is what authorises this one nudge. The designation is in memory only and dies with the bridge.',
+    input: {
+      browser_client_id: z.string().min(1).describe('From browser_owned_tabs (include_foreign=true): the tab holding this conversation.'),
+      url: z.string().optional().describe('Expected tab URL, carried through to the relay.'),
+      after_minutes: z.number().min(1).max(240).optional().describe('Silence before the first nudge. Default 27.'),
+      cooldown_minutes: z.number().min(1).max(60).optional().describe('Minimum gap between nudges. Default 3.'),
+      max_nudges: z.number().int().min(1).max(100).optional().describe('Budget before Shiro stops on its own. Default 8.'),
+      text: z.string().min(1).max(2000).optional().describe('What to submit. Default "continue".'),
+    },
+    output: CONTINUATION_SHAPE,
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, args => requireContinuation().designate(args))
+
+  define('continuation_status', {
+    family: 'config',
+    title: 'The continuation watchdog',
+    description: 'Reports whether a continuation tab is designated, how much nudge budget is left, and the recent nudges with their outcome. Read-only.',
+    input: {},
+    output: CONTINUATION_SHAPE,
+    annotations: READ_ONLY,
+  }, () => requireContinuation().snapshot())
+
+  define('continuation_clear', {
+    family: 'config',
+    title: 'Stop nudging',
+    description: 'Forgets the designated tab. Turns already waiting stay waiting -- this stops Shiro from typing into the conversation, it does not cancel anything.',
+    input: {},
+    output: { cleared: z.boolean() },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, () => requireContinuation().clear())
+
+  define('continuation_check', {
+    family: 'config',
+    title: 'Run one watchdog sweep now',
+    description: 'Runs the sweep the timer would run, and reports what it did. Use it to verify the designation works without waiting out the timer.',
+    input: {},
+    output: {
+      checked: z.number(),
+      nudged: z.number(),
+      reason: z.string().optional(),
+      error: z.string().optional(),
+      session_id: z.string().nullable().optional(),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  }, () => requireContinuation().sweep())
 
   define('permission_get', {
     family: 'config',

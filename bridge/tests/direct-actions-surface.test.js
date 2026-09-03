@@ -13,6 +13,13 @@ import { TerminalRegistry } from '../src/terminal-actions.js'
 import { ThreadRegistry } from '../src/thread-registry.js'
 import { WorkspaceRegistry } from '../src/workspaces.js'
 import { BridgeBroker, configureMcp, LOG_STREAMS, readServiceLog } from '../src/index.js'
+import { setConfirmationPolicy } from '../src/action-errors.js'
+
+// This file exercises the confirmation brake, which ships OFF: a destructive
+// action no longer costs a refusal-then-repeat round trip on an operator's own
+// machine. The tests below are what an operator gets back with
+// SHIRO_REQUIRE_CONFIRMATIONS=1, so they turn it on for this file.
+setConfirmationPolicy({ required: true })
 
 // The twelve actions the connector exposed before the direct-action work.
 // Nothing here may disappear or change shape.
@@ -50,11 +57,17 @@ const DIRECT_ACTIONS = [
   'artifact_list', 'artifact_metadata', 'artifact_delete',
   'config_get', 'config_validate', 'logs_tail', 'metrics_snapshot',
   'permission_get', 'permission_set',
+  'continuation_set', 'continuation_status', 'continuation_clear', 'continuation_check',
 ]
 
 function testConfig(workspaceRoot, overrides = {}) {
   return {
     workspaceAllowlist: [],
+    // configureMcp sets the confirmation policy from config on every build, so
+    // a top-of-file setConfirmationPolicy would be overwritten the moment a
+    // connector is constructed. This file's subject is the brake, so it is
+    // configured here where the connector reads it.
+    requireConfirmations: true,
     provider: 'shiro-sol',
     model: 'gpt-5.6-sol',
     workspaceRoot,

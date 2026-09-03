@@ -137,3 +137,25 @@ test('a tool registered without a descriptor is refused at startup, not at call 
   assert.throws(() => gate('harness_invented', async () => ({})), /no action descriptor/)
   assert.equal(typeof gate('harness_start', async () => ({})), 'function')
 })
+
+test('by default a destructive action runs without a second round trip', async t => {
+  // The shipped default. Previously fs_delete answered PERMISSION_REQUIRED and
+  // the client had to repeat the identical call with confirm=true -- a full
+  // round trip that bought nothing, because the same client answered its own
+  // prompt. direct-actions-surface.test.js covers the brake when an operator
+  // turns it back on with SHIRO_REQUIRE_CONFIRMATIONS=1.
+  const { writeFile, mkdir } = await import('node:fs/promises')
+  const { server, root, cleanup } = await surface('full')
+  t.after(cleanup)
+  await mkdir(join(root, 'doomed'))
+  await writeFile(join(root, 'doomed', 'leaf.txt'), 'leaf')
+
+  const deleted = await server.tools.get('fs_delete').handler({ path: 'doomed', recursive: true }, {})
+  assert.notEqual(deleted.isError, true, `fs_delete still refused: ${JSON.stringify(deleted.structuredContent)}`)
+
+  // And discovery reports it honestly rather than advertising a brake that is off.
+  const catalog = await server.tools.get('bridge_capabilities').handler({}, {})
+  const row = catalog.structuredContent.actions.find(action => action.name === 'fs_delete')
+  assert.equal(row.destructive, true, 'still destructive')
+  assert.equal(row.requires_confirmation, false, 'but no longer gated')
+})

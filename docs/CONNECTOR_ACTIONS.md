@@ -1,6 +1,6 @@
 # Shiro connector — direct actions và Harness agent
 
-Tài liệu này mô tả bề mặt MCP mà connector Shiro cung cấp cho ChatGPT: **118 action**
+Tài liệu này mô tả bề mặt MCP mà connector Shiro cung cấp cho ChatGPT: **122 action** (cộng thêm mọi tool plugin DSH đang mount, xem "Kho plugin DSH")
 chia theo họ, quy ước schema/lỗi/phân trang, và ranh giới an toàn của từng nhóm.
 
 ## Direct Actions vs Harness Agent
@@ -121,11 +121,36 @@ không ghi đè). `git_commit` nhận `expected_head` tương tự và trả SHA
 nội dung khác → `ALREADY_EXISTS`. `fs_mkdir` mặc định `exist_ok`. `git_branch_create`
 với `checkout: true` trên nhánh đã có → chuyển nhánh, `created: false`.
 
-**Phê duyệt.** Action phá hủy hoặc đi ra khỏi máy đòi `confirm: true`. Gọi không có
-`confirm` thì **không làm gì cả** và trả `PERMISSION_REQUIRED` kèm mô tả chính xác thao
-tác để client chuyển cho người dùng. Danh sách: `fs_delete` (recursive), `fs_move`/`fs_copy`
-(overwrite), `artifact_delete`, `git_restore`, `git_reset --hard`, `git_rebase --start`,
-`git_pull --rebase`, `git_push`, `download_file`.
+**Phê duyệt — mặc định tắt.** Action phá hủy hoặc đi ra khỏi máy *có thể* đòi `confirm: true`
+(danh sách: `fs_delete` recursive, `fs_move`/`fs_copy` overwrite, `artifact_delete`,
+`git_restore`, `git_reset --hard`, `git_rebase --start`, `git_pull --rebase`, `git_push`,
+`download_file`), nhưng cờ đó **mặc định không được thực thi**: trên máy của người vận
+hành, một vòng "gọi → bị từ chối → gọi lại y hệt kèm `confirm: true`" không ngăn được gì —
+cùng một client trả lời chính câu hỏi nó tự đặt ra — nên chỉ tốn một lượt round-trip.
+`bridge_capabilities` báo `requires_confirmation` đúng như nó sẽ hành xử: `false` trừ khi
+bật lại. Muốn giữ lại lớp phanh này (một client không tin cậy, hoặc vận hành đa người dùng),
+đặt `SHIRO_REQUIRE_CONFIRMATIONS=1` trước khi khởi động.
+
+## Kho plugin DSH — Shiro không có bề mặt cố định
+
+ChatGPT Web không có khái niệm "skill" như Codex. Điều nó *có*, một khi đang nói chuyện với
+Shiro, là một engine (DeepSeek Harness) đã mount sẵn một kho plugin lớn — LSP, todo/plan,
+subagent, skill, web fetch, schedule, MCP client — nhưng trước đây kho đó chỉ với tới được
+**từ bên trong một agent turn**: model dùng được trong lúc Shiro tự chạy vòng lặp, còn
+ChatGPT (đóng vai model qua MCP) thì không.
+
+Bridge giải quyết bằng cách **soi gương** (`bridge/src/engine-tools.js`): mỗi tool trong
+`ctx.tools.schemas()` của engine trở thành một MCP tool ngang hàng với `fs_read`, `git_status`
+— cùng tên, cùng schema thật của chính plugin đó, gọi thẳng vào `ctx.tools.execute()` engine
+dùng cho agent loop. Không danh sách tay: bộ tool tự lớn khi người vận hành mount thêm plugin,
+tự nhỏ khi gỡ. Tên trùng với action Shiro có sẵn (hiếm, vd `fs_read` cả hai bên đều có) được
+đổi thành `dsh_<tên gốc>` thay vì ghi đè — không bao giờ mất tool nào của bridge.
+
+`bridge_capabilities` liệt kê chúng ở family `plugin`, và chúng đi qua **đúng permission
+gate** như mọi action khác — `read-only` chặn được một plugin tool y như chặn `fs_update_file`.
+Vì bridge không biết trước một plugin bất kỳ làm gì, mọi tool mirror được khai bảo thủ:
+`read_only: false`, `destructive: false` — an toàn theo hướng "coi là có thể ghi" thay vì đoán
+sai thành "chắc chắn chỉ đọc".
 
 ## Danh mục action
 
@@ -583,6 +608,34 @@ vào `a/`/`b/` sẽ đọc sai path.
 | `config_validate` | read | Kiểm tra một cấu hình ứng viên mà không áp dụng |
 | `logs_tail` | read | Đuôi log dịch vụ theo **tên stream** trong allowlist, đã che secret |
 | `metrics_snapshot` | read | Đếm call/lỗi/latency theo từng action |
+
+### continuation — sống qua giới hạn 25 phút của ChatGPT
+| Action | Loại | Mô tả |
+|---|---|---|
+| `continuation_set` | write | Chỉ định tab ChatGPT (chính hội thoại đang chạy) mà Shiro được phép gõ "continue" vào |
+| `continuation_status` | read | Đang chỉ định tab nào, còn bao nhiêu nudge, lịch sử gần nhất |
+| `continuation_clear` | write | Quên tab đã chỉ định — không huỷ turn nào, chỉ ngừng gõ |
+| `continuation_check` | write | Chạy ngay một vòng quét (thay vì chờ timer), để xác nhận cấu hình đúng |
+
+**Vấn đề**: khi ChatGPT điều khiển Shiro, ChatGPT chính là "model" — một turn chỉ tiến
+được khi ChatGPT tiếp tục trả lời `harness_get_request` bằng `harness_continue`. Nền tảng
+buộc dừng sau khoảng 25 phút. Turn không lỗi — nó nằm im ở `model_input_required` mãi mãi,
+chờ một câu trả lời sẽ không bao giờ tới. (Trên máy triển khai từng thấy 3 turn treo kiểu
+này, hai cái đã 10 tiếng.)
+
+**Cách giải quyết**: Shiro tự gõ "continue" vào **chính hội thoại đó**. Ở phút 27 — sau mốc
+cắt ~25 phút, đủ xa để không ngắt một câu trả lời chỉ đang chậm. `continuation_set` không
+mở một quyền browser mới: hội thoại của bạn nằm trong tab ChatGPT cá nhân, và ownership gate
+(xem "Owned-tab gate" bên dưới) mặc định từ chối mọi automation chạm vào tab không thuộc
+fleet. Thay vì nới lỏng luật đó cho mọi action, người vận hành **tự đặt tên đúng một tab**
+và cấp cho nó đúng một quyền — nhận nudge này. Không action browser nào khác nhận
+"designated tab"; việc chỉ định chỉ sống trong bộ nhớ và mất khi bridge restart.
+
+Tham số: `after_minutes` (mặc định 27), `cooldown_minutes` giữa hai lần nudge (mặc định 3,
+tránh gõ hai dòng "continue" liên tiếp đọc như nhiễu), `max_nudges` (mặc định 8, dừng tự
+động khi hết ngân sách thay vì gõ vô hạn), `text` (mặc định "continue"). Một lần nudge thất
+bại (relay lỗi) **không** trừ ngân sách và **không** bắt đầu cooldown — turn vẫn đang treo,
+từ chối thử lại sẽ bỏ rơi nó.
 
 ## Gọi từ shell và từ script
 

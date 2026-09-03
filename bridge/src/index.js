@@ -5,8 +5,10 @@ import { extname, relative, resolve, sep } from 'node:path'
 import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { z } from 'zod'
-import { ActionError } from './action-errors.js'
+import { ActionError, setConfirmationPolicy } from './action-errors.js'
 import { createActionGate } from './action-gate.js'
+import { ContinuationWatchdog } from './continuation.js'
+import { engineToolsOf, registerEngineTools } from './engine-tools.js'
 import { IMAGE_MIME_BY_EXTENSION, TEXT_EXTENSIONS } from './artifact-kind.js'
 import { ActionMetrics, FLEET_SNAPSHOT_SHAPE, registerDirectActions } from './direct-actions.js'
 import { ProcessRegistry } from './exec-actions.js'
@@ -85,6 +87,9 @@ function normalizeConfig(config = {}) {
   // The coarse permission dial. The configured value is a CEILING: a runtime
   // caller may narrow it, never widen it.
   const permissionProfile = normalizeProfile(config.permissionProfile)
+  // Off by default: see setConfirmationPolicy. An operator turns the brake back
+  // on with SHIRO_REQUIRE_CONFIRMATIONS=1.
+  const requireConfirmations = config.requireConfirmations === true || String(config.requireConfirmations ?? '') === '1'
   const permissionRules = normalizeRules(config.permissionRules ?? {})
   const configuredFleetStateDir = typeof config.fleetStateDir === 'string' ? config.fleetStateDir.trim() : ''
   const configuredLogDir = typeof config.logDir === 'string' ? config.logDir.trim() : ''
@@ -95,6 +100,7 @@ function normalizeConfig(config = {}) {
     workspaceAllowlist,
     permissionProfile,
     permissionRules,
+    requireConfirmations,
     fleetStateDir: resolve(configuredFleetStateDir || resolve(workspaceRoot, '..', '.ShiroRuntime', 'state', 'fleets')),
     // Service logs live in the runtime directory beside the project root, not
     // inside it; logs_tail reads them through a fixed stream allowlist rather
@@ -289,6 +295,22 @@ export class BridgeBroker {
 
   request(id) {
     return this.#pending.get(id)?.request
+  }
+
+  /**
+   * How long each pending model request has gone unanswered. This is what tells
+   * a stalled turn from a slow one: ChatGPT stops answering when the platform
+   * cuts it off, and the request simply sits here.
+   */
+  waiting(now = Date.now()) {
+    return [...this.#pending.values()]
+      .sort((a, b) => a.createdAt - b.createdAt)
+      .map(row => ({
+        request_id: row.id,
+        session_id: row.sessionId,
+        created_at: new Date(row.createdAt).toISOString(),
+        waiting_ms: Math.max(0, now - row.createdAt),
+      }))
   }
 
   async waitForPending(timeoutMs) {
@@ -1543,6 +1565,7 @@ export function configureMcp(server, controller, config, fleetManager = null, ru
     projectRoot: config.workspaceRoot,
     allowedRoots: config.workspaceAllowlist ?? [],
   })
+  setConfirmationPolicy({ required: config.requireConfirmations === true })
   const policy = runtime.policy ?? new PermissionPolicy({ profile: config.permissionProfile, rules: config.permissionRules })
   // The harness and fleet tools are written out by hand below rather than built
   // from the direct-action table, so they need the gate applied explicitly.
@@ -2031,9 +2054,10 @@ export function configureMcp(server, controller, config, fleetManager = null, ru
   // per-request: a new McpServer is built for every HTTP request, so anything
   // holding state has to be handed in through `runtime`.
   const sandbox = runtime.sandbox ?? workspaces.primary().sandbox
-  registerDirectActions(server, {
+  const directRegistry = registerDirectActions(server, {
     // The engine's sandbox seam, when the host provides one.
     sandboxProvider: runtime.sandboxProvider ?? null,
+    continuation: runtime.continuation ?? null,
     config,
     controller,
     fleetManager,
@@ -2055,6 +2079,21 @@ export function configureMcp(server, controller, config, fleetManager = null, ru
     redact: value => redactSecrets(value),
     validateConfig: candidate => normalizeConfig(candidate),
   })
+
+  // Mirror the engine's plugin tools LAST, so `taken` is the complete set of
+  // bridge action names and a plugin can never shadow one. The rows are pushed
+  // into the same registry bridge_capabilities reads, which is why a mirrored
+  // tool is discoverable and gated exactly like a native action.
+  const engineTools = runtime.engineTools ?? null
+  if (engineTools !== null) {
+    registerEngineTools(server, {
+      tools: engineTools,
+      descriptors: directRegistry,
+      policy,
+      metrics: runtime.metrics,
+      taken: new Set([...directRegistry.map(row => row.name), ...HARNESS_ACTION_DESCRIPTORS.map(row => row.name)]),
+    })
+  }
 }
 
 async function handleMcpRequest(req, res, controller, config, fleetManager, runtime) {
@@ -2111,6 +2150,15 @@ function startHttpServer(ctx, broker, config, fleetManager) {
     // bridge unmounted on a host without one. Absent, Confinement refuses
     // narrowed modes instead of pretending to enforce them.
     sandboxProvider: sandboxProviderOf(ctx),
+    // The engine's own tool registry. Mirroring it is what gives ChatGPT the
+    // DSH plugin library directly, instead of only inside an agent turn.
+    engineTools: engineToolsOf(ctx),
+    // Bridge-lifetime: the designation and the nudge budget must survive across
+    // MCP requests, which each build a fresh server.
+    continuation: fleetManager === null ? null : new ContinuationWatchdog({
+      submit: (target, text) => fleetManager.transport.submit(target.browser_client_id, text),
+      pending: () => broker.waiting(),
+    }).start(),
     processes: new ProcessRegistry({ sandbox }),
     terminals: new TerminalRegistry(),
     metrics: new ActionMetrics(),

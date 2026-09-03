@@ -7,6 +7,14 @@ import {
   clickOwnedTabElement, decodeHandle, encodeHandle, evaluateInOwnedTab, queryOwnedTabDom, typeIntoOwnedTabElement,
 } from '../src/browser-dom.js'
 
+import { setConfirmationPolicy } from '../src/action-errors.js'
+
+// This file exercises the confirmation brake, which ships OFF: a destructive
+// action no longer costs a refusal-then-repeat round trip on an operator's own
+// machine. The tests below are what an operator gets back with
+// SHIRO_REQUIRE_CONFIRMATIONS=1, so they turn it on for this file.
+setConfirmationPolicy({ required: true })
+
 const OWNED_TAB = 7
 const OTHER_OWNED_TAB = 9
 const FOREIGN_TAB = 8

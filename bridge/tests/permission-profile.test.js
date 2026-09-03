@@ -180,3 +180,21 @@ test('a fleet write is outward, a fleet read is local', () => {
   assert.equal(evaluateAction('read-only', status).allowed, true)
   assert.equal(evaluateAction('full', start).allowed, true)
 })
+
+test('confirmations are off by default and can be put back', async () => {
+  const { confirmationsAreRequired, requireConfirmation, setConfirmationPolicy } = await import('../src/action-errors.js')
+  // Default: a destructive action runs without the extra round trip. The
+  // confirm parameter is still accepted, it is simply no longer demanded.
+  assert.equal(confirmationsAreRequired(), false)
+  assert.doesNotThrow(() => requireConfirmation(undefined, 'Delete everything'))
+
+  setConfirmationPolicy({ required: true })
+  assert.equal(confirmationsAreRequired(), true)
+  assert.throws(() => requireConfirmation(undefined, 'Delete everything'), error => {
+    assert.equal(error.code, 'PERMISSION_REQUIRED')
+    assert.match(error.message, /confirm=true/)
+    return true
+  })
+  assert.doesNotThrow(() => requireConfirmation(true, 'Delete everything'))
+  setConfirmationPolicy({ required: false })
+})

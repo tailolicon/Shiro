@@ -6,6 +6,13 @@ import { join } from 'node:path'
 import { Sandbox } from '../src/sandbox.js'
 import { runGit } from '../src/git-commands.js'
 import * as git from '../src/git-actions.js'
+import { setConfirmationPolicy } from '../src/action-errors.js'
+
+// This file exercises the confirmation brake, which ships OFF: a destructive
+// action no longer costs a refusal-then-repeat round trip on an operator's own
+// machine. The tests below are what an operator gets back with
+// SHIRO_REQUIRE_CONFIRMATIONS=1, so they turn it on for this file.
+setConfirmationPolicy({ required: true })
 
 // Every git action runs against a throwaway repository fixture: no network, no
 // user configuration, and nothing that could touch the real Shiro checkout.
