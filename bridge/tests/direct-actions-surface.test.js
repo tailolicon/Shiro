@@ -1203,3 +1203,21 @@ test('command and network rules apply to the actions that take them', async () =
     assert.match(host.body.error.message, /network rules/)
   }, { permissionRules: { commandDeny: ['rm', 'curl'], networkAllow: ['github.com'] } })
 })
+
+test('the engine-facing tool entrypoints actually import', async () => {
+  // Regression: the profile links @shiro-ai/harness-bridge as a SYMLINK, and
+  // Node resolves a symlinked package's own imports from its real path -- so
+  // `@deepseek-ai/dsh-tools` inside container-tool.js was looked up under
+  // bridge/, where the optional peer had never been installed. Both engine
+  // entrypoints failed with ERR_MODULE_NOT_FOUND, silently taking the agent's
+  // container and git tools with them: nothing logged, and the bridge's own
+  // 128 direct actions were unaffected, so every suite stayed green.
+  // Prepare-Shiro-Runtime.mjs now links that peer into bridge/node_modules.
+  const container = await import('../src/container-tool.js')
+  const git = await import('../src/git-tool.js')
+  for (const [label, plugin] of [['container-tool', container], ['git-tool', git]]) {
+    assert.equal(typeof plugin.apply, 'function', `${label} must be a mountable cordis plugin`)
+    assert.equal(typeof plugin.name, 'string')
+    assert.ok(Array.isArray(plugin.inject), `${label} declares what it injects`)
+  }
+})

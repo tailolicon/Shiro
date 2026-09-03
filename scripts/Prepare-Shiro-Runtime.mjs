@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto'
-import { access, chmod, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { access, chmod, mkdir, readFile, readlink, rm, symlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
 const repoRoot = path.resolve(process.argv[2] || path.join(import.meta.dirname, '..'))
@@ -71,6 +71,30 @@ if (!await exists(paths.relayEnvFile)) {
   await writeFile(paths.relayEnvFile, `${lines.join('\n')}\n`, { mode: 0o600 })
 }
 await chmod(paths.relayEnvFile, 0o600)
+
+// The bridge's engine-facing peer, linked into the bridge's OWN node_modules.
+//
+// The profile links @shiro-ai/harness-bridge as a symlink to bridge/, and Node
+// resolves a symlinked package's imports from its REAL path -- so
+// `import '@deepseek-ai/dsh-tools'` inside bridge/src/container-tool.js is
+// looked up under bridge/, never under the profile that linked it. The peer is
+// declared optional and autoInstallPeers is off, so nothing installed it and
+// BOTH `@shiro-ai/harness-bridge/container-tool` and `/git-tool` failed to load
+// with ERR_MODULE_NOT_FOUND -- silently, because a preset row that cannot be
+// imported takes the agent's container and git tools with it and says nothing.
+async function linkBridgePeer() {
+  const target = path.join(engineRoot, 'packages', 'core', 'tools')
+  const scope = path.join(repoRoot, 'bridge', 'node_modules', '@deepseek-ai')
+  const linkPath = path.join(scope, 'dsh-tools')
+  await mkdir(scope, { recursive: true })
+  // Relative, so the checkout stays movable.
+  const relative = path.relative(scope, target)
+  const current = await readlink(linkPath).catch(() => null)
+  if (current === relative) return
+  await rm(linkPath, { recursive: true, force: true })
+  await symlink(relative, linkPath, 'dir')
+}
+await linkBridgePeer()
 
 const link = value => `link:${value}`
 const file = value => `file:${value}`

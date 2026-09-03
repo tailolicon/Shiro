@@ -537,6 +537,35 @@ không chỉ spec của protocol.
     **Live sau khi sửa**: 134 action (128 + 6 mirror), `subagent_providers` khớp đúng trạng
     thái thật của cả 4 CLI, không còn `jq: parse error` lúc khởi động. 479 bridge test.
 
+44. **Lỗi thứ năm, tìm ra khi trả lời "có ảnh hưởng gì không" — hai tool của agent chưa
+    bao giờ nạp được.** Câu hỏi nhắm vào gate `verify-runtime-closure` còn đỏ. Thay vì
+    nhắc lại phán đoán "không ảnh hưởng", đi kiểm chứng: import thẳng hai specifier mà
+    preset khai, từ đúng thư mục profile. Kết quả: **cả hai fail**.
+
+    `@shiro-ai/harness-bridge` (bản thân bridge) resolve tốt, nhưng
+    `@shiro-ai/harness-bridge/container-tool` và `/git-tool` trả `ERR_MODULE_NOT_FOUND` —
+    gốc là `Cannot find package '@deepseek-ai/dsh-tools'`. Profile link bridge bằng
+    **symlink**, mà Node resolve import của một package symlink theo **realpath** của nó,
+    nên `import '@deepseek-ai/dsh-tools'` trong `bridge/src/container-tool.js` bị tìm dưới
+    `bridge/`, không phải dưới profile đã link nó. Peer đó khai `optional` và
+    `bridge/pnpm-workspace.yaml` đặt `autoInstallPeers: false`, nên **không gì từng cài nó**:
+    `bridge/node_modules` chỉ có `@modelcontextprotocol` và `zod`.
+
+    **Vì sao không ai thấy**: một preset row không import được sẽ mang theo luôn container
+    tool và git tool của agent mà **không log gì cả** — `backend.stderr.log` sạch 0 dòng.
+    Và 128 direct action của bridge không hề bị ảnh hưởng (chúng nằm trong `index.js`, không
+    import `dsh-tools`), nên mọi suite vẫn xanh. Đây đúng là loại lỗi chỉ lộ ra khi hỏi
+    "*chứng minh* đi" thay vì "test có xanh không".
+
+    Sửa trong `Prepare-Shiro-Runtime.mjs` — nơi đã sở hữu việc link runtime: tạo
+    `bridge/node_modules/@deepseek-ai/dsh-tools` trỏ (tương đối, để checkout còn di chuyển
+    được) tới `engine/packages/core/tools`, idempotent. Sau restart, cả hai entrypoint
+    resolve OK. Thêm test hồi quy import thẳng hai module đó.
+
+    **Trả lời câu hỏi gốc**: gate closure đỏ tự nó không ảnh hưởng vận hành (Shiro không
+    build/ship `python/sdk-runtime`, không script nào đụng tới nó) — nhưng đi kiểm chứng
+    nó đã lôi ra một lỗi thật, khác hẳn, đang làm agent thiếu hai tool.
+
 ## Lộ trình còn lại (thứ tự cập nhật 2026-09-03)
 
 ### ~~P0 — Harness workspace support~~ ✅ làm xong 2026-09-03 (mục 22)
