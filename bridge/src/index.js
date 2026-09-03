@@ -8,6 +8,7 @@ import { z } from 'zod'
 import { ActionError, setConfirmationPolicy } from './action-errors.js'
 import { createActionGate } from './action-gate.js'
 import { ContinuationWatchdog } from './continuation.js'
+import { SubagentRegistry } from './subagents.js'
 import { engineToolsOf, registerEngineTools } from './engine-tools.js'
 import { IMAGE_MIME_BY_EXTENSION, TEXT_EXTENSIONS } from './artifact-kind.js'
 import { ActionMetrics, FLEET_SNAPSHOT_SHAPE, registerDirectActions } from './direct-actions.js'
@@ -2058,6 +2059,7 @@ export function configureMcp(server, controller, config, fleetManager = null, ru
     // The engine's sandbox seam, when the host provides one.
     sandboxProvider: runtime.sandboxProvider ?? null,
     continuation: runtime.continuation ?? null,
+    subagents: runtime.subagents ?? undefined,
     config,
     controller,
     fleetManager,
@@ -2137,6 +2139,7 @@ function startHttpServer(ctx, broker, config, fleetManager) {
     allowedRoots: config.workspaceAllowlist ?? [],
   })
   const sandbox = workspaces.primary().sandbox
+  const processes = new ProcessRegistry({ sandbox })
   const runtime = {
     workspaces,
     policy: new PermissionPolicy({ profile: config.permissionProfile, rules: config.permissionRules }),
@@ -2159,7 +2162,8 @@ function startHttpServer(ctx, broker, config, fleetManager) {
       submit: (target, text) => fleetManager.transport.submit(target.browser_client_id, text),
       pending: () => broker.waiting(),
     }).start(),
-    processes: new ProcessRegistry({ sandbox }),
+    processes,
+    subagents: new SubagentRegistry({ processes }),
     terminals: new TerminalRegistry(),
     metrics: new ActionMetrics(),
   }

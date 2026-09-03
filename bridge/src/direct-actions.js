@@ -5,6 +5,8 @@ import { CLICK_BUTTONS, clickOwnedTabElement, DOM_LIMITS, evaluateInOwnedTab, EV
 import { navigateOwnedTab, NAVIGATE_LIMITS, WAIT_UNTIL } from './browser-navigate.js'
 import { captureOwnedTabScreenshot, SCREENSHOT_FORMATS, SCREENSHOT_LIMITS } from './browser-screenshot.js'
 import { Confinement } from './confinement.js'
+import { SUBAGENT_ADAPTERS } from './subagent-adapters.js'
+import { SubagentRegistry } from './subagents.js'
 import { EXEC_LIMITS, runCommand } from './exec-actions.js'
 import * as fs from './fs-actions.js'
 import * as git from './git-actions.js'
@@ -274,6 +276,10 @@ export function registerDirectActions(server, options) {
   // sandbox provider. Absent outside the engine, in which case a narrowed
   // profile refuses to run commands rather than running them unconfined.
   const confinement = options.confinement ?? new Confinement({ provider: options.sandboxProvider ?? null, policy })
+  // Real coding-agent CLIs (claude/codex/grok/antigravity) dispatched as
+  // background processes, built on the same ProcessRegistry every other
+  // process_* action uses -- see subagents.js for why.
+  const subagents = options.subagents ?? new SubagentRegistry({ processes })
   // The process registry is bridge-lifetime state built in index.js, so the
   // confinement is attached here rather than passed on every call.
   if (processes !== undefined && processes !== null && processes.confinement === null) processes.confinement = confinement
@@ -1168,6 +1174,125 @@ export function registerDirectActions(server, options) {
     },
     annotations: READ_ONLY,
   }, args => processes.list(args))
+
+  // -------------------------------------------------------- subagents --
+
+  const SUBAGENT_SHAPE = {
+    process_id: z.string(),
+    agent: z.enum(Object.keys(SUBAGENT_ADAPTERS)),
+    unverified: z.boolean().optional().describe('true for an adapter never exercised against a signed-in account on this deployment; treat its result shape as best-effort.'),
+    state: z.enum(['starting', 'running', 'exited', 'stopped', 'failed']).optional(),
+    pid: z.number().nullable().optional(),
+    cwd: z.string().optional(),
+    workspace: z.string().optional(),
+    started_at: z.string().optional(),
+    ended_at: z.string().optional(),
+    duration_ms: z.number().optional(),
+    exit_code: z.number().nullable().optional(),
+    sandbox: z.object({ mode: z.string(), enforcement: z.string(), backend: z.string().optional() }).optional(),
+    turn_done: z.boolean().optional().describe('The CLI has produced its final result; false while still running.'),
+    turn_success: z.boolean().optional(),
+    thread_id: z.string().optional().describe("This CLI's own session/thread id -- pass it as resume_from to continue."),
+    message: z.string().optional().describe('The final reply text, once turn_done is true.'),
+    usage: looseObject().optional(),
+    warnings: z.array(z.string()).optional(),
+    unverified_shape: z.boolean().optional().describe('The output did not match any known field name for this (unverified) adapter; message carries the raw JSON instead.'),
+    resumed_from: z.string().optional(),
+  }
+
+  define('subagent_providers', {
+    family: 'subagent',
+    title: 'Which coding-agent CLIs are available',
+    description: 'Probes claude, codex, grok and antigravity: whether each binary is installed and whether it looks signed in. authenticated is true/false only when the probe could classify it, otherwise null (unknown) -- never guessed. Call this before subagent_start on an agent you have not used yet, since an uninstalled or signed-out CLI fails at spawn, not at discovery. Read-only, no bridge-owned process is created.',
+    input: {},
+    output: {
+      providers: z.array(looseObject()).describe('{agent, label, installed, version?, authenticated, unverified}'),
+    },
+    annotations: READ_ONLY,
+  }, () => subagents.providers())
+
+  define('subagent_start', {
+    family: 'subagent',
+    workspaceScoped: true,
+    title: 'Dispatch a real coding-agent CLI as a sub-agent',
+    description: `Runs claude, codex, grok or antigravity headlessly as a bridge-owned background process -- its own full agent loop, its own tool use, under its own account and sandbox, working in this workspace. Returns immediately with a process_id; poll subagent_status or subagent_log for the result, the way you would with process_start. Pass resume_from (a prior process_id, or a raw thread/session id) to continue that CLI's own conversation instead of starting fresh. dangerously_skip_permissions maps to each CLI's own full-bypass flag; for claude and grok that mode is gated behind a one-time interactive disclaimer Shiro will not script past, and the refusal names the exact command to run once, yourself, to unlock it. grok and antigravity are ${SUBAGENT_ADAPTERS.grok.unverified ? 'unverified on this deployment' : 'verified'} -- see subagent_providers.`,
+    input: {
+      agent: z.enum(Object.keys(SUBAGENT_ADAPTERS)),
+      prompt: z.string().min(1).max(50_000),
+      path: pathField('Working directory the CLI runs in, relative to the workspace.').optional(),
+      resume_from: z.string().optional().describe('A process_id from an earlier subagent_start, or a raw session/thread id, to continue that conversation.'),
+      model: z.string().optional(),
+      permission_mode: z.string().optional().describe('Passed through to the CLI (claude/grok: --permission-mode; antigravity: --mode). bypassPermissions is refused -- see dangerously_skip_permissions.'),
+      sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional().describe('codex only: its own --sandbox. Default workspace-write.'),
+      dangerously_skip_permissions: z.boolean().optional().describe('Full bypass of the CLI\'s own tool-approval. codex/antigravity: applied directly. claude/grok: refused with PERMISSION_REQUIRED naming the one-time interactive command that unlocks it.'),
+    },
+    output: SUBAGENT_SHAPE,
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  }, (args, extra) => subagents.start(args, { sandbox: sandboxOf(args), workspaceId: args.workspace }))
+
+  define('subagent_status', {
+    family: 'subagent',
+    title: 'Check on a dispatched sub-agent',
+    description: 'State, resource facts and -- once turn_done -- the parsed final result of one subagent_start call. While still running, turn_done is false and message is absent; use subagent_log for a raw tail of a long-running one. Read-only.',
+    input: { process_id: z.string().uuid() },
+    output: SUBAGENT_SHAPE,
+    annotations: READ_ONLY,
+  }, args => subagents.status(args))
+
+  define('subagent_log', {
+    family: 'subagent',
+    title: "Read a sub-agent's raw output",
+    description: "Cursor-based read of one stream of a dispatched sub-agent's process, same convention as process_logs. Useful mid-run (codex streams NDJSON as it works) or to see exactly what a CLI printed rather than the parsed summary subagent_status gives. Read-only.",
+    input: {
+      process_id: z.string().uuid(),
+      stream: z.enum(['stdout', 'stderr']).optional(),
+      from_offset: z.number().int().min(0).optional(),
+      max_bytes: z.number().int().min(256).max(EXEC_LIMITS.output_max_bytes).optional(),
+    },
+    output: {
+      process_id: z.string(),
+      stream: z.string(),
+      state: z.string(),
+      content: z.string(),
+      offset: z.number(),
+      next_offset: z.number(),
+      dropped_bytes: z.number(),
+      total_bytes: z.number(),
+      eof: z.boolean(),
+      ...truncationShape,
+    },
+    annotations: READ_ONLY,
+  }, args => subagents.log(args))
+
+  define('subagent_stop', {
+    family: 'subagent',
+    title: 'Stop a dispatched sub-agent',
+    description: "Sends SIGTERM to a subagent's process and escalates to SIGKILL after grace_ms, same as process_stop. Its conversation may still be resumable through the CLI's own session store even after being stopped here -- stopping ends the process, not necessarily the underlying session.",
+    input: {
+      process_id: z.string().uuid(),
+      grace_ms: z.number().int().min(0).max(EXEC_LIMITS.stop_grace_max_ms).optional(),
+      force: z.boolean().optional(),
+    },
+    output: { ...SUBAGENT_SHAPE, escalated_to_sigkill: z.boolean().optional(), already_stopped: z.boolean().optional() },
+    annotations: DESTRUCTIVE,
+  }, args => subagents.stop(args))
+
+  define('subagent_list', {
+    family: 'subagent',
+    title: 'List dispatched sub-agents',
+    description: 'Lists only subagent_start-created processes, newest first -- process_list shows every bridge-owned process including these, but without which CLI each one is. Filter with state to find what is still running.',
+    input: {
+      state: z.enum(['running', 'exited', 'stopped', 'failed']).optional(),
+      limit: z.number().int().min(1).max(100).optional(),
+    },
+    output: {
+      subagents: z.array(looseObject()),
+      total: z.number(),
+      ...truncationShape,
+    },
+    annotations: READ_ONLY,
+  }, args => subagents.list(args))
+
 
   // GIT/TASK/HARNESS/FLEET/BROWSER/ARTIFACT/CONFIG families are appended below.
   // ----------------------------------------------------------- terminals --

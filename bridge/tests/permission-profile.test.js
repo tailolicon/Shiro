@@ -181,6 +181,22 @@ test('a fleet write is outward, a fleet read is local', () => {
   assert.equal(evaluateAction('full', start).allowed, true)
 })
 
+test('a subagent write is outward too: it runs a full autonomous CLI under its own account', () => {
+  const start = { name: 'subagent_start', family: 'subagent', read_only: false, destructive: false }
+  const stop = { name: 'subagent_stop', family: 'subagent', read_only: false, destructive: false }
+  const status = { name: 'subagent_status', family: 'subagent', read_only: true, destructive: false }
+  const providers = { name: 'subagent_providers', family: 'subagent', read_only: true, destructive: false }
+  for (const write of [start, stop]) {
+    assert.equal(evaluateAction('workspace-write', write).allowed, false, write.name)
+    assert.match(evaluateAction('workspace-write', write).reason, /outside this machine/)
+    assert.equal(evaluateAction('full', write).allowed, true, write.name)
+  }
+  for (const read of [status, providers]) {
+    assert.equal(evaluateAction('workspace-write', read).allowed, true, read.name)
+    assert.equal(evaluateAction('read-only', read).allowed, true, read.name)
+  }
+})
+
 test('confirmations are off by default and can be put back', async () => {
   const { confirmationsAreRequired, requireConfirmation, setConfirmationPolicy } = await import('../src/action-errors.js')
   // Default: a destructive action runs without the extra round trip. The

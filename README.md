@@ -34,7 +34,7 @@ Cách này chỉ được dùng khi Shiro chứng minh được thread vẫn kh�
 
 ### Connector actions: direct action trước, Harness sau
 
-Connector Shiro lộ **122 action** cho ChatGPT (trước đây là 12, rồi 74, rồi 118). Việc thường ngày —
+Connector Shiro lộ **128 action** cho ChatGPT (trước đây là 12, rồi 74, rồi 118, rồi 122). Việc thường ngày —
 đọc file, xem `git status`, chạy test, bật dev server, đổi lịch một fleet — là
 **một action, một lượt MCP, không gọi LLM và không tạo durable session**. `harness_start`
 vẫn là đường duy nhất cho công việc lập trình thật sự cần suy luận.
@@ -62,6 +62,15 @@ vẫn là đường duy nhất cho công việc lập trình thật sự cần s
 | Xem và tự siết quyền của đợt chạy | `permission_get`, `permission_set` |
 | Review theo từng hunk, nhận hunk này bỏ hunk kia | `review_diff` → `review_stage_hunk` / `review_revert_hunk` |
 | Worker ChatGPT định kỳ | `fleet_start` |
+| Giao việc cho Claude Code / Codex / Grok / Antigravity CLI thật | `subagent_start` → `subagent_status`/`subagent_log` |
+
+**Sub-agent là CLI thật, không phải mô phỏng.** ChatGPT Web không có kho skill như Codex,
+nhưng một khi nó đang nói chuyện với Shiro, `subagent_start` dispatch `claude`/`codex`/
+`grok`/`agy` headless dưới tài khoản riêng của từng CLI — full tool use, sandbox riêng,
+chạy nền trên `ProcessRegistry` sẵn có nên không chặn một lượt MCP nào. `resume_from` tiếp
+tục đúng phiên của chính CLI đó. `claude`/`codex` đã kiểm thật trên máy triển khai;
+`grok`/`agy` (Antigravity) cài rồi nhưng cần `<cli> login` một lần trước khi dùng được —
+`subagent_providers` cho biết trạng thái từng cái trước khi dispatch, không đoán.
 
 **Nhiều workspace.** Direct action không còn bị khóa trong repo Shiro: `workspace_open`
 đăng ký thêm root và mọi action `fs_*`/`exec_*`/`git_*`/`task_*`/`terminal_*` nhận tham

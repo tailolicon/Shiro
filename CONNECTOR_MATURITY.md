@@ -440,6 +440,60 @@ không chỉ spec của protocol.
     433 bridge test (416 → 433), 122 action. Toàn bộ implementation (97 file, những gì tồn
     tại trước đó chỉ trên một đĩa) và round này đã commit lên `feat/coding-sandbox-parity`.
 
+42. **Sub-agent CLI thật (Claude Code / Codex / Grok / Antigravity) — xong, 122 → 128
+    action.** Yêu cầu: ChatGPT Web không có kho skill như Codex; cho nó gọi được bốn CLI
+    coding agent thật như sub-agent của chính mình bù lại việc đó.
+
+    **Điều tra trước khi viết dòng nào**: cả 4 đều thật trên máy (không đoán, không tin lời
+    người dùng chưa kiểm) — `claude` 2.1.251 và `codex` 0.151.0 đã đăng nhập, chạy live được;
+    `grok` 1.0.13 cài nhưng chưa `grok login`; `agy` (Antigravity, người dùng cung cấp đường
+    dẫn) 1.1.25 tại `~/.local/bin/agy` — verify bằng `file`+`--version` thật trước khi tin,
+    cũng chưa đăng nhập. Probe live cho `claude -p --output-format json` và
+    `codex exec --json` xác nhận đúng hình dạng response; `grok`/`agy` build từ `--help` với
+    nguyên tắc suy giảm an toàn vì không đăng nhập được để xác minh — mọi kết quả của hai
+    adapter này mang `unverified: true`.
+
+    **Kiến trúc: xây trên `ProcessRegistry` có sẵn, không viết lại.** Một subagent LÀ một
+    tiến trình bridge sở hữu theo mọi tiêu chí đã có — PID, ring buffer, confinement, trần
+    số tiến trình đồng thời — nên `bridge/src/subagents.js` chỉ thêm phần đặc thù CLI
+    (chọn adapter, dựng argv, phân tích output thành `thread_id`/`message`) trên lớp đã có,
+    thay vì một registry song song. `bridge/src/subagent-adapters.js` tách riêng phần thuần
+    (dựng argv, parse transcript) khỏi phần I/O — test được không cần spawn.
+
+    **Chạy nền, không đồng bộ.** Một CLI có thể chạy hàng chục phút; ChatGPT tự nó bị nền
+    tảng cắt ~25 phút (mục 41). `subagent_start` trả `process_id` ngay; `subagent_status`
+    hỏi lại — tránh đúng việc cộng dồn hai giới hạn thời gian vào nhau.
+
+    **Cổng disclaimer không bị vượt qua.** `claude`/`grok` khoá `bypassPermissions` sau một
+    bước xác nhận tương tác một lần. Thử nghiệm trực tiếp: `claude --bg` với
+    `bypassPermissions` từ chối thẳng, đòi chạy `claude --dangerously-skip-permissions` một
+    lần trong terminal thật trước. `subagent_start` tôn trọng đúng ranh giới đó — yêu cầu
+    mode này bị từ chối `PERMISSION_REQUIRED` kèm đúng lệnh mở khoá, không script qua.
+    `codex`/`agy` không có cổng tương tự nên bypass của chúng đi thẳng.
+
+    **Hai bug thật bắt được khi build integration test bằng fixture CLI (không đụng CLI
+    thật, không tốn phí, không cần đăng nhập):**
+    1. `SubagentRegistry.start()` **quên ghép `adapter.binary` vào argv** — mọi adapter thật
+       (cả 4) sẽ hỏng ngay từ lệnh spawn đầu tiên trong production, chỉ vì `buildArgv()`
+       (đúng theo hợp đồng) trả về tham số CLI chứ không phải chính binary. Test tích hợp
+       dùng `ProcessRegistry` + `Sandbox` thật, chỉ giả `binary` bằng một script Node nhỏ,
+       lộ ra ngay ở lần chạy đầu — `executable is not runnable`.
+    2. **Auth probe đọc sai stream/exit code.** So khớp `subagent_providers` với sự thật đã
+       biết (`claude`/`codex` đăng nhập, `grok`/`agy` thì không) lộ ra hai cái sai:
+       `codex login status` in "Logged in using ChatGPT" ra **stderr**, không phải stdout —
+       classifier chỉ đọc stdout luôn trả `null`. Và `#probe()` chỉ gọi `classifyAuth` khi
+       tiến trình probe thoát mã 0 — đúng cho `grok` (thoát 0 dù chưa đăng nhập) nhưng sai
+       cho `agy` (thoát 1 khi chưa đăng nhập, nên classifier không bao giờ được gọi). Sửa:
+       luôn gộp cả stdout+stderr, luôn gọi classifier bất kể exit code — bản thân mỗi
+       classifier đã tự trả `null` khi không nhận ra gì, tầng gọi không cần đoán hộ.
+       Sau khi sửa, `subagent_providers` chạy thật khớp 100% với trạng thái đăng nhập thật
+       của cả 4 CLI.
+
+    **Quyền**: họ `subagent` outward-on-write giống `fleet` — `subagent_start`/`_stop` cần
+    `full`, action đọc (`status`/`log`/`list`/`providers`) chạy được ở `read-only`.
+
+    477 bridge test (433 → 477).
+
 ## Lộ trình còn lại (thứ tự cập nhật 2026-09-03)
 
 ### ~~P0 — Harness workspace support~~ ✅ làm xong 2026-09-03 (mục 22)

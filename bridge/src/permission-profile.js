@@ -30,7 +30,13 @@ const OUTWARD_FAMILIES = new Set(['network', 'browser'])
 // on disk, but starting, stopping or steering one opens browser tabs and submits
 // prompts to ChatGPT. A coverage test caught fleet_start passing as a local
 // write because the family alone did not say which half an action was in.
-const OUTWARD_ON_WRITE_FAMILIES = new Set(['fleet'])
+const OUTWARD_ON_WRITE_FAMILIES = new Set([
+  'fleet',
+  // Starting or resuming a sub-agent CLI runs a full autonomous agent under
+  // its own account, with its own tool use and network reach; reading its
+  // status/log/list is local (it reports state this bridge already captured).
+  'subagent',
+])
 const OUTWARD_ACTIONS = new Set(['git_fetch', 'git_pull', 'git_push'])
 
 // Reads that must stay available at every profile, because they are how a

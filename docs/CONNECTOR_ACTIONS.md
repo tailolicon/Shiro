@@ -1,6 +1,6 @@
 # Shiro connector — direct actions và Harness agent
 
-Tài liệu này mô tả bề mặt MCP mà connector Shiro cung cấp cho ChatGPT: **122 action** (cộng thêm mọi tool plugin DSH đang mount, xem "Kho plugin DSH")
+Tài liệu này mô tả bề mặt MCP mà connector Shiro cung cấp cho ChatGPT: **128 action** (cộng thêm mọi tool plugin DSH đang mount, xem "Kho plugin DSH")
 chia theo họ, quy ước schema/lỗi/phân trang, và ranh giới an toàn của từng nhóm.
 
 ## Direct Actions vs Harness Agent
@@ -63,6 +63,8 @@ thì mới trả tiền cho một Harness turn; còn lại thì một action là
 | Worker ChatGPT chạy định kỳ | `fleet_start` | `harness_start` |
 | Đổi lịch/prompt của fleet đang chạy | `fleet_update` | `fleet_stop` + `fleet_start` |
 | Làm mới hội thoại của một slot | `fleet_worker_recycle` | — |
+| Giao việc cho Claude Code / Codex / Grok / Antigravity CLI thật, chạy nền | `subagent_start` → `subagent_status`/`subagent_log` | `harness_start` (đó là Shiro tự làm, không phải CLI khác) |
+| Xem CLI nào cài + đăng nhập trước khi dispatch | `subagent_providers` | đoán rồi thử `subagent_start` |
 
 ## Khám phá capability và phiên bản
 
@@ -298,6 +300,53 @@ một byte nào** (cố ý không dùng `--3way`: nó ghi conflict marker vào t
 | `process_logs` | read | Đọc theo con trỏ byte tuyệt đối, báo `dropped_bytes` |
 | `process_stop` | destructive | SIGTERM rồi SIGKILL sau `grace_ms` |
 | `process_list` | read | **Chỉ** tiến trình do bridge khởi động |
+
+### subagent — Claude Code / Codex / Grok / Antigravity CLI thật, chạy như sub-agent của Shiro
+| Action | Loại | Mô tả |
+|---|---|---|
+| `subagent_providers` | read | CLI nào **cài** và **có vẻ đã đăng nhập**; không đoán, `authenticated` là `true`/`false`/`null` (chưa xác định được) |
+| `subagent_start` | write | Dispatch một CLI headless làm tiến trình nền, trả `process_id` ngay |
+| `subagent_status` | read | Trạng thái + (khi xong) kết quả đã phân tích: `thread_id`, `message`, `usage` |
+| `subagent_log` | read | Đọc raw output theo con trỏ byte, cùng quy ước `process_logs` |
+| `subagent_stop` | destructive | SIGTERM rồi SIGKILL, giống `process_stop` |
+| `subagent_list` | read | Chỉ tiến trình `subagent_start` tạo ra, không lẫn `process_start` |
+
+**Đây là bốn coding agent CLI thật chạy dưới tài khoản của chính chúng** — không phải một
+mô phỏng, không phải gọi API. `subagent_start` dispatch `claude -p`, `codex exec`,
+`grok -p`, hay `agy --print` ở chế độ headless, với đầy đủ tool use, sandbox và bộ nhớ
+phiên riêng của từng CLI. Xây trên **đúng `ProcessRegistry`** mà `process_*` dùng — một
+subagent có PID, ring buffer, confinement, giới hạn số tiến trình đồng thời, và cũng hiện
+trong `process_list` (chỉ thiếu việc biết nó là CLI nào, thứ `subagent_list` cho biết).
+
+**Chạy nền, không đồng bộ — có chủ đích.** Mỗi CLI có thể chạy hàng chục phút; ChatGPT tự
+nó bị nền tảng cắt sau khoảng 25 phút (xem họ `continuation`). Chặn một lệnh MCP chờ hết
+một subagent sẽ buộc hai giới hạn đó cộng dồn vô nghĩa. `subagent_start` trả về ngay;
+`subagent_status`/`subagent_log` để hỏi lại.
+
+**Tiếp tục hội thoại**: `resume_from` nhận **hoặc** `process_id` của một `subagent_start`
+trước (được giải về đúng session/thread id của chính CLI đó), **hoặc** một session id thô
+đã biết. Mỗi lượt vẫn là một tiến trình mới — tiếp tục nghĩa là gọi lại CLI với cờ resume
+riêng của nó (`--resume`, `codex exec resume`, `--conversation`), không phải giữ một
+tiến trình sống nhận nhiều lượt.
+
+**Đã xác minh thật vs chưa xác minh.** `claude` và `codex` đã chạy thật, có tài khoản, trên
+máy triển khai — hình dạng JSON/NDJSON trong `subagent_status`/`subagent_log` là hình dạng
+thật. `grok` và `agy` (Antigravity) có cài nhưng **chưa đăng nhập** khi viết tài liệu này;
+parser của chúng dựng từ `--help` với nguyên tắc suy giảm an toàn — sai hình dạng thì trả
+JSON thô trong `message` kèm `unverified_shape: true`, không bao giờ throw. `unverified: true`
+đi kèm mọi kết quả của hai adapter này, và `subagent_providers` liệt kê rõ trước khi bạn
+dispatch.
+
+**Cổng disclaimer không bị vượt qua.** `claude`/`grok` có một chế độ `bypassPermissions` bị
+khoá sau một bước xác nhận tương tác một lần (`claude --dangerously-skip-permissions` chạy
+tay, một lần, trong terminal thật). Yêu cầu mode đó qua `subagent_start` bị từ chối
+`PERMISSION_REQUIRED` kèm đúng lệnh cần chạy để mở khoá — Shiro không script qua bước đó.
+`codex`/`agy` không có cổng tương tự nên `dangerously_skip_permissions: true` đi thẳng vào
+cờ bypass riêng của chúng.
+
+**Quyền**: cả họ `subagent` outward-on-write giống `fleet` — `subagent_start`/`subagent_stop`
+cần profile `full` (một CLI tự chủ chạy dưới tài khoản riêng, có thể ra mạng); các action đọc
+(`status`/`log`/`list`/`providers`) chạy được ở `read-only`.
 
 ### terminal — pty tương tác
 | Action | Loại | Mô tả |

@@ -58,6 +58,7 @@ const DIRECT_ACTIONS = [
   'config_get', 'config_validate', 'logs_tail', 'metrics_snapshot',
   'permission_get', 'permission_set',
   'continuation_set', 'continuation_status', 'continuation_clear', 'continuation_check',
+  'subagent_providers', 'subagent_start', 'subagent_status', 'subagent_log', 'subagent_stop', 'subagent_list',
 ]
 
 function testConfig(workspaceRoot, overrides = {}) {
