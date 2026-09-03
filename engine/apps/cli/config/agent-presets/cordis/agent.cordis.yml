@@ -50,15 +50,6 @@
   name: '@deepseek-ai/dsh-tool-pwsh'
   disabled: !!js process.platform !== 'win32'
 
-- id: shiro-container-tool
-  name: '@shiro-ai/harness-bridge/container-tool'
-  config:
-    workspaceRoot: !!js process.env.SHIRO_WORKSPACE_ROOT
-
-- id: shiro-git-tool
-  name: '@shiro-ai/harness-bridge/git-tool'
-  config:
-    workspaceRoot: !!js process.env.SHIRO_WORKSPACE_ROOT
 
 # ── filesystem ──────────────────────────────────────────────────────────────
 

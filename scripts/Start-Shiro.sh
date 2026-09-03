@@ -230,7 +230,9 @@ if [[ -x "$tunnel_client" && -s "$state_root/tunnel-id.txt" && -s "$state_root/r
     local health_url
     health_url="$(tr -d '\r\n' <"$state_root/tunnel-health.url")"
     [[ "$health_url" =~ ^http://127\.0\.0\.1:[0-9]+$ ]] || return 1
-    curl --fail --silent --show-error --max-time 2 "$health_url/readyz" >/dev/null
+    # No --show-error: this is a poll inside a retry loop, so a 503 while the
+    # tunnel is still coming up is the expected case, not something to print.
+    curl --fail --silent --max-time 2 "$health_url/readyz" >/dev/null 2>&1
   }
 
   if pgrep -u "$(id -u)" -f -- "$tunnel_client" >/dev/null 2>&1; then

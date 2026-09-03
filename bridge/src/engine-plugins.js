@@ -151,6 +151,12 @@ export function renderOptionalPluginBlock({ lspServers = {}, hooksConfigPath = '
     rows.push("    name: '@deepseek-ai/dsh-lsp-stdio'")
     rows.push('    config:')
     rows.push(`      servers: ${JSON.stringify(lspServers)}`)
+    // The third row is the one that reaches the model. dsh-lsp provides the
+    // capability and dsh-lsp-stdio speaks to the servers, but NEITHER
+    // registers a tool -- without dsh-tool-lsp the provider is mounted and the
+    // agent still has no `lsp` to call, which is exactly how this shipped.
+    rows.push('  - id: shiro-tool-lsp')
+    rows.push("    name: '@deepseek-ai/dsh-tool-lsp'")
   }
   if (hooksConfigPath !== '') {
     rows.push('  - id: shiro-hooks-codex')

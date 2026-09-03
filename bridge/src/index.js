@@ -2057,7 +2057,7 @@ export function configureMcp(server, controller, config, fleetManager = null, ru
   const sandbox = runtime.sandbox ?? workspaces.primary().sandbox
   const directRegistry = registerDirectActions(server, {
     // The engine's sandbox seam, when the host provides one.
-    sandboxProvider: runtime.sandboxProvider ?? null,
+    sandboxProvider: typeof runtime.sandboxProvider === 'function' ? runtime.sandboxProvider() : (runtime.sandboxProvider ?? null),
     continuation: runtime.continuation ?? null,
     subagents: runtime.subagents ?? undefined,
     config,
@@ -2123,11 +2123,25 @@ async function handleMcpRequest(req, res, controller, config, fleetManager, runt
   await transport.handleRequest(req, res)
 }
 
-/** ctx.sandbox when the host mounts one, null otherwise -- never a throw. */
+/**
+ * The engine's sandbox seam, or null when the host mounts none.
+ *
+ * Read through `ctx.reflect.get`, not `ctx.sandbox`, for the same reason as the
+ * tool registry: cordis enforces declared injection and THROWS for anything a
+ * plugin did not list, so the direct read failed, the catch reported null, and
+ * confinement silently became a no-op -- every command ran unconfined while
+ * reporting `enforcement: "none"` as if that were the operator's choice.
+ * Injecting it instead would make the service required and leave the whole
+ * bridge unmounted on a host without one.
+ */
 function sandboxProviderOf(ctx) {
+  const usable = provider => (provider !== null && provider !== undefined && typeof provider.confine === 'function' ? provider : null)
   try {
-    const provider = ctx?.sandbox ?? null
-    return provider !== null && typeof provider.confine === 'function' ? provider : null
+    const reflected = ctx?.reflect?.get?.('sandbox', false)
+    if (usable(reflected) !== null) return reflected
+  } catch { /* fall through to the direct read */ }
+  try {
+    return usable(ctx?.sandbox ?? null)
   } catch {
     return null
   }
@@ -2156,7 +2170,7 @@ function startHttpServer(ctx, broker, config, fleetManager) {
     // cordis's array form makes a service REQUIRED and would keep the whole
     // bridge unmounted on a host without one. Absent, Confinement refuses
     // narrowed modes instead of pretending to enforce them.
-    sandboxProvider: sandboxProviderOf(ctx),
+    sandboxProvider: () => sandboxProviderOf(ctx),
     // The engine's own tool registry, as a RESOLVER rather than a value:
     // configureMcp calls it per request, so plugins mounted after the bridge
     // still get mirrored. Mirroring it is what gives ChatGPT the DSH plugin

@@ -566,6 +566,63 @@ không chỉ spec của protocol.
     build/ship `python/sdk-runtime`, không script nào đụng tới nó) — nhưng đi kiểm chứng
     nó đã lôi ra một lỗi thật, khác hẳn, đang làm agent thiếu hai tool.
 
+45. **Audit release: 4 blocker, cả 4 đều đúng, đã sửa và chứng minh trên runtime sống.**
+
+    **(1) Package bridge không phát hành độc lập được.** `npm pack` bỏ sót **9 module** mà
+    exports với tới bắc cầu (`action-gate`, `browser-dom`, `browser-navigate`, `confinement`,
+    `continuation`, `engine-tools`, `json-schema-zod`, `subagent-adapters`, `subagents`), và
+    `sdk.js` — thứ tài liệu gọi là public SDK — **không hề được export**. Chạy được lâu nay
+    chỉ vì profile dùng `link:` kéo nguyên thư mục, nên `files[]` sai mà không ai biết. Đã
+    thêm export `./sdk`, đồng bộ `files[]` theo **bao đóng thật**, và quan trọng hơn là gate
+    `tests/package-closure.test.js`: tính lại bao đóng, đối chiếu với `npm pack --json` của
+    chính npm, rồi **pack → cài vào thư mục trống → import từng export**. Đó là bài kiểm tra
+    duy nhất bắt được lỗi gốc, vì nó làm đúng thứ người dùng làm.
+
+    **(2) Deployment chưa hề được sandbox — confinement hoàn toàn vô hiệu.** Audit chỉ ra
+    `sandboxProviderOf()` có **cùng dạng lỗi** với plugin mirror ở mục 43: đọc `ctx.sandbox`
+    trực tiếp, cordis ném vì chưa inject, catch trả `null`. Đúng — và hệ quả tệ hơn mirror:
+    mọi lệnh chạy trần trong khi **báo cáo `enforcement: "none"` như thể đó là lựa chọn của
+    người vận hành**. Sửa sang `ctx.reflect.get('sandbox', false)` + resolve mỗi request.
+    Đồng thời `sandbox_mode` bị đọc trong `exec-actions.js` nhưng **chưa bao giờ khai trong
+    input schema**, nên caller không siết được từng lời gọi — đã khai cho `exec_run` và
+    `process_start`.
+
+    Chứng minh trên máy thật, không phải fake provider:
+    ```
+    sandbox_mode: read-only      → {mode: read-only, enforcement: full, backend: bwrap}
+    ghi /tmp                     → exit 1, "Read-only file system"
+    sandbox_mode: workspace-write→ ghi trong workspace OK
+    ```
+
+    **Còn nợ, ghi rõ thay vì lờ đi**: confinement mới nối vào `exec_run` + `process_start`.
+    `terminal_start`, `task_run`/`test_run`, git/worktree, poppler và các probe phụ vẫn spawn
+    ngoài sandbox. Và sandbox này chỉ kiểm soát **file effect** — network của tiến trình con
+    vẫn tự do (cần egress proxy/netns, chưa làm). Mặc định vẫn `full`/no-confirm **theo đúng
+    lựa chọn đã ghi của người vận hành** ở mục 41, không tự ý đảo lại.
+
+    **(3) Runtime closure đỏ — sửa bằng hướng thứ ba, không phải hai hướng audit nêu.**
+    Audit đề xuất: hoặc biến hai tool thành package engine-owned, hoặc bỏ khỏi preset engine
+    rồi chèn bằng Shiro profile patch. Kiểm tra thì preset **không có cơ chế overlay/include**
+    (`includeRuntimeContext` chỉ là field config), nên hướng thứ hai đòi **nhân bản nguyên
+    một preset** — bẫy bảo trì tệ hơn vấn đề nó sửa. Hướng thứ ba, rút ra từ `view(scope)`
+    của engine: **tool ở layer global được mọi agent scope kế thừa**. Nên hai row chuyển về
+    đúng `bridge/cordis.patch.yml` — bundle patch Shiro sở hữu hoàn toàn — và bị gỡ khỏi cả
+    ba preset của engine. Không đụng source engine, không nhân bản gì, không đảo tầng.
+
+    Gate xanh: *"4 agent presets and 120 workspace packages form a closed runtime dependency
+    graph"*. Và chứng minh agent **không mất tool**: sau restart, plugin mirror hiện
+    `sandbox_exec` cùng 7 git tool (`dsh_git_*` — luật đổi tên khi trùng của mục 41 chạy đúng
+    trong production).
+
+    **(4) LSP chưa tới model.** Đúng: block sinh ra mount `dsh-lsp` (capability) và
+    `dsh-lsp-stdio` (transport), nhưng **không** `dsh-tool-lsp` — package duy nhất trong ba
+    cái *đăng ký một tool*. Effective config trông đủ trong khi agent không có `lsp` để gọi.
+    Thêm row thứ ba. Chứng minh: sau restart, `lsp` xuất hiện trong bề mặt.
+
+    **Live cuối đợt**: 143 action (128 direct + 15 plugin mirror), 485 bridge test,
+    `verify-runtime-closure` xanh. Sửa thêm hai nhiễu khởi động cùng loại với `jq` ở mục 39:
+    probe tunnel in `curl: (22) 503` vì `--show-error` giữa vòng retry.
+
 ## Lộ trình còn lại (thứ tự cập nhật 2026-09-03)
 
 ### ~~P0 — Harness workspace support~~ ✅ làm xong 2026-09-03 (mục 22)

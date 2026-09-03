@@ -171,3 +171,19 @@ test('merging into an empty or absent patch file works', () => {
   assert.equal(mergeProfilePatch('', ''), '')
   assert.equal(mergeProfilePatch(undefined, ''), '')
 })
+
+test('the LSP block mounts the model-facing tool, not just the provider', async () => {
+  // Regression: the block mounted dsh-lsp (capability) and dsh-lsp-stdio
+  // (server transport) but not dsh-tool-lsp, which is the only one of the
+  // three that registers a tool. The effective config looked right -- LSP
+  // plugins present -- while the agent had no `lsp` to call.
+  const block = renderOptionalPluginBlock({ lspServers: { clangd: { command: 'clangd', args: [] } } })
+  assert.match(block, /@deepseek-ai\/dsh-lsp'/, 'the capability provider')
+  assert.match(block, /@deepseek-ai\/dsh-lsp-stdio'/, 'the server transport')
+  assert.match(block, /@deepseek-ai\/dsh-tool-lsp'/, 'the tool the model actually calls')
+
+  // With no language servers installed there is nothing to talk to, so none of
+  // the three rows is written -- a row that cannot work is not written at all.
+  const empty = renderOptionalPluginBlock({ lspServers: {} })
+  assert.doesNotMatch(empty, /dsh-tool-lsp/)
+})

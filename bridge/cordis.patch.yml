@@ -38,6 +38,20 @@
     # project-level cron; recurring project automation remains the fleet.
     - id: schedule
       name: '@deepseek-ai/dsh-schedule'
+    # Shiro's own engine-facing tools. They live HERE, in Shiro's bundle patch,
+    # rather than inside the engine's shipped agent presets: those presets are
+    # the engine's, and a preset of the engine's referencing a Shiro package
+    # inverts the layering -- which is exactly what verify-runtime-closure was
+    # reporting. Mounted at profile level they register into the GLOBAL tool
+    # layer, which every agent scope inherits, so agents keep them.
+    - id: shiro-container-tool
+      name: '@shiro-ai/harness-bridge/container-tool'
+      config:
+        workspaceRoot: !!js process.env.SHIRO_WORKSPACE_ROOT
+    - id: shiro-git-tool
+      name: '@shiro-ai/harness-bridge/git-tool'
+      config:
+        workspaceRoot: !!js process.env.SHIRO_WORKSPACE_ROOT
     - id: llm-shiro-harness-bridge
       name: '@shiro-ai/harness-bridge'
       config:
