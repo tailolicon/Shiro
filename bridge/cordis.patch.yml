@@ -32,16 +32,38 @@
     #     transport: stdio
     #     command: npx
     #     args: ['-y', '@modelcontextprotocol/server-github']
+    # Session-local reminders for the agent (schedule_create/list/delete).
+    # NOTE: delivery is fixed session-local -- a reminder fires inside the
+    # session that created it, while that session is live. This is NOT
+    # project-level cron; recurring project automation remains the fleet.
+    - id: schedule
+      name: '@deepseek-ai/dsh-schedule'
     - id: llm-shiro-harness-bridge
       name: '@shiro-ai/harness-bridge'
       config:
         provider: shiro-sol
         model: gpt-5.6-sol
         workspaceRoot: !!js process.env.SHIRO_WORKSPACE_ROOT
+        # Extra directory trees workspace_open may address, colon-separated.
+        # Empty (the default) keeps every direct action locked to workspaceRoot.
+        workspaceAllowlist: !!js process.env.SHIRO_WORKSPACE_ALLOWLIST ?? ''
+        # Coarse permission dial: read-only | workspace-write | full. This is a
+        # CEILING -- permission_set may narrow it at runtime, never widen it.
+        permissionProfile: !!js process.env.SHIRO_PERMISSION_PROFILE ?? 'full'
+        permissionRules:
+          commandAllow: !!js process.env.SHIRO_COMMAND_ALLOW ?? ''
+          commandDeny: !!js process.env.SHIRO_COMMAND_DENY ?? ''
+          networkAllow: !!js process.env.SHIRO_NETWORK_ALLOW ?? ''
+          networkDeny: !!js process.env.SHIRO_NETWORK_DENY ?? ''
         token: !!js process.env.SHIRO_BRIDGE_TOKEN
         port: !!js Number(process.env.SHIRO_BRIDGE_PORT ?? 23157)
         waitMs: 25000
+        maxConcurrentTurns: 4
         relayUrl: !!js process.env.SHIRO_RELAY_URL
         relayToken: !!js process.env.SHIRO_RELAY_API_TOKEN
         relayModel: !!js process.env.SHIRO_RELAY_MODEL ?? 'GPT-5.6 Sol'
+        fleetStateDir: !!js process.env.SHIRO_FLEET_STATE_DIR ?? ''
+        # Service logs live beside the project root, not inside it; logs_tail
+        # reads them through a fixed stream allowlist.
+        logDir: !!js process.env.SHIRO_LOG_DIR ?? ''
         grokCliPath: !!js process.env.SHIRO_GROK_CLI ?? ''

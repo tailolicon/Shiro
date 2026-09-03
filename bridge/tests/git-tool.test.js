@@ -84,12 +84,14 @@ test('commit message travels via stdin verbatim, not through a shell', async () 
 })
 
 test('model-supplied paths are confined to the workspace root', () => {
-  const dir = 'E:\\Project\\Shiro'
   const add = byName.get('git_add')
   const diff = byName.get('git_diff')
-  assert.throws(() => add.build({ paths: ['../../etc/passwd'] }, dir), /escapes the workspace/)
-  assert.throws(() => diff.build({ path: '../outside' }, dir), /escapes the workspace/)
-  assert.throws(() => add.build({ paths: ['C:\\Windows\\system32'] }, dir), /escapes the workspace/)
+  for (const dir of ['E:\\Project\\Shiro', '/home/tailolicon/Projects/Shiro']) {
+    assert.throws(() => add.build({ paths: ['../../etc/passwd'] }, dir), /escapes the workspace/)
+    assert.throws(() => diff.build({ path: '../outside' }, dir), /escapes the workspace/)
+    assert.throws(() => add.build({ paths: ['C:\\Windows\\system32'] }, dir), /escapes the workspace/)
+    assert.throws(() => diff.build({ path: '/etc/passwd' }, dir), /escapes the workspace/)
+  }
 })
 
 test('branch and ref names that could be read as options or break ref rules are rejected', () => {

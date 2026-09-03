@@ -1,6 +1,7 @@
 import { resolve } from 'node:path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { GIT_TOOLS, gateReason, runGit } from './git-commands.js'
+import { sessionRoot } from './session-root.js'
 
 // Thin DSH wrapper over git-commands.js. All git logic (argv construction, path
 // confinement, ref validation, approval reasons, the spawn runner) lives in the
@@ -44,8 +45,13 @@ export function registerGitTools(ctx, { workspaceRoot }) {
       parameters: spec.parameters,
       output: { schema: RESULT_SCHEMA, render: renderResult },
       async execute(args, exec) {
-        const { argv, stdin } = spec.build(args, workspaceRoot)
-        return runGit(workspaceRoot, argv, { stdin, signal: exec.signal })
+        // The repository is the one this session occupies, not the one the
+        // bridge was configured with: a session anchored in another workspace
+        // must not stage and commit into the Shiro repository. Path confinement
+        // is unchanged, it just follows the same root.
+        const root = sessionRoot(exec, workspaceRoot)
+        const { argv, stdin } = spec.build(args, root)
+        return runGit(root, argv, { stdin, signal: exec.signal })
       },
       presentCall: args => ({ card: 'terminal', title: spec.presentTitle(args), description: spec.description }),
     }))

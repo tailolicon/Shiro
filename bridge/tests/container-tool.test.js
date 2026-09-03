@@ -7,6 +7,11 @@ test('container workdir stays beneath the fixed root', () => {
   assert.equal(workspaceRelative('E:\\Project\\Shiro', 'bridge'), '/workspace/bridge')
   assert.throws(() => workspaceRelative('E:\\Project\\Shiro', '..'), /escapes/)
   assert.throws(() => workspaceRelative('E:\\Project\\Shiro', 'C:\\Windows'), /relative/)
+
+  assert.equal(workspaceRelative('/home/tailolicon/Projects/Shiro', '.'), '/workspace')
+  assert.equal(workspaceRelative('/home/tailolicon/Projects/Shiro', 'bridge/tests'), '/workspace/bridge/tests')
+  assert.throws(() => workspaceRelative('/home/tailolicon/Projects/Shiro', '..'), /escapes/)
+  assert.throws(() => workspaceRelative('/home/tailolicon/Projects/Shiro', '/etc'), /relative/)
 })
 
 test('shared dependency volumes are read-only during task execution', () => {

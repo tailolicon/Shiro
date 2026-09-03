@@ -1,6 +1,6 @@
 {
   "name": "@shiro-ai/harness-bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "main": "src/index.js",
@@ -9,15 +9,46 @@
     "./container-tool": "./src/container-tool.js",
     "./git-tool": "./src/git-tool.js"
   },
+  "bin": {
+    "shiro": "./bin/shiro.mjs"
+  },
   "files": [
-    "src/index.js",
+    "bin/shiro.mjs",
+    "cordis.patch.yml",
+    "sdk/shiro.py",
+    "src/action-errors.js",
+    "src/artifact-kind.js",
+    "src/browser-ownership.js",
+    "src/browser-screenshot.js",
     "src/chatgpt-relay.js",
-    "src/grok-cli.js",
-    "src/container-tool.js",
+    "src/cli-connect.js",
+    "src/cli.js",
     "src/container-path.js",
+    "src/container-tool.js",
+    "src/direct-actions.js",
+    "src/engine-plugins.js",
+    "src/exec-actions.js",
+    "src/fleet-manager.js",
+    "src/fs-actions.js",
+    "src/git-actions.js",
+    "src/git-commands.js",
     "src/git-tool.js",
+    "src/grok-cli.js",
+    "src/index.js",
+    "src/mcp-result.js",
+    "src/media-actions.js",
+    "src/net-actions.js",
+    "src/permission-profile.js",
+    "src/pty-bridge.py",
     "src/redact.js",
-    "cordis.patch.yml"
+    "src/review-actions.js",
+    "src/sandbox.js",
+    "src/session-root.js",
+    "src/task-actions.js",
+    "src/terminal-actions.js",
+    "src/thread-registry.js",
+    "src/workspaces.js",
+    "src/worktree-actions.js"
   ],
   "scripts": {
     "test": "node --test tests/*.test.js"

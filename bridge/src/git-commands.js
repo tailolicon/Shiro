@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process'
-import { isAbsolute, relative, resolve, sep } from 'node:path'
+import { posix, win32 } from 'node:path'
 
 // Pure, dependency-free core of the Git tool: git argv construction, path
 // confinement, ref validation, approval-reason derivation, and the spawn
@@ -30,13 +30,15 @@ export function assertSafeRef(value, label) {
 /** Resolve a model-supplied path and confine it inside the workspace, returned git-relative with forward slashes. */
 export function confinePath(workspaceRoot, value) {
   if (typeof value !== 'string' || value.trim() === '') throw new Error('path must be a non-empty string')
-  const resolved = resolve(workspaceRoot, value)
-  const rel = relative(workspaceRoot, resolved)
+  if (posix.isAbsolute(value) || win32.isAbsolute(value)) throw new Error(`path escapes the workspace root: ${value}`)
+  const pathApi = win32.isAbsolute(workspaceRoot) ? win32 : posix
+  const resolved = pathApi.resolve(workspaceRoot, value)
+  const rel = pathApi.relative(workspaceRoot, resolved)
   if (rel === '') return '.'
-  if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+  if (rel === '..' || rel.startsWith(`..${pathApi.sep}`) || pathApi.isAbsolute(rel)) {
     throw new Error(`path escapes the workspace root: ${value}`)
   }
-  return rel.split(sep).join('/')
+  return rel.split(pathApi.sep).join('/')
 }
 
 /** Every git tool spec: schema, argv builder (args, workspaceRoot) -> {argv, stdin?}, presentation, and mutation flag. */
@@ -121,7 +123,7 @@ export const GIT_TOOLS = [
   {
     name: 'git_add',
     mutating: true,
-    description: 'Stage one or more paths for the next commit. Requires approval. Paths are confined to the project root. Does not reset or discard anything.',
+    description: 'Stage one or more paths for the next commit. Requires approval. Paths are confined to the session workspace root. Does not reset or discard anything.',
     parameters: {
       paths: { type: 'array', items: { type: 'string' }, required: true, description: 'Project-relative paths to stage.' },
     },
@@ -170,12 +172,17 @@ function boundedString(parts, length) {
 }
 
 /** Run one git invocation with an argv array (never a shell string). Rejects only on spawn failure. */
-export function runGit(workspaceRoot, args, { stdin, signal } = {}) {
+export function runGit(workspaceRoot, args, { stdin, signal, env } = {}) {
   return new Promise((resolveRun, rejectRun) => {
     const child = spawn('git', args, {
       cwd: workspaceRoot,
       windowsHide: true,
       shell: false,
+      // Overlaid, never replaced: git needs the ambient HOME/PATH to find the
+      // user's config and credential helpers. Snapshotting overlays only
+      // GIT_INDEX_FILE so a scratch index can be built without touching the
+      // real one.
+      ...(env === undefined ? {} : { env: { ...process.env, ...env } }),
       stdio: [stdin === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
     })
     const out = { parts: [], length: 0 }

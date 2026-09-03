@@ -519,13 +519,14 @@ export class ChatGptBrowserRelay {
   // contents become unknown and the next turn must resend everything fresh.
   #forceFull = false
 
-  constructor({ url, token, model = 'GPT-5.6 Sol', timeoutMs = DEFAULT_TIMEOUT_MS, fetchImpl = fetch, maxThreadTurns }) {
+  constructor({ url, token, model = 'GPT-5.6 Sol', timeoutMs = DEFAULT_TIMEOUT_MS, fetchImpl = fetch, maxThreadTurns, isReservedClient = () => false }) {
     this.url = normalizeLoopbackUrl(url)
     this.token = asRequiredString(token, 'relayToken')
     this.model = asRequiredString(model, 'relayModel')
     this.timeoutMs = timeoutMs
     this.fetch = fetchImpl
     this.maxThreadTurns = resolveMaxThreadTurns(maxThreadTurns)
+    this.isReservedClient = typeof isReservedClient === 'function' ? isReservedClient : () => false
   }
 
   async #healthBody(signal) {
@@ -560,7 +561,10 @@ export class ChatGptBrowserRelay {
     } catch {
       return null
     }
-    const usable = clients.filter(client => client?.ready === true && client?.quarantined !== true && typeof client.id === 'string')
+    const usable = clients.filter(client => client?.ready === true
+      && client?.quarantined !== true
+      && typeof client.id === 'string'
+      && !this.isReservedClient(client))
     const remembered = usable.find(client => client.id === this.#selectedClientId)
     // A conversation URL (/c/<id>) means someone has been chatting there.
     const blank = usable.filter(client => !/\/c\//.test(String(client.url ?? '')))

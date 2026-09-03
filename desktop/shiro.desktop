@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Shiro
+Comment=Local ChatGPT coding agent powered by DeepSeek Harness
+Exec=shiro-start
+Icon=shiro
+Terminal=false
+Categories=Development;
+StartupNotify=true

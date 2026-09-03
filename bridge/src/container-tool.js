@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { containerArguments } from './container-path.js'
+import { sessionRoot } from './session-root.js'
 const MAX_OUTPUT = 256 * 1024
 
 function appendBounded(state, chunk) {
@@ -73,11 +74,11 @@ function runContainer({ workspaceRoot, command, workdir, timeoutMs, signal }) {
 export function registerContainerTool(ctx, config) {
   ctx.tools.register(defineTool({
     name: 'sandbox_exec',
-    description: 'Run a foreground command in Shiro\'s isolated Linux runner. Only the fixed project root is mounted at /workspace; the container has no network, no host filesystem, no extra capabilities, and is deleted after the command. Prefer this for tests, builds, package scripts, and commands that create child processes. Use pwsh for simple Windows-native inspection.',
+    description: `Run a foreground command in Shiro's isolated Linux runner. Only this session's workspace root is mounted at /workspace; the container has no network, no host filesystem, no extra capabilities, and is deleted after the command. Prefer this for tests, builds, package scripts, and commands that create child processes. Use ${process.platform === 'win32' ? 'pwsh' : 'bash'} for simple host-native inspection.`,
     parameters: {
       command: { type: 'string', required: true, description: 'POSIX shell command to run inside the isolated project container.' },
       description: { type: 'string', required: true, description: 'Short description of the operation.' },
-      workdir: { type: 'string', description: 'Relative directory inside the fixed project root. Defaults to the root.' },
+      workdir: { type: 'string', description: "Relative directory inside this session's workspace root. Defaults to the root." },
       timeoutMs: { type: 'number', description: 'Timeout from 1000 to 600000 milliseconds. Defaults to 120000.' },
     },
     output: {
@@ -102,7 +103,9 @@ export function registerContainerTool(ctx, config) {
       const timeoutMs = args.timeoutMs ?? 120_000
       if (!Number.isInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > 600_000) throw new Error('timeoutMs must be an integer from 1000 to 600000')
       return runContainer({
-        workspaceRoot: config.workspaceRoot,
+        // Mount the session's own workspace, so a command run for a session
+        // anchored elsewhere does not operate on the Shiro repository.
+        workspaceRoot: sessionRoot(exec, config.workspaceRoot),
         command: args.command,
         workdir: args.workdir ?? '.',
         timeoutMs,

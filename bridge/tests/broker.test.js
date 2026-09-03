@@ -64,6 +64,39 @@ test('adapter uses the connected browser relay without publishing an MCP handoff
   assert.deepEqual(chunks.at(-1), { type: 'finish', reason: { kind: 'stop' } })
 })
 
+test('adapter bypasses a ready relay while an MCP root turn is running', async () => {
+  const broker = new BridgeBroker()
+  broker.operationProbe = () => true
+  const relay = {
+    health: async () => { throw new Error('relay must not be consulted during an MCP turn') },
+    complete: async () => { throw new Error('relay must not be used during an MCP turn') },
+  }
+  const adapter = new ChatGptSolAdapter(broker, 'shiro-sol', 'gpt-5.6-sol', relay)
+  const chunksPromise = collect(adapter.stream(options))
+  const [pending] = await broker.waitForPending(1000)
+  assert.equal(pending.session_id, 'session-test')
+  broker.submit(pending.request_id, { blocks: [{ type: 'text', text: 'mcp answer' }] })
+  const chunks = await chunksPromise
+  assert.equal(chunks.find(chunk => chunk.type === 'text-delta').text, 'mcp answer')
+  assert.deepEqual(chunks.at(-1), { type: 'finish', reason: { kind: 'stop' } })
+})
+
+test('adapter returns to the relay when no MCP root turn is running', async () => {
+  const broker = new BridgeBroker()
+  broker.operationProbe = () => false
+  const relay = {
+    health: async () => ({ ready: true, clients: 1 }),
+    complete: async request => ({
+      blocks: [{ type: 'text', text: `relay:${request.messages[0].content[0].text}` }],
+      finishReason: 'stop',
+    }),
+  }
+  const adapter = new ChatGptSolAdapter(broker, 'shiro-sol', 'gpt-5.6-sol', relay)
+  const chunks = await collect(adapter.stream(options))
+  assert.equal(broker.snapshot().length, 0)
+  assert.equal(chunks.find(chunk => chunk.type === 'text-delta').text, 'relay:test')
+})
+
 test('adapter exposes native speed profiles and reasoning effort metadata', async () => {
   const adapter = new ChatGptSolAdapter(new BridgeBroker(), 'shiro-sol', 'gpt-5.6-sol')
   const models = await adapter.listModels('shiro-sol')

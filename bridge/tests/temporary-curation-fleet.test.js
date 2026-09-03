@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import fs from 'node:fs/promises'
-import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import test from 'node:test'
 
-const scriptPath = path.resolve('scripts/ChatGPT-Temporary-Curation-30m.console.js')
+// Resolved from this file, not from the working directory: `node --test` may be
+// run from the repository root or from bridge/, and a cwd-relative path made the
+// suite pass or fail depending on which.
+const scriptPath = fileURLToPath(new URL('../../scripts/ChatGPT-Temporary-Curation-30m.console.js', import.meta.url))
 const expectedPromptSha256 = '3858472f9594294ddab028ac6967ef56f246c62c9aefd27bb4b2788bc7e6e973'
 
 function embeddedPrompt(script) {
