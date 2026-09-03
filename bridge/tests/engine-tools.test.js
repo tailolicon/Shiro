@@ -182,3 +182,61 @@ test('a deployment with no engine registry simply has no plugin tools', async t 
   assert.equal(catalog.actions.some(action => action.family === 'plugin'), false)
   assert.ok(catalog.action_count >= 118, 'the native surface is unaffected')
 })
+
+test('the registry is read through cordis reflect, not through a bare ctx.tools', () => {
+  // Regression, found only by restarting into a real engine: cordis ENFORCES
+  // declared injection, so `ctx.tools` on a plugin that did not inject `tools`
+  // throws `cannot get property "tools" without inject`. The old code caught
+  // that throw and reported null -- "no engine here" while the engine was
+  // right there, and the mirror silently registered zero tools.
+  const registry = fakeEngineTools([TODO_SCHEMA])
+  const cordisLike = {
+    get tools() { throw new Error('cannot get property "tools" without inject') },
+    reflect: { get: (name, strict) => (name === 'tools' && strict === false ? registry : undefined) },
+  }
+  assert.equal(engineToolsOf(cordisLike), registry)
+
+  // A host with no tool registry at all still resolves to null, not a throw.
+  assert.equal(engineToolsOf({ reflect: { get: () => undefined } }), null)
+  // A reflect that itself throws falls through to the direct read.
+  assert.equal(engineToolsOf({ reflect: { get() { throw new Error('boom') } }, tools: registry }), registry)
+  // Something shaped like a service but missing execute() is not usable.
+  assert.equal(engineToolsOf({ reflect: { get: () => ({ schemas: () => [] }) } }), null)
+})
+
+test('the registry resolves per request, so plugins mounted later still mirror', async t => {
+  // Reading it once at boot froze the mirror at whatever existed in that
+  // instant; tool plugins that mount after the bridge would never appear.
+  const root = await mkdtemp(join(tmpdir(), 'shiro-mirror-lazy-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  let mounted = []
+  const registry = {
+    schemas: () => mounted,
+    async execute() { return { isError: false, value: null, content: [] } },
+  }
+
+  const controller = { broker: new BridgeBroker(), async sessions() { return { sessions: [] } }, async status() { return { status: 'idle' } } }
+  const build = async () => {
+    const server = new McpServer({ name: 'mirror-lazy', version: '0.0.0' })
+    // A RESOLVER, the shape startHttpServer passes.
+    configureMcp(server, controller, { workspaceRoot: root, waitMs: 25_000, token: 'x' }, null, { engineTools: () => registry })
+    const client = new Client({ name: 'mirror-lazy-client', version: '0.0.0' })
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+    await server.connect(serverTransport)
+    await client.connect(clientTransport)
+    return { server, client }
+  }
+
+  const first = await build()
+  assert.equal((await first.client.listTools()).tools.some(tool => tool.name === 'todo_write'), false, 'nothing mounted yet')
+  await first.client.close()
+  await first.server.close()
+
+  // A tool plugin mounts after the bridge did.
+  mounted = [TODO_SCHEMA]
+
+  const second = await build()
+  assert.equal((await second.client.listTools()).tools.some(tool => tool.name === 'todo_write'), true, 'the later plugin is mirrored')
+  await second.client.close()
+  await second.server.close()
+})

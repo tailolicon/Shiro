@@ -494,6 +494,49 @@ không chỉ spec của protocol.
 
     477 bridge test (433 → 477).
 
+43. **"Sửa hết lỗi" — bốn lỗi thật, ba trong số đó chỉ restart mới lộ ra.** Chạy đủ mọi
+    suite trước (bridge 477/477, relay **1010/1010** — lần đầu chạy full 159 file, relay
+    `npm run check` xanh, 4 engine verify gate xanh) rồi mới đi tìm chỗ chưa chạy.
+
+    **(1) Startup lock bị giữ vĩnh viễn — Shiro không restart được nữa.**
+    `Start-Shiro.sh` giữ lock qua `exec 9>start.lock`; fd 9 **thừa kế xuống mọi tiến trình
+    con**. Script đã xử lý đúng ở 3 chỗ (`9>&-` cho `start_detached` và chromium) nhưng
+    **sót hai lệnh `xdg-open`** mở UI. `xdg-open` giao URL cho **Chrome cá nhân của người
+    dùng**, và Chrome đó giữ lock cho tới khi đóng hẳn — đo được: 3 giờ 28 phút, khiến
+    `Start-Shiro.sh` chết với "Another Shiro startup is already running" trong khi **không
+    có startup nào đang chạy**. Thêm `9>&-` vào đúng hai chỗ đó. Dọn lock kẹt bằng
+    `rm` (holder giữ fd tới inode đã unlink, vô hại) thay vì giết trình duyệt của người dùng.
+
+    **(2) Lockfile engine lệch — backend chết ngay khi boot.** Bản sửa P0.3 ở mục 40 thêm
+    `@deepseek-ai/dsh-tool-session-query` vào `python/sdk-runtime/package.json` nhưng
+    **không regenerate `pnpm-lock.yaml`**, mà engine boot bằng `--frozen-lockfile`. Lỗi nằm
+    im từ mục 40 vì suốt các round sau **không ai restart**; lần restart đầu tiên là lần đầu
+    nó lộ ra. `pnpm install --lockfile-only` → 3 dòng. Bài học đúng loại: một thay đổi
+    package.json chưa restart thì chưa biết nó đúng.
+
+    **(3) Plugin mirror đăng ký 0 tool — cordis chặn đọc service chưa inject.** Mục 41 mirror
+    kho plugin DSH qua `ctx.tools`, nhưng cordis **enforce** inject: đọc service không khai
+    thì **ném** `cannot get property "tools" without inject`. `engineToolsOf` bắt exception
+    rồi trả `null` — trông y hệt "host này không có engine" trong khi engine ở ngay đó, và
+    mirror im lặng đăng ký 0 tool. Test cũ không phơi ra được vì chúng truyền thẳng object
+    registry vào, không đi qua ctx thật. Sửa bằng `ctx.reflect.get('tools', false)` — đúng
+    API cordis tài liệu hoá cho "đọc service không cần inject", trả `undefined` thay vì ném.
+    (Không dùng `inject: ['tools']`: dạng mảng của cordis khiến service thành **bắt buộc**,
+    bridge sẽ không mount nổi trên host không có tool registry.)
+
+    Cùng lúc sửa lỗi thứ hai cùng chỗ: registry đọc **một lần lúc boot** nên plugin mount
+    sau bridge vĩnh viễn vô hình. Đổi sang **resolver gọi mỗi request** — hợp với việc mỗi
+    HTTP request đã dựng một `McpServer` mới.
+
+    **(4) Tài liệu nói quá về phạm vi mirror.** Sau khi sửa, đo trên engine thật: **6 tool**
+    (`memory_*`), không phải LSP/todo/plan như mục 41 viết. Nguyên nhân kiến trúc:
+    `schemas()` không-scope chỉ trả **layer global**; tool của agent nằm trong scope của
+    từng preset. Đã sửa cả docs lẫn comment trong module cho khớp sự thật đo được thay vì
+    để lại lời hứa sai — `harness_start` vẫn là đường tới nhóm tool đó.
+
+    **Live sau khi sửa**: 134 action (128 + 6 mirror), `subagent_providers` khớp đúng trạng
+    thái thật của cả 4 CLI, không còn `jq: parse error` lúc khởi động. 479 bridge test.
+
 ## Lộ trình còn lại (thứ tự cập nhật 2026-09-03)
 
 ### ~~P0 — Harness workspace support~~ ✅ làm xong 2026-09-03 (mục 22)

@@ -45,6 +45,7 @@ node_modules/
 /hachimi-dual-lane-live/
 /live-b*.json
 /current-screen*.png
+/tmp/
 
 # The runtime copy the profile used to pin: generated, and pinning it froze the
 # bridge at whatever was copied. The profile now loads bridge/src directly.

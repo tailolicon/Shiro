@@ -1,6 +1,6 @@
 # Shiro connector — direct actions và Harness agent
 
-Tài liệu này mô tả bề mặt MCP mà connector Shiro cung cấp cho ChatGPT: **128 action** (cộng thêm mọi tool plugin DSH đang mount, xem "Kho plugin DSH")
+Tài liệu này mô tả bề mặt MCP mà connector Shiro cung cấp cho ChatGPT: **128 action** (cộng thêm tool plugin DSH đăng ký ở layer global, xem "Kho plugin DSH" — trên máy tham chiếu là 134)
 chia theo họ, quy ước schema/lỗi/phân trang, và ranh giới an toàn của từng nhóm.
 
 ## Direct Actions vs Harness Agent
@@ -136,10 +136,16 @@ bật lại. Muốn giữ lại lớp phanh này (một client không tin cậy,
 ## Kho plugin DSH — Shiro không có bề mặt cố định
 
 ChatGPT Web không có khái niệm "skill" như Codex. Điều nó *có*, một khi đang nói chuyện với
-Shiro, là một engine (DeepSeek Harness) đã mount sẵn một kho plugin lớn — LSP, todo/plan,
-subagent, skill, web fetch, schedule, MCP client — nhưng trước đây kho đó chỉ với tới được
-**từ bên trong một agent turn**: model dùng được trong lúc Shiro tự chạy vòng lặp, còn
-ChatGPT (đóng vai model qua MCP) thì không.
+Shiro, là một engine (DeepSeek Harness) đã mount sẵn nhiều plugin — nhưng trước đây kho đó
+chỉ với tới được **từ bên trong một agent turn**: model dùng được trong lúc Shiro tự chạy
+vòng lặp, còn ChatGPT (đóng vai model qua MCP) thì không.
+
+**Phạm vi thật, đo trên máy đang chạy:** engine đăng ký tool theo *layer*. Mirror lấy
+được **layer global** — nơi plugin cấp deployment đăng ký (hiện tại: 6 tool `memory_*` của
+`@shiro-ai/dsh-memory`). Tool của agent (`fs`, `bash`, LSP, todo/plan, subagent…) nằm trong
+**scope của từng agent preset**, không phải global, nên `schemas()` không-scope không thấy
+chúng — đúng thiết kế: chúng sinh ra để chạy trong vòng lặp agent với một session sống, và
+`harness_start` vẫn là đường tới chúng. Đây là giới hạn kiến trúc đã đo, không phải bug.
 
 Bridge giải quyết bằng cách **soi gương** (`bridge/src/engine-tools.js`): mỗi tool trong
 `ctx.tools.schemas()` của engine trở thành một MCP tool ngang hàng với `fs_read`, `git_status`

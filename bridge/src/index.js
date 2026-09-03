@@ -2086,7 +2086,11 @@ export function configureMcp(server, controller, config, fleetManager = null, ru
   // bridge action names and a plugin can never shadow one. The rows are pushed
   // into the same registry bridge_capabilities reads, which is why a mirrored
   // tool is discoverable and gated exactly like a native action.
-  const engineTools = runtime.engineTools ?? null
+  // Resolved per MCP request, not once at boot: a fresh McpServer is built for
+  // every request, so a lazily-read registry naturally picks up tool plugins
+  // that mounted after the bridge did. Reading it once at startup silently
+  // froze the mirror at whatever existed in that instant.
+  const engineTools = typeof runtime.engineTools === 'function' ? runtime.engineTools() : (runtime.engineTools ?? null)
   if (engineTools !== null) {
     registerEngineTools(server, {
       tools: engineTools,
@@ -2153,9 +2157,11 @@ function startHttpServer(ctx, broker, config, fleetManager) {
     // bridge unmounted on a host without one. Absent, Confinement refuses
     // narrowed modes instead of pretending to enforce them.
     sandboxProvider: sandboxProviderOf(ctx),
-    // The engine's own tool registry. Mirroring it is what gives ChatGPT the
-    // DSH plugin library directly, instead of only inside an agent turn.
-    engineTools: engineToolsOf(ctx),
+    // The engine's own tool registry, as a RESOLVER rather than a value:
+    // configureMcp calls it per request, so plugins mounted after the bridge
+    // still get mirrored. Mirroring it is what gives ChatGPT the DSH plugin
+    // library directly, instead of only inside an agent turn.
+    engineTools: () => engineToolsOf(ctx),
     // Bridge-lifetime: the designation and the nudge budget must survive across
     // MCP requests, which each build a fresh server.
     continuation: fleetManager === null ? null : new ContinuationWatchdog({

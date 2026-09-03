@@ -286,10 +286,15 @@ if [[ "$open_browser" -eq 1 && "$clients" -lt 1 ]]; then
   done
   if [[ "$clients" -lt 1 ]]; then
     echo "Connect the extension once at http://127.0.0.1:$relay_port/setup"
-    xdg-open "http://127.0.0.1:$relay_port/setup" >/dev/null 2>&1 &
+    # 9>&- like every other spawn here: xdg-open hands the URL to the user's
+    # own browser, which then INHERITS the startup lock on fd 9 and holds it
+    # for as long as that browser stays open. Observed: a personal Chrome kept
+    # the lock for hours, so every later start died with "Another Shiro startup
+    # is already running" while nothing was running at all.
+    xdg-open "http://127.0.0.1:$relay_port/setup" >/dev/null 2>&1 9>&- &
   fi
 fi
 
 if [[ "$open_ui" -eq 1 ]]; then
-  xdg-open "http://127.0.0.1:$web_port/" >/dev/null 2>&1 &
+  xdg-open "http://127.0.0.1:$web_port/" >/dev/null 2>&1 9>&- &
 fi

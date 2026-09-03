@@ -7,10 +7,17 @@ import { errorResult } from './mcp-result.js'
 //
 // WHY THIS EXISTS
 // ChatGPT Web has no equivalent of Codex's skills. What it does have, once it is
-// talking to Shiro, is an engine with a large plugin surface already mounted --
-// LSP, todo/plan, subagents, skills, web fetch, schedules, MCP clients. Until
-// now that surface was reachable only from INSIDE an agent turn: the model could
-// use it while Shiro drove the loop, but ChatGPT itself could not.
+// talking to Shiro, is an engine with plugins already mounted. Until now that
+// surface was reachable only from INSIDE an agent turn: the model could use it
+// while Shiro drove the loop, but ChatGPT itself could not.
+//
+// SCOPE, measured against a running engine rather than assumed: the engine
+// registers tools in LAYERS. `schemas()` with no scope returns the GLOBAL
+// layer, which is what deployment-level plugins register into -- that is what
+// gets mirrored. An agent's own tools (fs, bash, LSP, todo/plan, subagent) live
+// in per-preset scope layers and are deliberately not visible here: they exist
+// to run inside an agent loop with a live session, and harness_start remains
+// the way to reach them.
 //
 // So the bridge mirrors it. `ctx.tools.schemas()` is the engine's own registry,
 // so the mirrored set is whatever the deployment actually mounts, and it grows
@@ -33,11 +40,35 @@ const LOOP_ONLY = new Set([
   'run_code',
 ])
 
-/** ctx.tools when the host mounts one, null otherwise -- never a throw. */
+/**
+ * The engine's tool registry, or null when the host provides none.
+ *
+ * `ctx.tools` is NOT how to read it: cordis enforces declared injection and
+ * throws `cannot get property "tools" without inject` for anything a plugin
+ * did not list. Catching that throw is what made the mirror silently register
+ * zero tools -- it looked like "no engine here" when the engine was right
+ * there. `ctx.reflect.get(name, strict)` is cordis's own documented way to
+ * read a service without the inject requirement, returning undefined rather
+ * than throwing when it is genuinely absent.
+ *
+ * Injecting `tools` instead would be worse: cordis's array form makes an
+ * injected service REQUIRED, so the whole bridge would stay unmounted on a
+ * host that has no tool registry.
+ */
 export function engineToolsOf(ctx) {
+  const usable = tools => (tools !== null && tools !== undefined
+    && typeof tools.schemas === 'function'
+    && typeof tools.execute === 'function'
+    ? tools
+    : null)
   try {
-    const tools = ctx?.tools ?? null
-    return tools !== null && typeof tools.schemas === 'function' && typeof tools.execute === 'function' ? tools : null
+    // strict=false: accept an implementation whose providing fiber is not
+    // active yet, which is the normal state while plugins are still mounting.
+    const reflected = ctx?.reflect?.get?.('tools', false)
+    if (usable(reflected) !== null) return reflected
+  } catch { /* fall through to the direct read below */ }
+  try {
+    return usable(ctx?.tools ?? null)
   } catch {
     return null
   }
