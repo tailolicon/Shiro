@@ -659,6 +659,41 @@ không chỉ spec của protocol.
     confinement này quản **file effect**, không quản network của tiến trình con — cần egress
     proxy/netns, chưa làm.
 
+47. **"Luôn khởi động khi máy chạy, phải luôn luôn sống" — thay oneshot giả bằng giám sát
+    thật.** Điều tra trước: máy ĐÃ có `shiro.service`, nhưng là `Type=oneshot` chạy
+    `Start-Shiro.sh` — script spawn mọi thứ **detached rồi thoát**, systemd báo "active"
+    vĩnh viễn mà không theo dõi tiến trình nào. Đó chính xác là lý do sự cố mục trước
+    (backend sống, cổng MCP chết) không ai phát hiện: oneshot không phải supervision.
+
+    May là cả ba runner (`Run-Shiro-Backend/Relay/Tunnel.sh`) đều đã là foreground `exec`
+    — đúng hình systemd cần, chỉ thiếu người dùng chúng đúng cách. Bộ unit mới
+    (`Install-Shiro-Service.sh` sinh với path tuyệt đối):
+
+    * `shiro-prepare` (oneshot): deps/token/extension/build — tái dùng chính
+      `Start-Shiro.sh --prepare-only` (flag mới) thay vì nhân bản logic prepare.
+    * `shiro-relay` / `shiro-backend` / `shiro-tunnel` / `shiro-chromium`: mỗi tiến trình
+      một service `Restart=always` + `StartLimitIntervalSec=0`. Tunnel dùng
+      `ConditionPathExists` để **bị bỏ qua sạch sẽ** khi chưa cấu hình, thay vì crash-loop.
+    * `shiro-watchdog.timer` (mỗi phút): check HTTP health thật — tầng systemd không thấy
+      "sống nhưng cổng chết", chỉ HTTP thấy. Hai lần fail liên tiếp mới restart, nên
+      backend vừa (re)start có tối thiểu một phút để boot trước khi bị probe lại.
+    * `shiro.target` `WantedBy=graphical-session.target`: Omarchy autologin vào Hyprland
+      nên bật máy = Shiro lên. PATH của unit dùng **mise shims** thay vì hardcode
+      `node/26.7.0` như unit cũ — unit cũ sẽ gãy ngay lần update Node đầu tiên.
+
+    **Chống hai-supervisor đánh nhau**: `Stop-Shiro.sh` dừng qua target (kill PID tay dưới
+    systemd = restart tức thì, ngược hẳn ý định dừng); `Start-Shiro.sh` phát hiện target
+    đã enable thì uỷ quyền `systemctl start` — guard `SHIRO_SYSTEMD_UNIT=1` để prepare-unit
+    gọi lại chính script không đệ quy. `Reload-Shiro.sh` cho ca "cập nhật chức năng":
+    prepare → restart relay+backend, **cố ý không** restart cả target vì thế sẽ giết
+    Chromium và toàn bộ fleet tab cho một lần đổi code không đụng browser.
+
+    **Kiểm chứng trên máy thật, không phải trên giấy**: `kill -9` backend → NRestarts=1,
+    health trở lại sau ~14s; `kill -9` relay → tương tự; watchdog chạy tay cả hai nhánh
+    (khoẻ = im lặng, giả lập cổng chết bằng `SHIRO_BRIDGE_PORT=23999` hai lần → restart
+    đúng như thiết kế); Stop → cả ba unit `inactive` và **đứng yên** sau 6s; Start uỷ quyền
+    OK; Reload `--backend-only` OK; bề mặt sống lại đủ 143 action + 15 plugin mirror.
+
 ## Lộ trình còn lại (thứ tự cập nhật 2026-09-03)
 
 ### ~~P0 — Harness workspace support~~ ✅ làm xong 2026-09-03 (mục 22)

@@ -6,6 +6,15 @@ repo_root="$(cd -- "$script_dir/.." && pwd)"
 runtime_root="$(cd -- "$repo_root/.." && pwd)/.ShiroRuntime"
 state_root="$runtime_root/state"
 
+# Under systemd management, killing PIDs by hand is how you get an instant
+# supervised restart -- the opposite of stopping. Stop the target instead; the
+# legacy sweep below still runs afterwards to catch strays from before the
+# migration (old PID files, a manually started chromium profile).
+if systemctl --user is-enabled shiro.target >/dev/null 2>&1; then
+  echo 'Stopping systemd-managed Shiro (shiro.target)...'
+  systemctl --user stop shiro.target
+fi
+
 stop_registered() {
   local name="$1"
   local pid_file="$2"

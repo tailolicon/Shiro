@@ -43,6 +43,7 @@ node_modules/
 /hachimi-tl-vi/
 /hachimi-throughput-fix/
 /hachimi-dual-lane-live/
+/hachimi-guard-run/
 /aiko-validation/
 /aiko-validation2/
 /live-b*.json
@@ -52,3 +53,6 @@ node_modules/
 # The runtime copy the profile used to pin: generated, and pinning it froze the
 # bridge at whatever was copied. The profile now loads bridge/src directly.
 bridge/.runtime-live/
+
+# Python bytecode from the stdlib SDK's own test runs
+__pycache__/

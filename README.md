@@ -14,6 +14,31 @@ Giao diện web cục bộ có launcher native trên Omarchy và có thể đư�
 - `research/awesome-dsh-plugin/`: snapshot catalog đã ghim để Shiro tự nghiên cứu bên trong project root; catalog không được thực thi.
 - `scripts/`: cài đặt, khởi động, dừng, mở tunnel và build desktop app.
 
+## Vận hành trên Omarchy: systemd giám sát, luôn sống
+
+`scripts/Install-Shiro-Service.sh` (một lần, hoặc `npm run service:install`) cài Shiro thành
+một bộ systemd user unit **giám sát từng tiến trình**: relay, backend, tunnel và Chromium
+fleet mỗi cái một service `Restart=always` + `StartLimitIntervalSec=0` — chết là dậy lại,
+không bao giờ bỏ cuộc. `shiro.target` gắn vào `graphical-session.target`, mà Omarchy
+autologin thẳng vào Hyprland, nên **bật máy là Shiro tự lên**. Một watchdog timer chạy mỗi
+phút kiểm tra HTTP health thật — bắt cả ca "tiến trình còn sống nhưng cổng chết" mà
+process-supervision không thấy (hai lần fail liên tiếp mới restart, để không đánh nhầm lúc
+đang khởi động).
+
+Ba thao tác hằng ngày:
+
+```bash
+npm run reload:linux
+```
+
+- **Cập nhật code** → `Reload-Shiro.sh` (lệnh trên): chạy lại prepare, restart relay +
+  backend, **giữ nguyên Chromium** nên fleet tab không chết theo một lần đổi code.
+  `--backend-only` khi chỉ sửa bridge/engine; `--rebuild` khi cần build lại engine.
+- **Dừng chủ ý** → `Stop-Shiro.sh`: dừng qua `shiro.target` nên không có chuyện supervisor
+  dựng lại thứ bạn vừa tắt.
+- **Bật tay** → `Start-Shiro.sh`: tự phát hiện systemd đã quản lý và uỷ quyền cho
+  `systemctl`, không bao giờ tạo bản sao không giám sát thứ hai.
+
 ## Effort và speed
 
 Shiro không còn dùng một nhãn `ChatGPT Web` mơ hồ. Model selector của giao diện local có ba profile:

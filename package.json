@@ -10,6 +10,8 @@
     "start": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/Start-Shiro.ps1",
     "start:linux": "bash scripts/Start-Shiro.sh",
     "stop:linux": "bash scripts/Stop-Shiro.sh",
+    "reload:linux": "bash scripts/Reload-Shiro.sh",
+    "service:install": "bash scripts/Install-Shiro-Service.sh",
     "tunnel:install": "bash scripts/Install-Shiro-Tunnel-Client.sh",
     "tunnel:linux": "bash scripts/Start-Shiro-Tunnel.sh",
     "install:omarchy": "bash scripts/Install-Shiro-Omarchy.sh",

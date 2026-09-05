@@ -8,6 +8,7 @@ web_port=3080
 mcp_port=23157
 relay_port=23158
 rebuild=0
+prepare_only=0
 open_ui=1
 open_browser=1
 original_args=("$@")
@@ -20,6 +21,7 @@ Usage: Start-Shiro.sh [options]
   --web-port PORT      DSH web UI port (default: 3080)
   --mcp-port PORT      Shiro MCP/health port (default: 23157)
   --rebuild            Rebuild the DSH engine
+  --prepare-only       Prepare the runtime (deps, tokens, extension, build) and exit
   --no-open            Do not open the Shiro UI after startup
   --no-browser         Do not start the dedicated ChatGPT Chromium profile
   -h, --help           Show this help
@@ -32,6 +34,7 @@ while [[ $# -gt 0 ]]; do
     --web-port) web_port="${2:?--web-port needs a value}"; shift 2 ;;
     --mcp-port) mcp_port="${2:?--mcp-port needs a value}"; shift 2 ;;
     --rebuild) rebuild=1; shift ;;
+    --prepare-only) prepare_only=1; shift ;;
     --no-open) open_ui=0; shift ;;
     --no-browser) open_browser=0; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -40,6 +43,30 @@ while [[ $# -gt 0 ]]; do
 done
 
 project_root="$(realpath -- "$project_root")"
+
+# When the systemd units are installed, they are the one supervisor: starting
+# the stack by hand again would create a second, unsupervised copy of every
+# process. The units themselves call this script with --prepare-only and set
+# SHIRO_SYSTEMD_UNIT=1, which must not recurse back into systemctl.
+if [[ "${SHIRO_SYSTEMD_UNIT:-0}" != 1 && "$prepare_only" -eq 0 ]] \
+  && systemctl --user is-enabled shiro.target >/dev/null 2>&1; then
+  [[ "$rebuild" -eq 1 ]] && rm -f -- "$repo_root/engine/.shiro-build-ready"
+  echo 'Shiro is systemd-managed; starting shiro.target...'
+  systemctl --user start shiro.target
+  for _ in {1..180}; do
+    curl --fail --silent --max-time 2 "http://127.0.0.1:$mcp_port/health" >/dev/null 2>&1 && break
+    sleep 0.5
+  done
+  if curl --fail --silent --max-time 2 "http://127.0.0.1:$mcp_port/health" >/dev/null 2>&1; then
+    echo "Shiro is ready: http://127.0.0.1:$web_port/"
+  else
+    echo 'Shiro units started but the bridge is not answering yet; check: systemctl --user status shiro-backend' >&2
+  fi
+  if [[ "$open_ui" -eq 1 ]]; then
+    xdg-open "http://127.0.0.1:$web_port/" >/dev/null 2>&1 &
+  fi
+  exit 0
+fi
 runtime_root="$(cd -- "$repo_root/.." && pwd)/.ShiroRuntime"
 state_root="$runtime_root/state"
 log_root="$runtime_root/logs"
@@ -134,6 +161,11 @@ if [[ "$rebuild" -eq 1 || ! -f "$build_marker" ]]; then
   echo 'Building the Shiro engine...'
   DSH_CLIENT_TITLE=Shiro pnpm --dir "$repo_root/engine" build
   date --iso-8601=seconds >"$build_marker"
+fi
+
+if [[ "$prepare_only" -eq 1 ]]; then
+  echo 'Shiro runtime is prepared.'
+  exit 0
 fi
 
 relay_health() {
