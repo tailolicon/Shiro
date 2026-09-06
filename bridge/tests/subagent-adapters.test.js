@@ -56,16 +56,21 @@ test('claude: resume_from becomes --resume, model becomes --model', () => {
   assert.deepEqual(argv, ['-p', 'now add tests', '--output-format', 'json', '--permission-mode', 'acceptEdits', '--resume', 'c636b664-cf0f-427e-beaa-e2353be987df', '--model', 'opus'])
 })
 
-test('claude: bypassPermissions is refused with the exact unlock command, not silently dropped', () => {
-  assert.throws(() => SUBAGENT_ADAPTERS.claude.buildArgv({ prompt: 'x', permissionMode: 'bypassPermissions' }), error => {
-    assert.equal(error.code, 'PERMISSION_REQUIRED')
-    assert.match(error.message, /claude --dangerously-skip-permissions/)
-    return true
-  })
-  // The boolean escape hatch maps to the same gated mode for claude, and is
-  // refused the same way rather than silently taking a different, ungated path.
-  assert.throws(() => SUBAGENT_ADAPTERS.claude.buildArgv({ prompt: 'x', dangerouslySkipPermissions: true }), error => error.code === 'PERMISSION_REQUIRED')
-  // Any other mode passes straight through -- only the disclaimer-gated one is blocked.
+test('claude: bypassPermissions passes through -- the CLI, not Shiro, enforces its disclaimer', () => {
+  // History: an earlier hard block here promised "unlock once and it works"
+  // while refusing unconditionally, so the operator's real unlock (verified
+  // live on this machine) could never take effect through Shiro. The CLI is
+  // the authority on its own gate; an un-unlocked machine gets the CLI's own
+  // refusal, verbatim, in subagent_status.
+  assert.deepEqual(
+    SUBAGENT_ADAPTERS.claude.buildArgv({ prompt: 'x', permissionMode: 'bypassPermissions' }).slice(-2),
+    ['--permission-mode', 'bypassPermissions'],
+  )
+  // The boolean escape hatch maps to the same canonical mode.
+  assert.deepEqual(
+    SUBAGENT_ADAPTERS.claude.buildArgv({ prompt: 'x', dangerouslySkipPermissions: true }).slice(-2),
+    ['--permission-mode', 'bypassPermissions'],
+  )
   assert.deepEqual(
     SUBAGENT_ADAPTERS.claude.buildArgv({ prompt: 'x', permissionMode: 'dontAsk' }).slice(-2),
     ['--permission-mode', 'dontAsk'],
@@ -151,9 +156,12 @@ test('codex: turn.failed or a top-level error event ends the turn as failed', ()
 
 // -- grok and antigravity: unverified, must degrade rather than assume ----
 
-test('grok: argv construction mirrors claude\'s shape, same disclaimer refusal', () => {
+test('grok: argv construction mirrors claude\'s shape, bypass passed through the same way', () => {
   assert.deepEqual(SUBAGENT_ADAPTERS.grok.buildArgv({ prompt: 'x' }), ['-p', 'x', '--output-format', 'json'])
-  assert.throws(() => SUBAGENT_ADAPTERS.grok.buildArgv({ prompt: 'x', permissionMode: 'bypassPermissions' }), error => error.code === 'PERMISSION_REQUIRED')
+  assert.deepEqual(
+    SUBAGENT_ADAPTERS.grok.buildArgv({ prompt: 'x', dangerouslySkipPermissions: true }).slice(-2),
+    ['--permission-mode', 'bypassPermissions'],
+  )
   assert.deepEqual(
     SUBAGENT_ADAPTERS.grok.buildArgv({ prompt: 'x', resumeFrom: 'sess-1' }),
     ['-p', 'x', '--output-format', 'json', '--resume', 'sess-1'],

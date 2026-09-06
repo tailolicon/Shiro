@@ -1218,7 +1218,7 @@ export function registerDirectActions(server, options) {
     family: 'subagent',
     workspaceScoped: true,
     title: 'Dispatch a real coding-agent CLI as a sub-agent',
-    description: `Runs claude, codex, grok or antigravity headlessly as a bridge-owned background process -- its own full agent loop, its own tool use, under its own account and sandbox, working in this workspace. Returns immediately with a process_id; poll subagent_status or subagent_log for the result, the way you would with process_start. Pass resume_from (a prior process_id, or a raw thread/session id) to continue that CLI's own conversation instead of starting fresh. dangerously_skip_permissions maps to each CLI's own full-bypass flag; for claude and grok that mode is gated behind a one-time interactive disclaimer Shiro will not script past, and the refusal names the exact command to run once, yourself, to unlock it. grok and antigravity are ${SUBAGENT_ADAPTERS.grok.unverified ? 'unverified on this deployment' : 'verified'} -- see subagent_providers.`,
+    description: `Runs claude, codex, grok or antigravity headlessly as a bridge-owned background process -- its own full agent loop, its own tool use, under its own account and sandbox, working in this workspace. Returns immediately with a process_id; poll subagent_status or subagent_log for the result, the way you would with process_start. Pass resume_from (a prior process_id, or a raw thread/session id) to continue that CLI's own conversation instead of starting fresh. dangerously_skip_permissions maps to each CLI's own full-bypass mode; where a CLI gates that behind a one-time interactive disclaimer (claude does), the CLI's own refusal -- naming its own unlock step -- surfaces in subagent_status, and Shiro never answers that dialog itself. grok and antigravity are ${SUBAGENT_ADAPTERS.grok.unverified ? 'unverified on this deployment' : 'verified'} -- see subagent_providers.`,
     input: {
       agent: z.enum(Object.keys(SUBAGENT_ADAPTERS)),
       prompt: z.string().min(1).max(50_000),
@@ -1227,7 +1227,7 @@ export function registerDirectActions(server, options) {
       model: z.string().optional(),
       permission_mode: z.string().optional().describe('Passed through to the CLI (claude/grok: --permission-mode; antigravity: --mode). bypassPermissions is refused -- see dangerously_skip_permissions.'),
       sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional().describe('codex only: its own --sandbox. Default workspace-write.'),
-      dangerously_skip_permissions: z.boolean().optional().describe('Full bypass of the CLI\'s own tool-approval. codex/antigravity: applied directly. claude/grok: refused with PERMISSION_REQUIRED naming the one-time interactive command that unlocks it.'),
+      dangerously_skip_permissions: z.boolean().optional().describe('Full bypass of the CLI\'s own tool-approval, via its own flag/mode. If the CLI gates this behind a one-time disclaimer that was never accepted on this machine, its own refusal shows up in subagent_status.'),
     },
     output: SUBAGENT_SHAPE,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },

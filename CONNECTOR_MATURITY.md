@@ -694,6 +694,24 @@ không chỉ spec của protocol.
     đúng như thiết kế); Stop → cả ba unit `inactive` và **đứng yên** sau 6s; Start uỷ quyền
     OK; Reload `--backend-only` OK; bề mặt sống lại đủ 143 action + 15 plugin mirror.
 
+48. **Mở khoá bypassPermissions cho subagent Claude — và gỡ một hard-block tự mâu thuẫn.**
+    Người vận hành yêu cầu chạy `claude --dangerously-skip-permissions` trong đúng môi
+    trường Shiro. Chạy qua chính họ `terminal_*` của Shiro (PTY spawn từ backend): Claude
+    Code v2.1.261 vào thẳng REPL với "bypass permissions on" — **disclaimer đã được chấp
+    nhận sẵn** trên user này từ trước, không có hộp thoại nào để trả lời. Verify bằng đúng
+    lệnh từng bị từ chối (`--bg` + `bypassPermissions`): chạy được.
+
+    Việc đó lộ ra mâu thuẫn trong adapter của mục 42: `blockDisclaimerGatedMode` hứa
+    "unlock một lần rồi mode này dùng được từ đây" nhưng **chặn vô điều kiện** — unlock
+    thật không bao giờ có tác dụng qua Shiro. Gỡ block: mode đi thẳng xuống CLI, vì CLI
+    mới là chủ cổng của chính nó — máy chưa unlock thì lời từ chối *của CLI* (kèm hướng
+    dẫn unlock của nó) hiện nguyên văn trong `subagent_status`. Lập trường không đổi:
+    Shiro **không bao giờ tự trả lời** hộp thoại disclaimer; con người đã trả lời nó.
+
+    Chứng minh end-to-end qua Shiro: `subagent_start({agent: claude,
+    dangerously_skip_permissions: true})` → argv mang `--permission-mode bypassPermissions`,
+    turn chạy thật, `turn_success: true`, message đúng. 490 test.
+
 ## Lộ trình còn lại (thứ tự cập nhật 2026-09-03)
 
 ### ~~P0 — Harness workspace support~~ ✅ làm xong 2026-09-03 (mục 22)

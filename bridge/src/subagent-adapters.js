@@ -13,24 +13,18 @@
 // carried through to bridge_capabilities so a caller is told, not left to
 // find out the hard way.
 //
-// THE ONE-TIME DISCLAIMER, NOT BYPASSED
-// Both claude and grok name a `bypassPermissions` mode that Anthropic/xAI gate
-// behind an interactive one-time acceptance (`claude --dangerously-skip-permissions`
-// run once, by a person, in a real terminal). Shiro will not script past that:
-// requesting it here fails with the exact command to run instead. codex's and
-// antigravity's bypass flags carry no such gate and are passed through as
-// asked, because there is nothing here to circumvent.
+// THE ONE-TIME DISCLAIMER: ENFORCED BY THE CLI, NEVER ACCEPTED BY SHIRO
+// claude (and possibly grok) gate their bypass mode behind a one-time
+// interactive acceptance. Shiro's stance is unchanged -- it never answers that
+// dialog itself -- but it no longer pre-blocks the request either: an earlier
+// hard block here claimed "run the unlock once and this works", while the code
+// refused unconditionally, so the unlock could never take effect through
+// Shiro. The CLI is the authority on its own gate: on a machine where the
+// operator accepted the disclaimer (this one has -- verified live), the mode
+// just works; on one where they have not, the CLI's own refusal, naming its
+// own unlock command, surfaces verbatim in subagent_status/subagent_log.
 
 import { fail } from './action-errors.js'
-
-const CLAUDE_BLOCKED_MODES = new Set(['bypassPermissions'])
-const GROK_BLOCKED_MODES = new Set(['bypassPermissions'])
-
-function blockDisclaimerGatedMode(mode, blocked, unlockCommand) {
-  if (mode !== undefined && blocked.has(mode)) {
-    fail('PERMISSION_REQUIRED', `permission_mode "${mode}" needs a one-time interactive disclaimer Shiro will not script past: run "${unlockCommand}" yourself once, in a real terminal, then this mode works from here.`)
-  }
-}
 
 /** First JSON value in text that parses, scanning from the end -- the CLI's own trailing noise (a stray log line) must not hide a valid final result. */
 function lastJsonObject(text) {
@@ -110,9 +104,7 @@ const claude = {
   unlockCommand: 'claude --dangerously-skip-permissions',
 
   buildArgv({ prompt, resumeFrom, model, permissionMode, dangerouslySkipPermissions }) {
-    if (dangerouslySkipPermissions === true) blockDisclaimerGatedMode('bypassPermissions', CLAUDE_BLOCKED_MODES, this.unlockCommand)
-    blockDisclaimerGatedMode(permissionMode, CLAUDE_BLOCKED_MODES, this.unlockCommand)
-    const mode = permissionMode ?? this.defaultPermissionMode
+    const mode = dangerouslySkipPermissions === true ? 'bypassPermissions' : (permissionMode ?? this.defaultPermissionMode)
     const argv = ['-p', prompt, '--output-format', 'json']
     if (mode !== undefined) argv.push('--permission-mode', mode)
     if (typeof resumeFrom === 'string' && resumeFrom !== '') argv.push('--resume', resumeFrom)
@@ -225,10 +217,9 @@ const grok = {
   unlockCommand: 'grok --permission-mode bypassPermissions (interactively, once)',
 
   buildArgv({ prompt, resumeFrom, model, permissionMode, dangerouslySkipPermissions }) {
-    if (dangerouslySkipPermissions === true) blockDisclaimerGatedMode('bypassPermissions', GROK_BLOCKED_MODES, this.unlockCommand)
-    blockDisclaimerGatedMode(permissionMode, GROK_BLOCKED_MODES, this.unlockCommand)
+    const mode = dangerouslySkipPermissions === true ? 'bypassPermissions' : permissionMode
     const argv = ['-p', prompt, '--output-format', 'json']
-    if (permissionMode !== undefined) argv.push('--permission-mode', permissionMode)
+    if (mode !== undefined) argv.push('--permission-mode', mode)
     if (typeof resumeFrom === 'string' && resumeFrom !== '') argv.push('--resume', resumeFrom)
     if (typeof model === 'string' && model !== '') argv.push('-m', model)
     return argv
