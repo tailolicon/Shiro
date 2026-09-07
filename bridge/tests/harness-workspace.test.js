@@ -81,6 +81,7 @@ function fixture() {
     model: 'gpt-5.6-sol',
     waitMs: 0,
     maxConcurrentTurns: 4,
+    sessionStatePath: ':memory:',
     workspaceRoot: PROJECT_ROOT,
   })
   return { controller, createdWorkspaces, createdSessions, cancellations, emit }

@@ -59,7 +59,7 @@ Cách này chỉ được dùng khi Shiro chứng minh được thread vẫn kh�
 
 ### Connector actions: direct action trước, Harness sau
 
-Connector Shiro lộ **130 action** cho ChatGPT (trước đây là 12, rồi 74, rồi 118, rồi 122, rồi 128). Việc thường ngày —
+Connector Shiro lộ **131 action** cho ChatGPT (trước đây là 12, rồi 74, rồi 118, rồi 122, rồi 128). Việc thường ngày —
 đọc file, xem `git status`, chạy test, bật dev server, đổi lịch một fleet — là
 **một action, một lượt MCP, không gọi LLM và không tạo durable session**. `harness_start`
 vẫn là đường duy nhất cho công việc lập trình thật sự cần suy luận.
@@ -264,3 +264,5 @@ Script tự đọc URL và API token từ `.ShiroRuntime/state/chatgpt-relay.env
 ## Nguồn mở
 
 Shiro tích hợp DeepSeek Harness theo giấy phép MIT và dùng Pake để tạo desktop shell. Xem `THIRD_PARTY.md` và các file giấy phép đi kèm từng thành phần.
+
+Durable session ownership, browser bindings, and conservative restart recovery are documented in [Astra runtime foundation](docs/ASTRA_RUNTIME.md). Inspect them through the read-only `session_runtime_status` action.

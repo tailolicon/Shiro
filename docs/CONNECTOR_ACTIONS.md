@@ -1,6 +1,6 @@
 # Shiro connector — direct actions và Harness agent
 
-Tài liệu này mô tả bề mặt MCP mà connector Shiro cung cấp cho ChatGPT: **130 action** (cộng thêm tool plugin DSH đăng ký ở layer global; tổng cuối cùng phụ thuộc các plugin đang bật, xem "Kho plugin DSH")
+Tài liệu này mô tả bề mặt MCP mà connector Shiro cung cấp cho ChatGPT: **131 action** (cộng thêm tool plugin DSH đăng ký ở layer global; tổng cuối cùng phụ thuộc các plugin đang bật, xem "Kho plugin DSH")
 chia theo họ, quy ước schema/lỗi/phân trang, và ranh giới an toàn của từng nhóm.
 
 ## Direct Actions vs Harness Agent
@@ -792,3 +792,7 @@ turn rồi treo chờ người khác trả lời — nên nó không tồn tại
 | Terminal render toàn màn hình | `terminal_read` dựng lại output **theo dòng** (đủ cho REPL/prompt/installer). Emulator màn hình 2 chiều là một hệ thống khác hẳn; TUI hiện thành nhiều lần repaint, và `raw: true` luôn trả bytes gốc. |
 
 `bridge_capabilities.unsupported[]` trả lại đúng danh sách này lúc chạy.
+
+### Durable runtime inspection
+
+`session_runtime_status({session_id, workspace?})` reads a safe, redacted projection of Shiro-owned durable runtime: loop ownership, canonical workspace identity/current alias, lease/fence state, recovery, browser binding metadata, requested/verified model and reasoning, operation states/checkpoints, and effect states. It deliberately excludes raw operation data, assistant completion text, effect arguments and receipts, and it never resumes a turn. See [Astra runtime foundation](ASTRA_RUNTIME.md) for lease/fencing, paged recovery proof, cancellation semantics, storage configuration, and recovery limits.

@@ -537,6 +537,8 @@ export function registerDirectActions(server, options) {
       harness_workspaces: true,
       thread_events: true,
       turn_steer: true,
+      session_runtime_status: true,
+      durable_session_kernel: controller.runtime?.kernel?.path !== ':memory:' && !!controller.runtime?.kernel && !controller.runtime?.error,
       thread_fork: controller.canFork?.() === true,
       thread_archive: true,
       git: true,
@@ -2111,7 +2113,7 @@ export function registerDirectActions(server, options) {
     title: 'List Shiro root turns',
     description: 'Lists the root turns this bridge has registered in one workspace, newest first, with status, session id and pending counts. Scoped by workspace, and scoped by default: omitting workspace lists the fixed project root, never every workspace at once. Deterministic control-plane read: it inspects bridge state only and never contacts the engine or a model. Use harness_status to wait on a turn, harness_operation_get for one turn in full.',
     input: {
-      status: z.enum(['running', 'completed', 'failed', 'cancelled']).optional(),
+      status: z.enum(['running', 'completed', 'failed', 'cancelled', 'interrupted']).optional(),
       workspace: workspaceField(),
       limit: z.number().int().min(1).max(100).optional(),
     },
@@ -2124,7 +2126,11 @@ export function registerDirectActions(server, options) {
       ...truncationShape,
     },
     annotations: READ_ONLY,
-  }, args => controller.operationList({ ...args, workspace: harnessWorkspace(args) }))
+  }, async args => {
+    const workspace = harnessWorkspace(args)
+    await controller.ensureRuntimeWorkspace?.(workspace)
+    return controller.operationList({ ...args, workspace })
+  })
 
   define('harness_operation_get', {
     family: 'harness',
@@ -2148,7 +2154,11 @@ export function registerDirectActions(server, options) {
       sessions: z.array(z.string()).optional(),
     },
     annotations: READ_ONLY,
-  }, args => controller.operationGet(args.operation_id, harnessWorkspace(args)))
+  }, async args => {
+    const workspace = harnessWorkspace(args)
+    await controller.ensureRuntimeWorkspace?.(workspace)
+    return controller.operationGet(args.operation_id, workspace)
+  })
 
   define('harness_session_get', {
     family: 'harness',

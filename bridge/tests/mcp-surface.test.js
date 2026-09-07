@@ -7,6 +7,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { BridgeBroker, configureMcp } from '../src/index.js'
+import { publicSessionStatus } from '../src/session-status.js'
 
 async function withMcp(controller, workspaceRoot, run, fleetManager = null) {
   const server = new McpServer({ name: 'shiro-mcp-test', version: '0.0.0' })
@@ -308,4 +309,71 @@ test('configureMcp exposes a mature keyless protocol surface', async () => {
   } finally {
     await rm(root, { recursive: true, force: true })
   }
+})
+
+test('session runtime status is read-only and preserves its structured response through MCP validation', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'shiro-runtime-mcp-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const controller = fakeController()
+  controller.runtimeStatus = async (id, workspace) => {
+    assert.equal(id, 'session-test')
+    assert.equal(workspace.id, 'project')
+    return { session_id: id, runtime_mode: 'web-harness', loop_owner: 'harness', requested_model: 'Astra', verified_model: null, recovery_state: 'interrupted-unverified', effects: [] }
+  }
+  await withMcp(controller, root, async client => {
+    const tool = toolByName(await client.listTools(), 'session_runtime_status')
+    assert.equal(tool.annotations.readOnlyHint, true)
+    const result = await client.callTool({ name: 'session_runtime_status', arguments: { session_id: 'session-test' } })
+    assert.notEqual(result.isError, true)
+    assert.equal(result.structuredContent.runtime.requested_model, 'Astra')
+    assert.equal(result.structuredContent.runtime.verified_model, null)
+    assert.equal(result.structuredContent.runtime.recovery_state, 'interrupted-unverified')
+  })
+})
+
+
+test('session runtime status exposes only an allowlisted redacted public projection', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'shiro-runtime-secrets-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const controller = fakeController()
+  const bearer = 'Bearer abcdefghijklmnopqrstuvwxyz123456'
+  const apiKey = 'sk-abcdefghijklmnopqrstuvwxyz123456'
+  const privateKey = '-----BEGIN PRIVATE KEY-----\nVERYSECRETKEYMATERIAL\n-----END PRIVATE KEY-----'
+  const credentialUrl = 'https://alice:supersecret@example.com/c/thread?access_token=token-secret#frag'
+  controller.runtimeStatus = async () => publicSessionStatus({
+    session_id: 'session-test', runtime_mode: 'web-harness', loop_owner: 'harness',
+    workspace_id: 'root:stable', workspace_root: root,
+    requested_model: `model ${bearer}`, verified_model: apiKey,
+    requested_effort: 'high', verified_effort: privateKey,
+    codex_thread_id: `thread api_key=${apiKey}`, recovery_state: 'interrupted-unverified',
+    last_event_seq: 9, created_at: 1, updated_at: 2,
+    executor_id: 'must-not-leak-executor-id', lease_until: 99, fence: 4,
+    checkpoint: { operation_id: 'operation-test', after_seq: 3 },
+    browser_binding: { client_id: 'client-test', tab_id: 7, conversation_id: 'conversation-test', url: credentialUrl, observed_at: 3,
+      verification_evidence: `secret=${apiKey}` },
+    operations: [{ operation_id: 'operation-test', state: 'interrupted', after_seq: 3, created_at: 1, updated_at: 2,
+      data: { completion: { assistant_text: `${bearer} ${privateKey}` }, raw_secret: apiKey } }],
+    effects: [{ effect_id: 'effect-test', operation_id: 'operation-test', name: 'harness.prompt', state: 'uncertain', created_at: 1, updated_at: 2,
+      arguments: { token: apiKey }, receipt: { error: bearer, url: credentialUrl } }],
+  }, { durable: true, workspace: 'project', now: 10 })
+
+  await withMcp(controller, root, async client => {
+    const result = await client.callTool({ name: 'session_runtime_status', arguments: { session_id: 'session-test' } })
+    assert.notEqual(result.isError, true)
+    const runtime = result.structuredContent.runtime
+    const wire = JSON.stringify({ structured: result.structuredContent, content: result.content })
+    for (const secret of ['abcdefghijklmnopqrstuvwxyz123456', 'supersecret', 'VERYSECRETKEYMATERIAL', 'token-secret', 'alice:supersecret']) {
+      assert.equal(wire.includes(secret), false, `secret survived runtime projection: ${secret}`)
+    }
+    assert.equal(wire.includes('must-not-leak-executor-id'), false)
+    assert.equal(runtime.operations[0].data, undefined)
+    assert.equal(runtime.operations[0].completion, undefined)
+    assert.equal(runtime.effects[0].arguments, undefined)
+    assert.equal(runtime.effects[0].receipt, undefined)
+    assert.equal(runtime.browser_binding.verification_evidence, undefined)
+    assert.equal(runtime.browser_binding.url.includes('alice'), false)
+    assert.equal(runtime.browser_binding.url.includes('access_token'), false)
+    assert.equal(runtime.executor.fence, 4)
+    assert.equal(runtime.operations[0].state, 'interrupted')
+  })
 })

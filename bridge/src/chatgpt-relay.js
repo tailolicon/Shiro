@@ -181,7 +181,14 @@ function extractJson(text) {
     for (const candidate of candidates) {
       const repaired = repair(candidate)
       if (repaired === candidate) continue
-      try { return JSON.parse(repaired) } catch {}
+      let payload
+      try { payload = JSON.parse(repaired) } catch { continue }
+      // A repair anywhere in an executable envelope invalidates the entire
+      // decision, including mixed text/tool replies and legacy tool_calls.
+      if (Array.isArray(payload?.tool_calls) || payload?.blocks?.some?.(block => ['tool_call', 'tool-call'].includes(block?.type))) {
+        throw new RelayError('Executable tool calls require strictly parsed JSON; heuristic repair refused', EMPTY_RESPONSE_CODE)
+      }
+      return payload
     }
   }
   return null
@@ -217,11 +224,16 @@ function normalizeBlocks(payload, rawText, allowedTools) {
     if (block?.type === 'tool_call' || block?.type === 'tool-call') {
       const name = asRequiredString(block.name, `blocks[${index}].name`)
       if (!allowedTools.has(name)) throw new Error(`relay returned unavailable Harness tool: ${name}`)
+      let args = block.arguments
+      if (typeof args === 'string') {
+        try { args = JSON.parse(args) } catch { throw new RelayError('Tool arguments must be strict JSON', EMPTY_RESPONSE_CODE) }
+      }
+      if (!args || typeof args !== 'object' || Array.isArray(args)) throw new RelayError('Tool arguments must be a JSON object', EMPTY_RESPONSE_CODE)
       return {
         type: 'tool_call',
         id: typeof block.id === 'string' && block.id ? block.id : `shiro-tool-${randomUUID()}`,
         name,
-        arguments: block.arguments ?? {},
+        arguments: args,
       }
     }
     if (block?.type === 'reasoning') {
@@ -519,7 +531,8 @@ export class ChatGptBrowserRelay {
   // contents become unknown and the next turn must resend everything fresh.
   #forceFull = false
 
-  constructor({ url, token, model = 'GPT-5.6 Sol', timeoutMs = DEFAULT_TIMEOUT_MS, fetchImpl = fetch, maxThreadTurns, isReservedClient = () => false }) {
+  constructor({ url, token, model = 'GPT-5.6 Sol', timeoutMs = DEFAULT_TIMEOUT_MS, fetchImpl = fetch, maxThreadTurns, isReservedClient = () => false, bindSession = null }) {
+    this.bindSession = bindSession
     this.url = normalizeLoopbackUrl(url)
     this.token = asRequiredString(token, 'relayToken')
     this.model = asRequiredString(model, 'relayModel')
@@ -527,6 +540,29 @@ export class ChatGptBrowserRelay {
     this.fetch = fetchImpl
     this.maxThreadTurns = resolveMaxThreadTurns(maxThreadTurns)
     this.isReservedClient = typeof isReservedClient === 'function' ? isReservedClient : () => false
+  }
+
+  async #recordBinding(request, signal, result = {}) {
+    if (!this.bindSession || !request.session_id) return
+    let binding = { client_id: null, tab_id: null, conversation_id: null, url: null, requested_browser_model: this.model }
+    // Only the relay's selected client is authoritative for routing. Never
+    // infer selection from array order or copy a requested model as verified.
+    try {
+      const health = await this.#healthBody(signal)
+      const clientId = result.clientId ?? health.selectedClientId
+      if (typeof clientId === 'string' && clientId) {
+        binding.client_id = clientId
+        binding.selection_source = result.clientId ? 'response' : 'relay-health'
+        const response = await this.fetch(`${this.url}/browser/clients`, { headers: { authorization: `Bearer ${this.token}` }, signal })
+        if (response.ok) {
+          const body = await response.json()
+          const client = (Array.isArray(body) ? body : body.clients ?? []).find(client => client.id === clientId)
+          if (client) binding = { ...binding, tab_id: client.tabId ?? null, url: client.url ?? null,
+            conversation_id: client.conversationId ?? String(client.url ?? '').match(/\/c\/([^/?#]+)/)?.[1] ?? null }
+        }
+      }
+    } catch { /* Unavailable observations remain explicitly unknown. */ }
+    await this.bindSession(request.session_id, binding)
   }
 
   async #healthBody(signal) {
@@ -789,12 +825,14 @@ export class ChatGptBrowserRelay {
     const timeout = AbortSignal.timeout(this.timeoutMs)
     const combined = signal ? AbortSignal.any([signal, timeout]) : timeout
     const plan = this.#planThread(request)
+    await this.#recordBinding(request, combined)
     const attachments = images.length > 0 ? await this.#uploadImages(images, combined, signal) : undefined
     // From here the prompt may reach the composer; only a committed reply
     // proves what the thread now holds.
     this.#forceFull = true
     const response = await this.#post('/chat', this.#buildBody(request, plan, attachments, false), combined, signal)
     const body = await response.json().catch(() => ({}))
+    await this.#recordBinding(request, combined, body)
     const rawText = String(body.response ?? body.answer ?? '')
     const result = parseReply(rawText, request.tools)
     this.#commitThread(plan, request)
@@ -821,6 +859,7 @@ export class ChatGptBrowserRelay {
     const timeout = AbortSignal.timeout(this.timeoutMs)
     const combined = signal ? AbortSignal.any([signal, timeout]) : timeout
     const plan = this.#planThread(request)
+    await this.#recordBinding(request, combined)
     const attachments = images.length > 0 ? await this.#uploadImages(images, combined, signal) : undefined
     // Same rule as complete(): the thread's contents are unknown until commit.
     this.#forceFull = true
@@ -830,6 +869,7 @@ export class ChatGptBrowserRelay {
     const contentType = response.headers?.get?.('content-type') ?? ''
     if (!contentType.includes('text/event-stream') || body === null || body === undefined || typeof body.getReader !== 'function') {
       const parsed = await response.json().catch(() => null)
+      await this.#recordBinding(request, combined, parsed ?? {})
       const rawText = parsed === null ? '' : String(parsed.response ?? parsed.answer ?? '')
       const result = parseReply(rawText, request.tools)
       this.#commitThread(plan, request)
@@ -885,6 +925,7 @@ export class ChatGptBrowserRelay {
     if (finalResult === undefined) {
       throw new RelayError('ChatGPT browser relay stream ended before a result was received', 'TRANSPORT')
     }
+    await this.#recordBinding(request, combined, finalResult)
     const rawText = String(finalResult.answer ?? '')
     const result = parseReply(rawText, request.tools)
     this.#commitThread(plan, request)

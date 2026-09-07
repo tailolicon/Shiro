@@ -58,7 +58,11 @@
     "src/terminal-actions.js",
     "src/thread-registry.js",
     "src/workspaces.js",
-    "src/worktree-actions.js"
+    "src/worktree-actions.js",
+    "src/session-kernel.js",
+    "src/session-runtime.js",
+    "src/session-recovery.js",
+    "src/session-status.js"
   ],
   "scripts": {
     "test": "node --test tests/*.test.js"
@@ -79,5 +83,8 @@
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
+  },
+  "engines": {
+    "node": ">=22.13.0"
   }
 }
