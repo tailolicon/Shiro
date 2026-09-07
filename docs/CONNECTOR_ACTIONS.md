@@ -1,6 +1,6 @@
 # Shiro connector — direct actions và Harness agent
 
-Tài liệu này mô tả bề mặt MCP mà connector Shiro cung cấp cho ChatGPT: **128 action** (cộng thêm tool plugin DSH đăng ký ở layer global, xem "Kho plugin DSH" — trên máy tham chiếu là 134)
+Tài liệu này mô tả bề mặt MCP mà connector Shiro cung cấp cho ChatGPT: **131 action** (cộng thêm tool plugin DSH đăng ký ở layer global; tổng cuối cùng phụ thuộc các plugin đang bật, xem "Kho plugin DSH")
 chia theo họ, quy ước schema/lỗi/phân trang, và ranh giới an toàn của từng nhóm.
 
 ## Direct Actions vs Harness Agent

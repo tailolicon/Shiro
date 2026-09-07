@@ -19,6 +19,7 @@
     "sdk/shiro.py",
     "src/action-errors.js",
     "src/action-gate.js",
+    "src/action-gap.js",
     "src/artifact-kind.js",
     "src/browser-dom.js",
     "src/browser-navigate.js",

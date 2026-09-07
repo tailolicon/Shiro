@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
@@ -30,6 +30,7 @@ const ORIGINAL_ACTIONS = [
 ]
 
 const DIRECT_ACTIONS = [
+  'report_action_gap', 'action_gap_summary',
   'bridge_status', 'bridge_capabilities', 'session_runtime_status',
   'workspace_list', 'workspace_open', 'workspace_create', 'workspace_close',
   'worktree_create', 'worktree_list', 'worktree_remove', 'worktree_snapshot',
@@ -246,6 +247,48 @@ test('the connector exposes every original action plus the direct-action surface
     assert.equal(status.harness.active_turns, 0)
     assert.equal(status.processes.running, 0)
     assert.equal(status.health.browser_relay, false)
+  })
+})
+
+test('action-gap actions persist locally, aggregate duplicates and expose existing-action hints', async () => {
+  await withConnector(async ({ call, root }) => {
+    const first = await call('report_action_gap', {
+      problem_type: 'missing_action',
+      task: 'Need a simpler way to update one exact string',
+      attempted_actions: ['fs_read', 'exec_run'],
+      current_workaround: 'Use shell text replacement and then inspect the diff.',
+      suggested_action: 'fs_update_file',
+      severity: 'high',
+      estimated_savings_calls: 3,
+      friction: { unnecessary_tool_calls: 3, shell_workarounds: 1 },
+      evidence: ['5 direct calls for one exact replacement'],
+      source_agent: 'surface-test',
+    })
+    assert.equal(first.isError, false, JSON.stringify(first.body))
+    assert.equal(first.body.queued, true)
+    assert.equal(first.body.possible_agent_misuse, true)
+    assert.deepEqual(first.body.existing_action_matches, ['fs_update_file'])
+    assert.equal(first.body.friction_score, 5)
+
+    const second = await call('report_action_gap', {
+      problem_type: 'missing_action',
+      task: 'Exact replacement took a cumbersome path',
+      suggested_action: 'fs_update_file',
+      severity: 'medium',
+      estimated_savings_calls: 1,
+    })
+    assert.equal(second.isError, false, JSON.stringify(second.body))
+    assert.equal(second.body.fingerprint, first.body.fingerprint)
+
+    const summary = await call('action_gap_summary', { min_count: 2 })
+    assert.equal(summary.isError, false, JSON.stringify(summary.body))
+    assert.equal(summary.body.total_reports, 2)
+    assert.equal(summary.body.unique_gaps, 1)
+    assert.equal(summary.body.items[0].count, 2)
+    assert.equal(summary.body.items[0].max_severity, 'high')
+
+    const persisted = await readFile(join(root, '.shiro', 'action-gaps', 'reports.jsonl'), 'utf8')
+    assert.equal(persisted.trim().split('\n').length, 2)
   })
 })
 
