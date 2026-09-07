@@ -30,7 +30,7 @@ const ORIGINAL_ACTIONS = [
 ]
 
 const DIRECT_ACTIONS = [
-  'bridge_status', 'bridge_capabilities',
+  'bridge_status', 'bridge_capabilities', 'session_runtime_status',
   'workspace_list', 'workspace_open', 'workspace_create', 'workspace_close',
   'worktree_create', 'worktree_list', 'worktree_remove', 'worktree_snapshot',
   'worktree_snapshots', 'worktree_restore', 'worktree_handoff', 'worktree_snapshot_drop',

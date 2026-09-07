@@ -1,3 +1,5 @@
+import { canonicalWorkspaceRoot, defaultSessionStatePath } from './session-kernel.js'
+import { SessionRuntime } from './session-runtime.js'
 import { randomUUID, timingSafeEqual } from 'node:crypto'
 import { open, readFile, realpath, stat } from 'node:fs/promises'
 import { createServer } from 'node:http'
@@ -102,6 +104,11 @@ function normalizeConfig(config = {}) {
     permissionProfile,
     permissionRules,
     requireConfirmations,
+    sessionStatePath: config.sessionStatePath ?? process.env.SHIRO_SESSION_STATE_PATH ?? defaultSessionStatePath(),
+    sessionKernel: config.sessionKernel,
+    sessionClock: config.sessionClock,
+    sessionLeaseMs: config.sessionLeaseMs,
+    sessionHeartbeat: config.sessionHeartbeat,
     fleetStateDir: resolve(configuredFleetStateDir || resolve(workspaceRoot, '..', '.ShiroRuntime', 'state', 'fleets')),
     // Service logs live in the runtime directory beside the project root, not
     // inside it; logs_tail reads them through a fixed stream allowlist rather
@@ -635,10 +642,10 @@ async function unwrap(promise, label) {
   return response.result.value
 }
 
-async function history(ctx, sessionId, maxMessages = 100) {
+async function history(ctx, sessionId, maxMessages = 100, beforeSeq) {
   return unwrap(ctx.apiProxy.sessions.history({
     rpcId: rpcId('bridge-history'),
-    payload: { sessionId, maxMessages },
+    payload: { sessionId, maxMessages, ...(beforeSeq === undefined ? {} : { beforeSeq }) },
   }), 'session.history')
 }
 
@@ -685,6 +692,10 @@ export class BridgeController {
     this.startingSessions = new Set()
     this.interactions = new Map()
     this.eventsAbort = new AbortController()
+    this.runtime = new SessionRuntime(config)
+    this.workspaceAliases = new Map([[PRIMARY_WORKSPACE_ID, canonicalWorkspaceRoot(config.workspaceRoot)]])
+    this.runtimeWorkspaces = new Map()
+    this.ready = this.runtime.recover(this, (id, before) => history(this.ctx, id, 100, before), turnCompletion, { id: PRIMARY_WORKSPACE_ID, root: canonicalWorkspaceRoot(config.workspaceRoot) })
     this.eventsTask = this.pumpEvents()
     this.broker.operationProbe = () => this.activeOperations().length > 0
     this.broker.operationResolver = sessionId => {
@@ -695,10 +706,53 @@ export class BridgeController {
     }
   }
 
+  workspaceScope(workspace = {}, register = false) {
+    if (typeof workspace === 'string') workspace = { id: workspace }
+    const id = workspace.id ?? PRIMARY_WORKSPACE_ID
+    const entry = this.workspaceRegistry?.get(id)
+    let root = entry?.path ?? this.workspaceAliases.get(id)
+    if (!entry && id !== PRIMARY_WORKSPACE_ID && register && workspace.root) root = workspace.root
+    if (!root || (workspace.root && canonicalWorkspaceRoot(root) !== canonicalWorkspaceRoot(workspace.root))) {
+      throw Object.assign(new Error('workspace is not open under this root'), { code: 'NOT_FOUND' })
+    }
+    root = canonicalWorkspaceRoot(root)
+    if (register) this.workspaceAliases.set(id, root)
+    return { id, root }
+  }
+
+  operationMatches(operation, workspace) {
+    try {
+      const current = this.workspaceScope({ id: operation.workspace ?? PRIMARY_WORKSPACE_ID })
+      const expected = workspace === undefined ? current : this.workspaceScope(workspace)
+      return current.id === expected.id && current.root === expected.root && canonicalWorkspaceRoot(operation.workspaceRoot ?? this.config.workspaceRoot) === expected.root
+    } catch { return false }
+  }
+
+  async ensureRuntimeWorkspace(workspace = {}) {
+    const scope = this.workspaceScope(workspace, true)
+    await this.ready
+    // Serialize reconciliation per root, but recheck leases on subsequent reads:
+    // a controller that saw a live foreign owner may later observe expiration.
+    const previous = this.runtimeWorkspaces.get(scope.root) ?? Promise.resolve()
+    const task = previous.then(() => this.runtime.recover(this, (id, before) => history(this.ctx, id, 100, before), turnCompletion, scope))
+    this.runtimeWorkspaces.set(scope.root, task)
+    await task
+    return scope
+  }
+
+  async runtimeStatus(sessionId, workspace = {}) {
+    const scope = await this.ensureRuntimeWorkspace(workspace)
+    return this.runtime.status(sessionId, scope.id, scope.root)
+  }
+
+  bindBrowser(sessionId, binding, verification) {
+    const operation = this.operationForSession(sessionId)
+    if (!operation) return
+    this.runtime.require().bindBrowser(operation.rootSessionId, operation.workspace, operation.workspaceRoot, { ...binding, request_session_id: sessionId }, verification)
+  }
+
   activeOperations(workspace) {
-    const all = [...this.operations.values()].filter(operation => operation.status === 'running')
-    if (workspace === undefined) return all
-    return all.filter(operation => (operation.workspace ?? PRIMARY_WORKSPACE_ID) === workspace)
+    return [...this.operations.values()].filter(operation => operation.status === 'running' && this.operationMatches(operation, workspace))
   }
 
   /**
@@ -712,12 +766,8 @@ export class BridgeController {
    * message: confirming that an id exists somewhere else is itself the leak.
    */
   #gate(owned, workspace, subject) {
-    const expected = workspace?.id ?? PRIMARY_WORKSPACE_ID
-    const actual = owned ?? PRIMARY_WORKSPACE_ID
-    if (actual === expected) return
-    const error = new Error(`${subject} is not registered under bridge workspace ${expected}`)
-    error.code = 'NOT_FOUND'
-    throw error
+    if (owned && this.operationMatches(owned, workspace)) return
+    throw Object.assign(new Error(`${subject} is not registered under this workspace`), { code: 'NOT_FOUND' })
   }
 
   operationForSession(sessionId) {
@@ -756,7 +806,7 @@ export class BridgeController {
     // bridge is carrying in total -- a count, never another workspace's state.
     const scope = workspace.id ?? PRIMARY_WORKSPACE_ID
     const all = [...this.operations.values()]
-      .filter(operation => allWorkspaces || (operation.workspace ?? PRIMARY_WORKSPACE_ID) === scope)
+      .filter(operation => this.operationMatches(operation, allWorkspaces ? undefined : workspace))
       .filter(operation => status === undefined || operation.status === status)
       .sort((left, right) => right.startedAt - left.startedAt)
     const page = all.slice(0, limit)
@@ -768,7 +818,7 @@ export class BridgeController {
       })),
       workspace: allWorkspaces ? undefined : scope,
       total: all.length,
-      active: allWorkspaces ? this.activeOperations().length : this.activeOperations(scope).length,
+      active: allWorkspaces ? this.activeOperations().length : this.activeOperations(workspace).length,
       max_concurrent_turns: this.config.maxConcurrentTurns ?? DEFAULT_MAX_CONCURRENT_TURNS,
       truncated: all.length > page.length,
     }
@@ -782,7 +832,7 @@ export class BridgeController {
       error.code = 'NOT_FOUND'
       throw error
     }
-    this.#gate(operation.workspace, workspace, `operation ${operationId}`)
+    this.#gate(operation, workspace, `operation ${operationId}`)
     const pending = this.pendingForOperation(operation)
     return {
       ...this.operationSummary(operation),
@@ -811,6 +861,7 @@ export class BridgeController {
       throw error
     }
     const operation = this.operationForSession(sessionId)
+    if (operation) this.#gate(operation, workspace, `session ${sessionId}`)
     return {
       workspace: listed.workspace,
       workspace_root: listed.workspace_root,
@@ -833,7 +884,7 @@ export class BridgeController {
     if (operationId !== undefined) {
       const operation = this.operations.get(operationId)
       if (operation === undefined) throw new Error(`operation ${operationId} is not registered`)
-      this.#gate(operation.workspace, workspace, `operation ${operationId}`)
+      this.#gate(operation, workspace, `operation ${operationId}`)
       if (sessionId !== undefined && this.operationForSession(sessionId)?.id !== operation.id) {
         throw new Error('operation_id and session_id refer to different Shiro turns')
       }
@@ -842,16 +893,16 @@ export class BridgeController {
     if (sessionId !== undefined) {
       const operation = this.operationForSession(sessionId)
       if (operation === undefined) throw new Error(`session ${sessionId} has no registered Shiro operation`)
-      this.#gate(operation.workspace, workspace, `session ${sessionId}`)
+      this.#gate(operation, workspace, `session ${sessionId}`)
       return operation
     }
-    const active = this.activeOperations(scope)
+    const active = this.activeOperations(workspace)
     if (active.length === 1) return active[0]
     if (active.length > 1) return null
     if (this.lastOperationId === null) return null
     const last = this.operations.get(this.lastOperationId)
     if (last === undefined) return null
-    return (last.workspace ?? PRIMARY_WORKSPACE_ID) === scope ? last : null
+    return this.operationMatches(last, workspace) ? last : null
   }
 
   pendingForOperation(operation) {
@@ -1038,7 +1089,8 @@ export class BridgeController {
       error.code = 'CONFLICT'
       throw error
     }
-    this.#gate(operation.workspace, workspace, `thread ${sessionId}`)
+    this.#gate(operation, workspace, `thread ${sessionId}`)
+    this.runtime.require().assertLease(operation.rootSessionId)
     await unwrap(this.ctx.apiProxy.sessions.prompt({
       rpcId: rpcId('bridge-steer'),
       payload: {
@@ -1106,6 +1158,8 @@ export class BridgeController {
   }
 
   async start(prompt, agentPreset, requestedSessionId, speedProfile = 'balanced', reasoningEffort, waitOptions = {}, workspace = {}) {
+    workspace = await this.ensureRuntimeWorkspace(workspace)
+    const kernel = this.runtime.require()
     const limit = this.config.maxConcurrentTurns ?? DEFAULT_MAX_CONCURRENT_TURNS
     if (this.activeOperations().length + this.pendingStarts >= limit) {
       throw new Error(`Shiro already has ${limit} concurrent root turns; wait for or cancel one before starting another`)
@@ -1138,9 +1192,16 @@ export class BridgeController {
         }
         created = { sessionId: requestedSessionId }
       }
+      kernel.claim({ session_id: created.sessionId, runtime_mode: 'web-harness', loop_owner: 'harness',
+        workspace_id: workspace.id ?? PRIMARY_WORKSPACE_ID, workspace_root: workspace.root ?? this.config.workspaceRoot })
+      const durable = kernel.session(created.sessionId, workspace.id ?? PRIMARY_WORKSPACE_ID, workspace.root ?? this.config.workspaceRoot)
+      if (this.operationForSession(created.sessionId)?.status === 'interrupted' || durable.effects.some(effect => effect.state === 'uncertain' || effect.state === 'started')) {
+        throw Object.assign(new Error('session has an ambiguous interrupted turn; reconcile engine execution before resuming'), { code: 'CONFLICT' })
+      }
       const selectedModel = modelIdForSpeed(this.config.model, speedProfile)
       const selectedProfile = profileForModel(selectedModel, this.config.model)
       const selectedEffort = reasoningEffort ?? selectedProfile.defaultEffort
+      kernel.updateSession(created.sessionId, { requested_model: selectedModel, requested_effort: selectedEffort, verified_model: null, verified_effort: null })
       await unwrap(this.ctx.apiProxy.sessions.selectModel({
         rpcId: rpcId('bridge-model'),
         payload: {
@@ -1164,10 +1225,11 @@ export class BridgeController {
         reasoningEffort: selectedEffort,
         recoverableEnd: null,
       }
+      this.runtime.persist(operation)
       this.operations.set(operation.id, operation)
       this.operationsBySession.set(operation.rootSessionId, operation)
       this.lastOperationId = operation.id
-      await unwrap(this.ctx.apiProxy.sessions.prompt({
+      await kernel.runEffect({ effect_id: randomUUID(), session_id: created.sessionId, operation_id: operation.id, name: 'harness.prompt', arguments: { session_id: created.sessionId } }, () => unwrap(this.ctx.apiProxy.sessions.prompt({
         rpcId: rpcId('bridge-prompt'),
         payload: {
           sessionId: created.sessionId,
@@ -1175,10 +1237,14 @@ export class BridgeController {
           content: [{ type: 'text', text: prompt }],
           clientTimeZone: 'Asia/Saigon',
         },
-      }), 'session.prompt')
+      }), 'session.prompt'))
       return this.waitForOutcome(this.config.waitMs, { ...waitOptions, operationId: operation.id, workspace })
     } catch (error) {
-      if (operation?.status === 'running') operation.status = 'failed'
+      if (operation?.status === 'running' && error.code !== 'FENCED') {
+        operation.status = 'failed'
+        operation.recoveryState = 'dispatch-failed-or-uncertain'
+        this.runtime.persist(operation)
+      }
       throw error
     } finally {
       this.pendingStarts -= 1
@@ -1192,9 +1258,10 @@ export class BridgeController {
     // Gate before the answer reaches the engine: a model response is an input
     // to a running turn, so accepting one across workspaces would let a caller
     // scoped to B drive a turn in A.
-    this.#gate(request.workspace, workspace, `model request ${requestId}`)
+    this.#gate(this.operationForRequest(request) ?? { workspace: request.workspace, workspaceRoot: this.config.workspaceRoot }, workspace, `model request ${requestId}`)
     const operation = this.operationForRequest(request)
     if (operation === undefined) throw new Error(`model request ${requestId} cannot be matched to one active Shiro operation`)
+    this.runtime.require().assertLease(operation.rootSessionId)
     this.broker.submit(requestId, response)
     return this.waitForOutcome(waitMs, { ...waitOptions, operationId: operation.id, workspace })
   }
@@ -1203,11 +1270,12 @@ export class BridgeController {
   pendingRequest(requestId, workspace = {}) {
     const request = this.broker.request(requestId)
     if (request === undefined) return undefined
-    this.#gate(request.workspace, workspace, `model request ${requestId}`)
+    this.#gate(this.operationForRequest(request) ?? { workspace: request.workspace, workspaceRoot: this.config.workspaceRoot }, workspace, `model request ${requestId}`)
     return request
   }
 
   async waitForOutcome(waitMs, { operationId, sessionId, signal, onProgress, workspace = {} } = {}) {
+    workspace = await this.ensureRuntimeWorkspace(workspace)
     if (signal?.aborted) throw requestCancelledError()
     const scope = workspace.id ?? PRIMARY_WORKSPACE_ID
     if (operationId === undefined && sessionId === undefined && this.activeOperations(scope).length > 1) {
@@ -1224,6 +1292,15 @@ export class BridgeController {
         workspace: scope,
         model_requests: this.broker.snapshot().filter(request => (request.workspace ?? PRIMARY_WORKSPACE_ID) === scope).map(requestSummary),
       }
+    }
+    if (operation.status !== 'running') return {
+      status: operation.status, state: operation.status, pending_action: 'none',
+      operation_id: operation.id, session_id: operation.rootSessionId, root_session_id: operation.rootSessionId,
+      workspace: scope, recovery_state: operation.recoveryState, completion: operation.completion,
+    }
+    try { this.runtime.require().assertLease(operation.rootSessionId) } catch (error) {
+      if (error.code !== 'FENCED') throw error
+      return { status: operation.status, state: operation.status, pending_action: 'none', operation_id: operation.id, session_id: operation.rootSessionId, workspace: scope, recovery_state: 'owned-by-other-executor' }
     }
     const startedAt = Date.now()
     const deadline = startedAt + waitMs
@@ -1265,6 +1342,11 @@ export class BridgeController {
         }
       }
       const page = await history(this.ctx, operation.rootSessionId)
+      const observedSeq = Math.max(operation.lastEventSeq ?? operation.afterSeq, latestSeq(page))
+      if (observedSeq !== operation.lastEventSeq) {
+        operation.lastEventSeq = observedSeq
+        this.runtime.persist(operation)
+      }
       const done = turnCompletion(page, operation.afterSeq)
       if (done !== null) {
         if (awaitsAutoContinue(done.reason)) {
@@ -1276,10 +1358,12 @@ export class BridgeController {
             continue
           }
         }
-        operation.status = 'completed'
+        operation.completion = done
+        operation.status = done.reason?.kind === 'error' ? 'failed' : done.reason?.kind === 'interrupted' ? 'cancelled' : 'completed'
+        this.runtime.persist(operation)
         return {
-          status: 'completed',
-          state: 'completed',
+          status: operation.status,
+          state: operation.status,
           pending_action: 'none',
           operation_id: operation.id,
           session_id: operation.rootSessionId,
@@ -1313,11 +1397,12 @@ export class BridgeController {
     if (interaction === undefined) throw new Error(`interaction ${interactionId} is not pending`)
     // An approval is the highest-value input in the system: it is what lets a
     // turn do something destructive. It never crosses a workspace boundary.
-    this.#gate(interaction.workspace, workspace, `interaction ${interactionId}`)
+    this.#gate(this.operations.get(interaction.operation_id) ?? this.operationForSession(interaction.sessionId), workspace, `interaction ${interactionId}`)
     const operation = interaction.operation_id === undefined
       ? this.operationForSession(interaction.sessionId)
       : this.operations.get(interaction.operation_id)
     if (operation === undefined) throw new Error(`interaction ${interactionId} cannot be matched to one active Shiro operation`)
+    this.runtime.require().assertLease(operation.rootSessionId)
     let value
     if (interaction.type === 'approval/requested') {
       if (approvalOutcome === undefined) throw new Error('approval_outcome is required for an approval')
@@ -1356,23 +1441,49 @@ export class BridgeController {
   }
 
   async cancel(operationId, sessionId, workspace = {}) {
-    const scope = workspace.id ?? PRIMARY_WORKSPACE_ID
-    if (operationId === undefined && sessionId === undefined && this.activeOperations(scope).length > 1) {
+    workspace = await this.ensureRuntimeWorkspace(workspace)
+    if (operationId === undefined && sessionId === undefined && this.activeOperations(workspace).length > 1) {
       throw new Error('multiple Shiro turns are active; pass operation_id or session_id to cancel exactly one')
     }
     const operation = this.resolveOperation(operationId, sessionId, workspace)
-    if (operation === null || operation.status !== 'running') return { cancelled: false, status: operation?.status ?? 'idle' }
-    await unwrap(this.ctx.apiProxy.sessions.cancel({
-      rpcId: rpcId('bridge-cancel'),
-      payload: { sessionId: operation.rootSessionId },
-    }), 'session.cancel')
+    if (!operation) return { cancelled: false, status: 'idle' }
+    const kernel = this.runtime.require()
+    const effectId = `cancel:${operation.id}`
+    const prior = kernel.session(operation.rootSessionId, workspace.id, workspace.root).effects.find(effect => effect.effect_id === effectId)
+    const accepted = () => ({ cancelled: true, operation_id: operation.id, session_id: operation.rootSessionId, root_session_id: operation.rootSessionId, workspace: workspace.id })
+    if (prior?.state === 'succeeded') return accepted()
+    if (prior) return { cancelled: false, status: 'cancellation-uncertain' }
+    const potentiallyLive = operation.status === 'running' || operation.status === 'interrupted'
+      || (operation.status === 'failed' && operation.recoveryState === 'dispatch-failed-or-uncertain')
+    if (!potentiallyLive) return { cancelled: false, status: operation.status }
+    // A locally running operation was created through this controller, so its
+    // session membership is already proven. Recovered interrupted/failed work
+    // may outlive the bridge process, therefore re-check engine membership
+    // before sending a cancellation into that durable session.
+    if (operation.status !== 'running') {
+      const membership = await this.workspace(workspace.root)
+      if (!membership.workspace.sessionIds.includes(operation.rootSessionId)) throw Object.assign(new Error('session is not registered under this workspace'), { code: 'NOT_FOUND' })
+    }
+    const current = this.operationForSession(operation.rootSessionId)
+    if (current && current.id !== operation.id && current.status === 'running') {
+      throw Object.assign(new Error('a newer turn is running on this session; refusing to cancel an older operation'), { code: 'CONFLICT' })
+    }
+    kernel.assertLease(operation.rootSessionId)
+    await kernel.runEffect({ effect_id: effectId, session_id: operation.rootSessionId, operation_id: operation.id, name: 'harness.cancel', arguments: { session_id: operation.rootSessionId } }, () => unwrap(this.ctx.apiProxy.sessions.cancel({
+      rpcId: rpcId('bridge-cancel'), payload: { sessionId: operation.rootSessionId },
+    }), 'session.cancel'))
     operation.status = 'cancelled'
-    return { cancelled: true, operation_id: operation.id, session_id: operation.rootSessionId, root_session_id: operation.rootSessionId, workspace: operation.workspace ?? PRIMARY_WORKSPACE_ID }
+    operation.recoveryState = 'cancellation-accepted-effects-unverified'
+    this.runtime.persist(operation)
+    return accepted()
   }
 
   async dispose() {
     this.eventsAbort.abort()
     await this.eventsTask
+    await this.ready
+    await Promise.all(this.runtimeWorkspaces.values())
+    this.runtime.close()
   }
 }
 
@@ -1478,6 +1589,7 @@ const outcomeShape = {
   operations: z.array(looseObject()).optional(),
   interactions: z.array(looseObject()).optional(),
   completion: looseObject().optional(),
+  recovery_state: z.string().optional(),
   requested_profile: looseObject().optional(),
   instruction: z.string().optional(),
 }
@@ -1538,6 +1650,7 @@ export async function readServiceLog(logDir, { stream, from_offset: fromOffset, 
  */
 export const HARNESS_ACTION_DESCRIPTORS = Object.freeze([
   { name: 'harness_profiles', title: 'List exact Shiro speed and effort profiles', family: 'harness', read_only: true, destructive: false, requires_confirmation: false },
+  { name: 'session_runtime_status', title: 'Read durable session runtime', family: 'harness', read_only: true, destructive: false, requires_confirmation: false },
   { name: 'harness_start', title: 'Start a full Shiro coding task', family: 'harness', read_only: false, destructive: false, requires_confirmation: false },
   { name: 'harness_sessions', title: 'List resumable Shiro sessions', family: 'harness', read_only: true, destructive: false, requires_confirmation: false },
   { name: 'harness_get_request', title: 'Fetch the full body of one pending model request', family: 'harness', read_only: true, destructive: false, requires_confirmation: false },
@@ -1545,7 +1658,7 @@ export const HARNESS_ACTION_DESCRIPTORS = Object.freeze([
   { name: 'harness_status', title: 'Inspect active Shiro tasks', family: 'harness', read_only: true, destructive: false, requires_confirmation: false },
   { name: 'harness_respond', title: 'Answer a Harness question or approval request', family: 'harness', read_only: false, destructive: false, requires_confirmation: false },
   { name: 'harness_get_artifact', title: 'Fetch a produced file or image over MCP', family: 'artifact', read_only: true, destructive: false, requires_confirmation: false },
-  { name: 'harness_cancel', title: 'Cancel one active Shiro turn', family: 'harness', read_only: false, destructive: true, requires_confirmation: false },
+  { name: 'harness_cancel', title: 'Request cancellation of one Shiro turn', family: 'harness', read_only: false, destructive: true, requires_confirmation: false },
   { name: 'fleet_start', title: 'Start or resume a named ChatGPT worker fleet', family: 'fleet', read_only: false, destructive: false, requires_confirmation: false },
   { name: 'fleet_status', title: 'Read one named ChatGPT worker fleet', family: 'fleet', read_only: true, destructive: false, requires_confirmation: false },
   { name: 'fleet_stop', title: 'Stop one named ChatGPT worker fleet', family: 'fleet', read_only: false, destructive: true, requires_confirmation: false },
@@ -1566,6 +1679,7 @@ export function configureMcp(server, controller, config, fleetManager = null, ru
     projectRoot: config.workspaceRoot,
     allowedRoots: config.workspaceAllowlist ?? [],
   })
+  controller.workspaceRegistry = workspaces
   setConfirmationPolicy({ required: config.requireConfirmations === true })
   const policy = runtime.policy ?? new PermissionPolicy({ profile: config.permissionProfile, rules: config.permissionRules })
   // The harness and fleet tools are written out by hand below rather than built
@@ -1749,6 +1863,16 @@ export function configureMcp(server, controller, config, fleetManager = null, ru
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
   }, async ({ name }) => {
     try { return toolResult(await requireFleetManager().stop(name)) } catch (error) { return errorResult(error) }
+  })
+
+  registerGatedTool('session_runtime_status', {
+    title: 'Read durable session runtime',
+    description: 'Read a workspace-scoped, secret-redacted durable runtime projection: ownership, lease/fence state, requested and verified model/effort, browser binding metadata, recovery, operation checkpoints and effect states. Raw operation data, completion text, effect arguments and receipts are excluded. Does not resume execution.',
+    inputSchema: { session_id: z.string().min(1), workspace: z.string().min(1).optional() },
+    outputSchema: resultSchema({ runtime: looseObject() }),
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, async ({ session_id, workspace }) => {
+    try { return toolResult({ runtime: await controller.runtimeStatus(session_id, harnessWorkspace(workspace)) }) } catch (error) { return errorResult(error) }
   })
 
   registerGatedTool('harness_start', {
@@ -2029,8 +2153,8 @@ export function configureMcp(server, controller, config, fleetManager = null, ru
   })
 
   registerGatedTool('harness_cancel', {
-    title: 'Cancel one active Shiro turn',
-    description: 'Cancels one active Harness turn in one workspace (the fixed project root unless workspace names another). Pass operation_id or session_id when multiple turns are active there. An id belonging to another workspace fails with NOT_FOUND and cancels nothing. It does not delete files, sessions, or workspaces, and it does not stop ChatGPT worker fleets; use fleet_stop for those.',
+    title: 'Request cancellation of one Shiro turn',
+    description: 'Requests cancellation of an active or interrupted Harness turn; acceptance does not prove all side effects stopped. Repeated accepted requests are durable and idempotent. Operates in one workspace (the fixed project root unless workspace names another). Pass operation_id or session_id when multiple turns are active there. An id belonging to another workspace fails with NOT_FOUND and cancels nothing. It does not delete files, sessions, or workspaces, and it does not stop ChatGPT worker fleets; use fleet_stop for those.',
     inputSchema: {
       operation_id: z.string().uuid().optional(),
       session_id: z.string().min(1).optional(),
@@ -2156,6 +2280,7 @@ function startHttpServer(ctx, broker, config, fleetManager) {
     projectRoot: config.workspaceRoot,
     allowedRoots: config.workspaceAllowlist ?? [],
   })
+  controller.workspaceRegistry = workspaces
   const sandbox = workspaces.primary().sandbox
   const processes = new ProcessRegistry({ sandbox })
   const runtime = {
@@ -2266,6 +2391,7 @@ export function apply(ctx, rawConfig = {}) {
   }
   ctx.effect(() => {
     const serving = startHttpServer(ctx, broker, config, fleetManager)
+    if (relay) relay.bindSession = (sessionId, binding, verification) => serving.controller.bindBrowser(sessionId, binding, verification)
     return async () => {
       // Kill every bridge-owned background process before anything else: a
       // dev server started through process_start or an interactive terminal

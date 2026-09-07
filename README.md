@@ -263,3 +263,5 @@ Script tự đọc URL và API token từ `.ShiroRuntime/state/chatgpt-relay.env
 ## Nguồn mở
 
 Shiro tích hợp DeepSeek Harness theo giấy phép MIT và dùng Pake để tạo desktop shell. Xem `THIRD_PARTY.md` và các file giấy phép đi kèm từng thành phần.
+
+Durable session ownership, browser bindings, and conservative restart recovery are documented in [Astra runtime foundation](docs/ASTRA_RUNTIME.md). Inspect them through the read-only `session_runtime_status` action.

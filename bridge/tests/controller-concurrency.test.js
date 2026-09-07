@@ -44,6 +44,7 @@ function fixture(maxConcurrentTurns = 3) {
     model: 'gpt-5.6-sol',
     waitMs: 0,
     maxConcurrentTurns,
+    sessionStatePath: ':memory:',
     workspaceRoot: '/tmp/shiro-test',
   })
   return { broker, controller, prompts, cancellations }

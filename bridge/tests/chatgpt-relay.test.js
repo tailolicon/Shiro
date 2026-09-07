@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { ChatGptBrowserRelay, RelayError, relayDeltaPrompt, relayPrompt } from '../src/chatgpt-relay.js'
+import { ChatGptBrowserRelay, RelayError, parseReply, relayDeltaPrompt, relayPrompt } from '../src/chatgpt-relay.js'
 
 const request = {
   request_id: 'request-test',
@@ -87,7 +87,7 @@ test('browser relay preserves ordinary text when ChatGPT does not emit JSON', as
   assert.equal(result.finishReason, 'stop')
 })
 
-test('browser relay repairs raw Windows separators in multi-tool JSON', async () => {
+test('browser relay refuses repair of raw Windows separators in executable JSON', async () => {
   const relay = new ChatGptBrowserRelay({
     url: 'http://127.0.0.1:23158',
     token: 'relay-test-token',
@@ -95,25 +95,7 @@ test('browser relay repairs raw Windows separators in multi-tool JSON', async ()
       response: String.raw`{"blocks":[{"type":"tool_call","id":"call-content","name":"pwsh","arguments":{"command":"Get-Content .shiro-smoke\relay-proof.txt","workdir":"E:\Project\Shiro"}},{"type":"tool_call","id":"call-status","name":"pwsh","arguments":{"command":"git status --short","workdir":"E:\Project\Shiro"}}],"finishReason":"tool-calls"}`,
     }),
   })
-  const result = await relay.complete({
-    ...request,
-    tools: [{ name: 'pwsh', description: 'Run PowerShell', inputSchema: { type: 'object' } }],
-  })
-  assert.equal(result.finishReason, 'tool-calls')
-  assert.deepEqual(result.blocks, [
-    {
-      type: 'tool_call',
-      id: 'call-content',
-      name: 'pwsh',
-      arguments: { command: String.raw`Get-Content .shiro-smoke\relay-proof.txt`, workdir: String.raw`E:\Project\Shiro` },
-    },
-    {
-      type: 'tool_call',
-      id: 'call-status',
-      name: 'pwsh',
-      arguments: { command: 'git status --short', workdir: String.raw`E:\Project\Shiro` },
-    },
-  ])
+  await assert.rejects(relay.complete({ ...request, tools: [{ name: 'pwsh' }] }), { code: 'EMPTY_RESPONSE' })
 })
 
 // --- Task 1: real error taxonomy + retry policy -----------------------------
@@ -213,7 +195,7 @@ test('browser relay throws a typed retryable error for a genuinely empty reply',
   })
 })
 
-test('browser relay repairs unescaped double quotes embedded in tool-call argument strings', async () => {
+test('browser relay rejects unescaped double quotes in executable arguments', async () => {
   // Reproduces a live failure: Sol emitted a PowerShell command containing
   // raw "env:APPDATA/npm" quotes inside the JSON string, which strict
   // parsing rejects and the old code rendered as a raw-JSON text reply.
@@ -227,11 +209,7 @@ test('browser relay repairs unescaped double quotes embedded in tool-call argume
     token: 'relay-test-token',
     fetchImpl: async () => Response.json({ response: wire }),
   })
-  const result = await relay.complete({ ...request, tools: [{ name: 'pwsh' }] })
-  assert.equal(result.finishReason, 'tool-calls')
-  assert.equal(result.blocks[0].type, 'tool_call')
-  assert.equal(result.blocks[0].name, 'pwsh')
-  assert.match(result.blocks[0].arguments.command, /Get-ChildItem "env:APPDATA\/npm" -Filter 'dsh\*'/)
+  await assert.rejects(relay.complete({ ...request, tools: [{ name: 'pwsh' }] }), { code: 'EMPTY_RESPONSE' })
 })
 
 test('browser relay retries when the extension returns only a fenced fragment of the reply', async () => {
@@ -803,4 +781,50 @@ test('an SSE error frame keeps its actionable detail whichever shape it uses', a
       return true
     },
   )
+})
+
+
+test('strict parser rejects repaired mixed and legacy executable envelopes; text repair still works', () => {
+  for (const raw of [
+    String.raw`{"blocks":[{"type":"text","text":"bad "quote""},{"type":"tool-call","name":"read","arguments":{}}]}`,
+    String.raw`{"tool_calls":[{"function":{"name":"read","arguments":{"path":"C:\Project"}}}]}`,
+    JSON.stringify({ blocks: [{ type: 'tool_call', name: 'read', arguments: '{"path":"bad "quote""}' }] }),
+  ]) assert.throws(() => parseReply(raw, request.tools), { code: 'EMPTY_RESPONSE' })
+  for (const args of [null, [], 1, undefined]) {
+    assert.throws(() => parseReply(JSON.stringify({ blocks: [{ type: 'tool_call', name: 'read', arguments: args }] }), request.tools), { code: 'EMPTY_RESPONSE' })
+  }
+  const strict = parseReply(JSON.stringify({ tool_calls: [{ function: { name: 'read', arguments: '{"path":"a"}' } }] }), request.tools)
+  assert.deepEqual(strict.blocks[0].arguments, { path: 'a' })
+  assert.equal(parseReply(String.raw`{"blocks":[{"type":"text","text":"say "hello" now"}]}`, []).blocks[0].text, 'say "hello" now')
+})
+
+test('browser binding records the selected client, tab and conversation without claiming model verification', async () => {
+  const bindings = []
+  const relay = new ChatGptBrowserRelay({
+    url: 'http://127.0.0.1:23158', token: 'test', model: 'Requested Astra',
+    bindSession: (...args) => bindings.push(args),
+    fetchImpl: async url => {
+      if (url.endsWith('/health')) return Response.json({ ok: true, clients: 2, selectedClientId: 'selected' })
+      if (url.endsWith('/browser/clients')) return Response.json({ clients: [
+        { id: 'foreign', tabId: 1, url: 'https://chatgpt.com/c/foreign' },
+        { id: 'selected', tabId: 9, url: 'https://chatgpt.com/c/conversation-9' },
+      ] })
+      return Response.json({ response: PROTOCOL_OK })
+    },
+  })
+  await relay.complete({ ...request, session_id: 'session-a' })
+  assert.equal(bindings.length, 2)
+  for (const [id, binding, verification] of bindings) {
+    assert.equal(id, 'session-a'); assert.equal(binding.client_id, 'selected')
+    assert.equal(binding.tab_id, 9); assert.equal(binding.conversation_id, 'conversation-9')
+    assert.equal(binding.requested_browser_model, 'Requested Astra'); assert.equal(verification, undefined)
+  }
+})
+
+test('streaming settlement refuses executable JSON repair', async () => {
+  const relay = new ChatGptBrowserRelay({
+    url: 'http://127.0.0.1:23158', token: 'test',
+    fetchImpl: async () => new Response('data: ' + JSON.stringify({ type: 'request.result', result: { answer: String.raw`{"blocks":[{"type":"tool_call","name":"read","arguments":{"path":"C:\Project"}}]}` } }) + '\n\n', { headers: { 'content-type': 'text/event-stream' } }),
+  })
+  await assert.rejects(async () => { for await (const item of relay.streamComplete(request)) assert.notEqual(item.type, 'final') }, { code: 'EMPTY_RESPONSE' })
 })
