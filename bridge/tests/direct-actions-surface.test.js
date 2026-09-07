@@ -433,6 +433,8 @@ test('config and log introspection stay secret-free and allowlisted', async () =
   await withConnector(async ({ call, base, config }) => {
     const effective = (await call('config_get')).body
     assert.equal(effective.provider, 'shiro-sol')
+    assert.equal(effective.execution.default_mode, 'relay')
+    assert.equal(effective.execution.autonomous_configured, false)
     assert.equal(effective.redacted, true)
     assert.equal(effective.relay.configured, false)
     const serialized = JSON.stringify(effective)
@@ -443,6 +445,33 @@ test('config and log introspection stay secret-free and allowlisted', async () =
     })
     assert.equal(valid.body.valid, true)
     assert.ok(!JSON.stringify(valid.body.normalized).includes('a-real-bridge-token-value'), 'validation must not echo the token back')
+
+    const autonomous = await call('config_validate', {
+      config: {
+        workspaceRoot: config.workspaceRoot,
+        token: 'a-real-bridge-token-value',
+        port: 23157,
+        autonomousProvider: 'native-openai',
+        autonomousModel: 'gpt-native',
+      },
+    })
+    assert.equal(autonomous.body.valid, true)
+    assert.equal(autonomous.body.normalized.executionMode, 'autonomous')
+    assert.equal(autonomous.body.normalized.autonomousProvider, 'native-openai')
+    assert.equal(autonomous.body.normalized.autonomousModel, 'gpt-native')
+
+    const collision = await call('config_validate', {
+      config: {
+        workspaceRoot: config.workspaceRoot,
+        token: 'a-real-bridge-token-value',
+        port: 23157,
+        provider: 'shiro-sol',
+        autonomousProvider: 'shiro-sol',
+        autonomousModel: 'another-model',
+      },
+    })
+    assert.equal(collision.body.valid, false)
+    assert.match(collision.body.message, /must differ/)
 
     const invalid = await call('config_validate', { config: { workspaceRoot: config.workspaceRoot, token: 'x', port: 80 } })
     assert.equal(invalid.body.valid, false)

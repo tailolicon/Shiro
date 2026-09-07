@@ -55,8 +55,18 @@
     - id: llm-shiro-harness-bridge
       name: '@shiro-ai/harness-bridge'
       config:
+        # Legacy ChatGPT-Web relay route. Kept registered for compatibility and
+        # for an explicit harness_start execution_mode=relay.
         provider: shiro-sol
         model: gpt-5.6-sol
+        # Native loop-owner route. When both values are set, autonomous becomes
+        # the inferred default and DSH feeds streamed model output/tool results
+        # directly through its local ReactLoopAgent without returning to Web.
+        autonomousProvider: !!js process.env.SHIRO_AUTONOMOUS_PROVIDER ?? ''
+        autonomousModel: !!js process.env.SHIRO_AUTONOMOUS_MODEL ?? ''
+        # Optional explicit override: autonomous | relay. Empty means infer from
+        # whether the autonomous provider/model pair above is configured.
+        executionMode: !!js process.env.SHIRO_EXECUTION_MODE ?? ''
         workspaceRoot: !!js process.env.SHIRO_WORKSPACE_ROOT
         # Extra directory trees workspace_open may address, colon-separated.
         # Empty (the default) keeps every direct action locked to workspaceRoot.

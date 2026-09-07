@@ -411,6 +411,7 @@ export function registerDirectActions(server, options) {
       project_root: z.string().describe('Absolute fixed root. This is the one absolute path in the public contract; every other path is relative to it.'),
       provider: z.string(),
       model: z.string(),
+      execution: looseObject().describe('{default_mode, autonomous_configured, autonomous_provider, autonomous_model, relay_provider, relay_model}'),
       uptime_ms: z.number(),
       started_at: z.string(),
       harness: looseObject().describe('{active_turns, max_concurrent_turns, pending_model_requests}'),
@@ -452,6 +453,14 @@ export function registerDirectActions(server, options) {
       project_root: config.workspaceRoot,
       provider: config.provider,
       model: config.model,
+      execution: {
+        default_mode: config.executionMode ?? 'relay',
+        autonomous_configured: (config.autonomousProvider ?? '') !== '',
+        autonomous_provider: config.autonomousProvider ?? '',
+        autonomous_model: config.autonomousModel ?? '',
+        relay_provider: config.provider,
+        relay_model: config.model,
+      },
       uptime_ms: metrics.snapshot(0).uptime_ms,
       started_at: new Date(metrics.startedAt).toISOString(),
       harness: {
@@ -3108,6 +3117,7 @@ export function registerDirectActions(server, options) {
     output: {
       provider: z.string(),
       model: z.string(),
+      execution: looseObject().describe('Loop ownership/model routes; no credentials. autonomous is the fast local DSH loop, relay is the Web compatibility path.'),
       project_root: z.string(),
       workspace_allowlist: z.array(z.string()).describe('Directory prefixes workspace_open may address. Empty means single-rooted.'),
       permission: looseObject().describe('{profile, ceiling, command_allow, command_deny, network_allow, network_deny}'),
@@ -3125,6 +3135,14 @@ export function registerDirectActions(server, options) {
   }, () => options.redact({
     provider: config.provider,
     model: config.model,
+    execution: {
+      default_mode: config.executionMode ?? 'relay',
+      autonomous_configured: (config.autonomousProvider ?? '') !== '',
+      autonomous_provider: config.autonomousProvider ?? '',
+      autonomous_model: config.autonomousModel ?? '',
+      relay_provider: config.provider,
+      relay_model: config.model,
+    },
     project_root: config.workspaceRoot,
     permission: policy.snapshot(),
     workspace_allowlist: [...workspaces.allowedRoots],

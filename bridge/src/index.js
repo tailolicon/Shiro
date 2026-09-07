@@ -1,5 +1,6 @@
 import { canonicalWorkspaceRoot, defaultSessionStatePath } from './session-kernel.js'
 import { SessionRuntime } from './session-runtime.js'
+import { recoveryHistory } from './session-recovery.js'
 import { randomUUID, timingSafeEqual } from 'node:crypto'
 import { open, readFile, realpath, stat } from 'node:fs/promises'
 import { createServer } from 'node:http'
@@ -96,9 +97,33 @@ function normalizeConfig(config = {}) {
   const permissionRules = normalizeRules(config.permissionRules ?? {})
   const configuredFleetStateDir = typeof config.fleetStateDir === 'string' ? config.fleetStateDir.trim() : ''
   const configuredLogDir = typeof config.logDir === 'string' ? config.logDir.trim() : ''
+  const provider = requiredString(config.provider ?? DEFAULT_PROVIDER, 'provider')
+  const model = requiredString(config.model ?? DEFAULT_MODEL, 'model')
+  const autonomousProvider = typeof config.autonomousProvider === 'string' ? config.autonomousProvider.trim() : ''
+  const autonomousModel = typeof config.autonomousModel === 'string' ? config.autonomousModel.trim() : ''
+  if ((autonomousProvider === '') !== (autonomousModel === '')) {
+    throw new Error('autonomousProvider and autonomousModel must be configured together')
+  }
+  if (autonomousProvider !== '' && autonomousProvider === provider) {
+    throw new Error('autonomousProvider must differ from provider because provider is reserved for the legacy relay adapter')
+  }
+  const executionMode = config.executionMode === undefined || config.executionMode === null || config.executionMode === ''
+    ? (autonomousProvider === '' ? 'relay' : 'autonomous')
+    : String(config.executionMode).trim()
+  if (!['autonomous', 'relay'].includes(executionMode)) throw new Error('executionMode must be autonomous or relay')
+  if (executionMode === 'autonomous' && autonomousProvider === '') {
+    throw new Error('executionMode autonomous requires autonomousProvider and autonomousModel')
+  }
   return {
-    provider: requiredString(config.provider ?? DEFAULT_PROVIDER, 'provider'),
-    model: requiredString(config.model ?? DEFAULT_MODEL, 'model'),
+    // `provider` / `model` remain the legacy Web-relay adapter route. Native
+    // autonomous turns select `autonomousProvider` / `autonomousModel`, which
+    // are supplied by any adapter already registered on ctx.llm (pi-ai,
+    // OpenAI Responses, a gateway, a local CLI adapter, ...).
+    provider,
+    model,
+    executionMode,
+    autonomousProvider,
+    autonomousModel,
     workspaceRoot,
     workspaceAllowlist,
     permissionProfile,
@@ -147,6 +172,33 @@ function profileForModel(model, configuredModel = DEFAULT_MODEL) {
   const profile = SPEED_PROFILES.find(candidate => `${base}${candidate.suffix}` === model)
   if (profile === undefined) throw new Error(`unsupported Shiro model: ${model}`)
   return profile
+}
+
+function executionRoute(config, mode = config.executionMode, speedProfile = 'balanced', reasoningEffort) {
+  if (!['autonomous', 'relay'].includes(mode)) throw new Error(`unsupported execution mode: ${mode}`)
+  const profile = SPEED_PROFILES.find(candidate => candidate.id === speedProfile)
+  if (profile === undefined) throw new Error(`unsupported speed profile: ${speedProfile}`)
+  if (mode === 'autonomous') {
+    if (!config.autonomousProvider || !config.autonomousModel) {
+      throw new Error('autonomous execution is not configured; set autonomousProvider and autonomousModel')
+    }
+    return {
+      mode,
+      provider: config.autonomousProvider,
+      model: config.autonomousModel,
+      profile,
+      effort: reasoningEffort ?? profile.defaultEffort,
+    }
+  }
+  const model = modelIdForSpeed(config.model, speedProfile)
+  const relayProfile = profileForModel(model, config.model)
+  return {
+    mode,
+    provider: config.provider,
+    model,
+    profile: relayProfile,
+    effort: reasoningEffort ?? relayProfile.defaultEffort,
+  }
 }
 
 function modelInfo(provider, model, configuredModel = DEFAULT_MODEL) {
@@ -680,6 +732,108 @@ function awaitsAutoContinue(reason) {
   return reason?.kind === 'max-tokens' || reason?.kind === 'error' || reason?.kind === 'interrupted'
 }
 
+function metricState(operation) {
+  if (operation.metrics === undefined) {
+    operation.metrics = {
+      last_seq: operation.afterSeq,
+      model_rounds: 0,
+      tool_calls: 0,
+      tool_results: 0,
+      model_wait_ms: 0,
+      tool_result_latency_ms: 0,
+      max_tool_calls_in_flight_observed: 0,
+      complete: true,
+      gap_after_seq: null,
+      pending_model_steps: {},
+      pending_tool_calls: {},
+    }
+  }
+  return operation.metrics
+}
+
+function historyCoversAfterSeq(page, afterSeq) {
+  const events = (page.events ?? []).map(entry => entry.event).sort((left, right) => left.seq - right.seq)
+  if (events.length === 0) return true
+  const newer = events.filter(event => event.seq > afterSeq)
+  if (newer.length === 0) return true
+  if (newer[0].seq !== afterSeq + 1) return false
+  return newer.every((event, index) => index === 0 || event.seq === newer[index - 1].seq + 1)
+}
+
+function observeOperationMetrics(operation, page) {
+  const metrics = metricState(operation)
+  const events = (page.events ?? [])
+    .map(entry => entry.event)
+    .filter(event => event.seq > Math.max(operation.afterSeq, metrics.last_seq ?? operation.afterSeq))
+    .sort((left, right) => left.seq - right.seq)
+  metrics.complete = true
+  metrics.gap_after_seq = null
+  for (const event of events) {
+    const data = event.data ?? {}
+    if (event.type === 'step/start') {
+      metrics.model_rounds += 1
+      metrics.first_model_round_at ??= event.time
+      metrics.pending_model_steps[`${data.turn}:${data.step}`] = event.time
+    } else if (event.type === 'assistant/chunk' || event.type === 'assistant/message') {
+      const key = `${data.turn}:${data.step}`
+      const started = metrics.pending_model_steps[key]
+      if (started !== undefined) {
+        metrics.model_wait_ms += Math.max(0, event.time - started)
+        delete metrics.pending_model_steps[key]
+      }
+      metrics.first_model_output_at ??= event.time
+    } else if (event.type === 'tool/call') {
+      metrics.tool_calls += 1
+      metrics.first_tool_call_at ??= event.time
+      metrics.pending_tool_calls[data.callId] = event.time
+      metrics.max_tool_calls_in_flight_observed = Math.max(
+        metrics.max_tool_calls_in_flight_observed,
+        Object.keys(metrics.pending_tool_calls).length,
+      )
+    } else if (event.type === 'tool/result') {
+      metrics.tool_results += 1
+      const callId = data.message?.source?.callId ?? data.message?.callId ?? data.callId
+      const started = callId === undefined ? undefined : metrics.pending_tool_calls[callId]
+      if (started !== undefined) {
+        // Results commit in model order, so this is deliberately named result
+        // latency rather than exact tool CPU/wall time. It remains a stable
+        // benchmark for scheduler + tool overhead and can reveal regressions.
+        metrics.tool_result_latency_ms += Math.max(0, event.time - started)
+        delete metrics.pending_tool_calls[callId]
+      }
+    } else if (event.type === 'turn/end') {
+      metrics.completed_at = event.time
+    }
+    metrics.last_seq = Math.max(metrics.last_seq ?? operation.afterSeq, event.seq)
+  }
+  return metrics
+}
+
+function publicOperationMetrics(operation, now = Date.now()) {
+  const metrics = metricState(operation)
+  const acceptedAt = operation.acceptedAt ?? operation.startedAt
+  const end = metrics.completed_at ?? now
+  return {
+    accepted_at: acceptedAt,
+    first_model_round_at: metrics.first_model_round_at ?? null,
+    first_model_output_at: metrics.first_model_output_at ?? null,
+    first_tool_call_at: metrics.first_tool_call_at ?? null,
+    completed_at: metrics.completed_at ?? null,
+    time_to_first_model_ms: metrics.first_model_round_at === undefined ? null : Math.max(0, metrics.first_model_round_at - acceptedAt),
+    time_to_first_tool_ms: metrics.first_tool_call_at === undefined ? null : Math.max(0, metrics.first_tool_call_at - acceptedAt),
+    model_rounds: metrics.model_rounds,
+    model_wait_ms: metrics.model_wait_ms,
+    tool_calls: metrics.tool_calls,
+    tool_results: metrics.tool_results,
+    tool_result_latency_ms: metrics.tool_result_latency_ms,
+    max_tool_calls_in_flight_observed: metrics.max_tool_calls_in_flight_observed,
+    total_wall_ms: Math.max(0, end - acceptedAt),
+    last_event_seq: metrics.last_seq,
+    complete: metrics.complete !== false,
+    gap_after_seq: metrics.gap_after_seq ?? null,
+  }
+}
+
 export class BridgeController {
   constructor(ctx, broker, config) {
     this.ctx = ctx
@@ -789,7 +943,14 @@ export class BridgeController {
       root_session_id: operation.rootSessionId,
       workspace: operation.workspace ?? PRIMARY_WORKSPACE_ID,
       status: operation.status,
+      accepted_at: operation.acceptedAt ?? operation.startedAt,
       started_at: operation.startedAt,
+      execution_mode: operation.executionMode ?? 'relay',
+      model_route: {
+        provider: operation.modelProvider ?? this.config.provider,
+        model: operation.modelId ?? this.config.model,
+      },
+      metrics: publicOperationMetrics(operation),
       pending_model_requests: pendingRequests.length,
       pending_interactions: this.interactionSnapshot(operation).length,
     }
@@ -838,8 +999,9 @@ export class BridgeController {
       ...this.operationSummary(operation),
       speed_profile: operation.speedProfile,
       reasoning_effort: operation.reasoningEffort,
+      accepted_at_iso: new Date(operation.acceptedAt ?? operation.startedAt).toISOString(),
       started_at_iso: new Date(operation.startedAt).toISOString(),
-      duration_ms: Date.now() - operation.startedAt,
+      duration_ms: Date.now() - (operation.acceptedAt ?? operation.startedAt),
       model_requests: pending.map(request => requestSummary(request)),
       interactions: this.interactionSnapshot(operation),
       sessions: [...this.operationsBySession.entries()]
@@ -1157,7 +1319,12 @@ export class BridgeController {
     return redactSecrets({ session_id: sessionId, limit, events })
   }
 
-  async start(prompt, agentPreset, requestedSessionId, speedProfile = 'balanced', reasoningEffort, waitOptions = {}, workspace = {}) {
+  async start(prompt, agentPreset, requestedSessionId, speedProfile = 'balanced', reasoningEffort, waitOptions = {}, workspace = {}, requestedExecutionMode) {
+    const acceptedAt = Date.now()
+    // Validate the per-turn route before creating or claiming a durable
+    // session. In particular, an autonomous override on a relay-only bridge
+    // must fail without leaving an otherwise unused session behind.
+    const route = executionRoute(this.config, requestedExecutionMode ?? this.config.executionMode ?? 'relay', speedProfile, reasoningEffort)
     workspace = await this.ensureRuntimeWorkspace(workspace)
     const kernel = this.runtime.require()
     const limit = this.config.maxConcurrentTurns ?? DEFAULT_MAX_CONCURRENT_TURNS
@@ -1198,17 +1365,14 @@ export class BridgeController {
       if (this.operationForSession(created.sessionId)?.status === 'interrupted' || durable.effects.some(effect => effect.state === 'uncertain' || effect.state === 'started')) {
         throw Object.assign(new Error('session has an ambiguous interrupted turn; reconcile engine execution before resuming'), { code: 'CONFLICT' })
       }
-      const selectedModel = modelIdForSpeed(this.config.model, speedProfile)
-      const selectedProfile = profileForModel(selectedModel, this.config.model)
-      const selectedEffort = reasoningEffort ?? selectedProfile.defaultEffort
-      kernel.updateSession(created.sessionId, { requested_model: selectedModel, requested_effort: selectedEffort, verified_model: null, verified_effort: null })
+      kernel.updateSession(created.sessionId, { requested_model: route.model, requested_effort: route.effort, verified_model: null, verified_effort: null })
       await unwrap(this.ctx.apiProxy.sessions.selectModel({
         rpcId: rpcId('bridge-model'),
         payload: {
           sessionId: created.sessionId,
-          provider: this.config.provider,
-          model: selectedModel,
-          reasoningEffort: selectedEffort,
+          provider: route.provider,
+          model: route.model,
+          reasoningEffort: route.effort,
         },
       }), 'session.selectModel')
       const before = await history(this.ctx, created.sessionId)
@@ -1220,9 +1384,13 @@ export class BridgeController {
         workspaceRoot: workspace.root ?? this.config.workspaceRoot,
         afterSeq: latestSeq(before),
         status: 'running',
+        acceptedAt,
         startedAt: Date.now(),
-        speedProfile: selectedProfile.id,
-        reasoningEffort: selectedEffort,
+        executionMode: route.mode,
+        modelProvider: route.provider,
+        modelId: route.model,
+        speedProfile: route.profile.id,
+        reasoningEffort: route.effort,
         recoverableEnd: null,
       }
       this.runtime.persist(operation)
@@ -1296,7 +1464,12 @@ export class BridgeController {
     if (operation.status !== 'running') return {
       status: operation.status, state: operation.status, pending_action: 'none',
       operation_id: operation.id, session_id: operation.rootSessionId, root_session_id: operation.rootSessionId,
-      workspace: scope, recovery_state: operation.recoveryState, completion: operation.completion,
+      workspace: scope,
+      execution_mode: operation.executionMode ?? 'relay',
+      model_route: { provider: operation.modelProvider ?? this.config.provider, model: operation.modelId ?? this.config.model },
+      metrics: publicOperationMetrics(operation),
+      recovery_state: operation.recoveryState,
+      completion: operation.completion,
     }
     try { this.runtime.require().assertLease(operation.rootSessionId) } catch (error) {
       if (error.code !== 'FENCED') throw error
@@ -1318,6 +1491,9 @@ export class BridgeController {
           session_id: operation.rootSessionId,
           root_session_id: operation.rootSessionId,
           workspace: operation.workspace ?? PRIMARY_WORKSPACE_ID,
+          execution_mode: operation.executionMode ?? 'relay',
+          model_route: { provider: operation.modelProvider ?? this.config.provider, model: operation.modelId ?? this.config.model },
+          metrics: publicOperationMetrics(operation),
           model_requests: pending.map(requestSummary),
           requested_profile: {
             speed: operation.speedProfile,
@@ -1337,13 +1513,39 @@ export class BridgeController {
           session_id: operation.rootSessionId,
           root_session_id: operation.rootSessionId,
           workspace: operation.workspace ?? PRIMARY_WORKSPACE_ID,
+          execution_mode: operation.executionMode ?? 'relay',
+          model_route: { provider: operation.modelProvider ?? this.config.provider, model: operation.modelId ?? this.config.model },
+          metrics: publicOperationMetrics(operation),
           interactions,
           instruction: 'Relay questions to the user. Allow an approval only after the user explicitly consents to that exact operation; otherwise reject it. Call harness_respond, then continue.',
         }
       }
       const page = await history(this.ctx, operation.rootSessionId)
+      const metrics = metricState(operation)
+      const metricSeqBefore = metrics.last_seq
+      const metricCompleteBefore = metrics.complete !== false
       const observedSeq = Math.max(operation.lastEventSeq ?? operation.afterSeq, latestSeq(page))
-      if (observedSeq !== operation.lastEventSeq) {
+      if (latestSeq(page) > metricSeqBefore) {
+        if (historyCoversAfterSeq(page, metricSeqBefore)) {
+          observeOperationMetrics(operation, page)
+        } else {
+          const recovered = await recoveryHistory(
+            beforeSeq => history(this.ctx, operation.rootSessionId, 500, beforeSeq),
+            metricSeqBefore,
+          )
+          if (recovered === null) {
+            metrics.complete = false
+            metrics.gap_after_seq = metricSeqBefore
+          } else {
+            observeOperationMetrics(operation, recovered)
+          }
+        }
+      }
+      if (
+        observedSeq !== operation.lastEventSeq
+        || metricState(operation).last_seq !== metricSeqBefore
+        || (metricState(operation).complete !== false) !== metricCompleteBefore
+      ) {
         operation.lastEventSeq = observedSeq
         this.runtime.persist(operation)
       }
@@ -1369,6 +1571,9 @@ export class BridgeController {
           session_id: operation.rootSessionId,
           root_session_id: operation.rootSessionId,
           workspace: operation.workspace ?? PRIMARY_WORKSPACE_ID,
+          execution_mode: operation.executionMode ?? 'relay',
+          model_route: { provider: operation.modelProvider ?? this.config.provider, model: operation.modelId ?? this.config.model },
+          metrics: publicOperationMetrics(operation),
           completion: done,
         }
       }
@@ -1383,8 +1588,13 @@ export class BridgeController {
       session_id: operation.rootSessionId,
       root_session_id: operation.rootSessionId,
       workspace: operation.workspace ?? PRIMARY_WORKSPACE_ID,
+      execution_mode: operation.executionMode ?? 'relay',
+      model_route: { provider: operation.modelProvider ?? this.config.provider, model: operation.modelId ?? this.config.model },
+      metrics: publicOperationMetrics(operation),
       model_requests: this.pendingForOperation(operation).map(requestSummary),
-      instruction: 'Call harness_status or harness_continue again. Harness is still executing its own tools.',
+      instruction: operation.executionMode === 'autonomous'
+        ? 'Harness owns the model/tool loop locally. Read thread_events for progress or call harness_status again; only respond when an approval/question is surfaced.'
+        : 'Call harness_status or harness_continue again. Legacy relay mode is still executing the Harness turn.',
     }
   }
 
@@ -1585,6 +1795,9 @@ const outcomeShape = {
   operation_id: z.string().optional(),
   root_session_id: z.string().optional(),
   workspace: z.string().optional().describe('Bridge workspace the turn is anchored in.'),
+  execution_mode: z.enum(['autonomous', 'relay']).optional().describe('autonomous keeps model↔tool rounds inside Harness; relay exposes model requests to the MCP client for compatibility.'),
+  model_route: looseObject().optional().describe('{provider, model} selected for this operation.'),
+  metrics: looseObject().optional().describe('Per-operation Codex-style timing/call counters derived from durable session events.'),
   model_requests: z.array(looseObject()).optional(),
   operations: z.array(looseObject()).optional(),
   interactions: z.array(looseObject()).optional(),
@@ -1799,7 +2012,7 @@ export function configureMcp(server, controller, config, fleetManager = null, ru
     description: 'Resume one exact durable Harness session and continue its pending work.',
     argsSchema: { session_id: z.string().min(1).describe('Session id returned by harness_sessions.') },
   }, async ({ session_id: sessionId }) => ({
-    messages: [{ role: 'user', content: { type: 'text', text: `Resume the exact durable Shiro session ${sessionId} with harness_start using that session_id. Continue every returned model request through harness_continue until the turn completes; do not create a replacement session.` } }],
+    messages: [{ role: 'user', content: { type: 'text', text: `Resume the exact durable Shiro session ${sessionId} with harness_start using that session_id. In autonomous mode let Harness own the local model/tool loop and follow thread_events/status; use harness_continue only if this session is explicitly running in legacy relay mode. Do not create a replacement session.` } }],
   }))
 
   registerGatedTool('harness_profiles', {
@@ -1817,7 +2030,7 @@ export function configureMcp(server, controller, config, fleetManager = null, ru
     speed_profiles: SPEED_PROFILES.map(({ id, name, description, defaultEffort }) => ({ id, name, description, default_effort: defaultEffort })),
     reasoning_efforts: REASONING_EFFORTS,
     default: { speed_profile: 'balanced', reasoning_effort: 'standard' },
-    scope: 'These values select and expose Shiro operating policy. The ChatGPT Web model and compute entitlement are still selected by ChatGPT itself.',
+    scope: `These values select Shiro operating policy. In autonomous mode inference runs on the configured local ctx.llm route${config.autonomousProvider ? ` (${config.autonomousProvider}/${config.autonomousModel})` : ''}; in legacy relay mode ChatGPT Web model entitlement remains external.`,
   }))
 
   const requireFleetManager = () => {
@@ -1877,7 +2090,7 @@ export function configureMcp(server, controller, config, fleetManager = null, ru
 
   registerGatedTool('harness_start', {
     title: 'Start a full Shiro coding task',
-    description: `Starts one Shiro task. It runs in the fixed project root ${config.workspaceRoot} unless workspace names another root opened with workspace_open, in which case the durable session is anchored there and every engine tool -- filesystem, shell, git, container -- acts on that tree. Up to ${config.maxConcurrentTurns ?? DEFAULT_MAX_CONCURRENT_TURNS} root turns may run concurrently in different durable sessions. The returned model_requests are exact engine LLM calls: act as GPT-5.6 Sol and answer them with harness_continue. All filesystem, PowerShell, tests, Git, skills, plans, goals, subagents, workflows, approvals, persistence, and sandboxing stay inside Shiro's DeepSeek Harness engine.`,
+    description: `Starts one Shiro task. It runs in the fixed project root ${config.workspaceRoot} unless workspace names another root opened with workspace_open. Up to ${config.maxConcurrentTurns ?? DEFAULT_MAX_CONCURRENT_TURNS} root turns may run concurrently. Default execution is ${config.executionMode ?? 'relay'}. In autonomous mode the selected ctx.llm provider streams directly into DeepSeek Harness, which owns every model→tool→model round locally; the Web/MCP client only reads thread_events/status and handles approvals or user steering. Relay mode preserves the legacy model_requests + harness_continue protocol. Agent presets are the scoped-tool mechanism: hidden tools are omitted from the model schema and execution surface.`,
     inputSchema: {
       prompt: z.string().min(1).describe('The user task for Shiro.'),
       workspace: z.string().min(1).optional().describe('Workspace id from workspace_list to run the task in. Omit for the fixed project root. Sessions are namespaced per workspace, so session_id must belong to the same one.'),
@@ -1885,13 +2098,14 @@ export function configureMcp(server, controller, config, fleetManager = null, ru
       session_id: z.string().min(1).optional().describe('Optional durable Harness session id returned by harness_sessions for this workspace. Omit to create a new session.'),
       speed_profile: z.enum(['fast', 'balanced', 'deep']).optional().describe('Optional Shiro operating profile. Omit for balanced; explicit values remain supported for clients that expose this field.'),
       reasoning_effort: z.enum(['light', 'standard', 'high', 'max']).optional().describe('Optional reasoning effort. Omit to use the selected profile default (balanced defaults to standard).'),
+      execution_mode: z.enum(['autonomous', 'relay']).optional().describe('Override this turn only. autonomous requires autonomousProvider/autonomousModel to be configured; omit to use the bridge default.'),
     },
     outputSchema: resultSchema(outcomeShape),
     // The engine's tools can edit workspace files and reach the web
     // (web_fetch/search), and destructive steps still require harness_respond
     // approval -- so: writes yes, destructive no, open world yes.
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
-  }, async ({ prompt, workspace, agent_preset: agentPreset, session_id: sessionId, speed_profile: speedProfile, reasoning_effort: reasoningEffort }, extra) => {
+  }, async ({ prompt, workspace, agent_preset: agentPreset, session_id: sessionId, speed_profile: speedProfile, reasoning_effort: reasoningEffort, execution_mode: executionMode }, extra) => {
     try {
       if (sessionId !== undefined && threads.isArchived(sessionId)) {
         throw Object.assign(new Error(`thread ${sessionId} is archived; restore it with thread_unarchive before resuming it`), { code: 'CONFLICT' })
@@ -1904,6 +2118,7 @@ export function configureMcp(server, controller, config, fleetManager = null, ru
         reasoningEffort,
         requestWaitOptions(extra, 'Starting Shiro task'),
         harnessWorkspace(workspace),
+        executionMode,
       ))
     } catch (error) { return errorResult(error) }
   })
@@ -1934,7 +2149,7 @@ export function configureMcp(server, controller, config, fleetManager = null, ru
 
   registerGatedTool('harness_get_request', {
     title: 'Fetch the full body of one pending model request',
-    description: 'Turn outcomes carry only request summaries to stay small. Call this with a request_id from model_requests to receive the actual system prompt, tools, and messages to act on. When truncated is true, call again with messages_from = next_messages_from until the whole request is read, then answer with harness_continue.',
+    description: 'Legacy relay compatibility only. Autonomous operations never expose model requests. For a relay-mode request_id from model_requests, fetch the exact system prompt, tools, and messages; page with messages_from when truncated, then answer with harness_continue.',
     inputSchema: {
       request_id: z.string().uuid(),
       workspace: z.string().min(1).optional().describe('Workspace the turn belongs to. Omit for the fixed project root. An id from another workspace fails with NOT_FOUND before the engine is touched.'),
@@ -1999,8 +2214,8 @@ export function configureMcp(server, controller, config, fleetManager = null, ru
   })
 
   registerGatedTool('harness_continue', {
-    title: 'Return one Sol model decision to Shiro',
-    description: 'Answers exactly one pending Harness model request. Use only tool names and JSON arguments from that request. If tools are needed, return tool_call blocks so Harness executes them under its own sandbox; never simulate tool results. Keep calling this tool for every returned model request until status is completed.',
+    title: 'Return one legacy relay model decision to Shiro',
+    description: 'Legacy relay compatibility only. Answers exactly one pending relay-mode model request. Autonomous operations keep this round-trip entirely inside Harness and never call this action. For relay requests, use only the request tool schema and return tool_call blocks so Harness executes them.',
     inputSchema: {
       request_id: z.string().uuid(),
       workspace: z.string().min(1).optional().describe('Workspace the turn belongs to. Omit for the fixed project root. An id from another workspace fails with NOT_FOUND before the engine is touched.'),
@@ -2029,7 +2244,7 @@ export function configureMcp(server, controller, config, fleetManager = null, ru
 
   registerGatedTool('harness_status', {
     title: 'Inspect active Shiro tasks',
-    description: 'Returns pending model requests, running tool state, or final completion for turns in one workspace (the fixed project root unless workspace names another). Pass operation_id or session_id to inspect one turn; omit both to receive aggregate status when several turns run concurrently in that workspace. Ids from another workspace fail with NOT_FOUND.',
+    description: 'Returns one operation’s execution mode/model route, benchmark metrics, pending interaction or final completion. Autonomous turns keep model requests local and expose progress through thread_events; relay turns may also return model_requests. Pass operation_id or session_id to inspect one turn, or omit both for workspace aggregate status.',
     inputSchema: {
       operation_id: z.string().uuid().optional(),
       session_id: z.string().min(1).optional(),
@@ -2237,7 +2452,7 @@ async function handleMcpRequest(req, res, controller, config, fleetManager, runt
     { name: 'shiro-harness-bridge', title: 'Shiro', version: '0.1.0' },
     {
       capabilities: { tools: {} },
-      instructions: 'Use harness_profiles when the user asks about operating profiles. harness_start accepts optional speed_profile and reasoning_effort; omission is backward-compatible and defaults to balanced/standard. Different durable sessions may run concurrently. Turn outcomes stay small: model_requests holds summaries only -- fetch each full request body with harness_get_request (page with messages_from when truncated), act as the model, then answer with harness_continue. Shiro executes coding tools inside the workspace a turn is anchored in: the fixed project root by default, or the workspace_open root passed to harness_start. When a task produces a file or an image_attachment block appears in a model request, fetch it with harness_get_artifact; workspace files are exposed as MCP resource links. Continue every operation until completed.',
+      instructions: `Shiro's default execution mode is ${config.executionMode ?? 'relay'}. Send one large task with harness_start. When execution_mode is autonomous, DeepSeek Harness owns the complete streamed model↔tool loop locally: read thread_events with its cursor for progress/tool/diff events, use turn_steer for user steering, and answer only user_input_required interactions with harness_respond. Poll harness_status for terminal state and benchmark metrics. Only legacy relay mode exposes model_requests; fetch those with harness_get_request and answer them with harness_continue. Agent presets scope the model tool surface, and hidden tools are omitted from schemas. Continue until terminal state or a real user interaction is required.`,
     },
   )
   configureMcp(server, controller, config, fleetManager, runtime)
@@ -2320,6 +2535,14 @@ function startHttpServer(ctx, broker, config, fleetManager) {
         ok: true,
         provider: config.provider,
         model: config.model,
+        execution: {
+          defaultMode: config.executionMode,
+          autonomousConfigured: config.autonomousProvider !== '',
+          autonomousProvider: config.autonomousProvider,
+          autonomousModel: config.autonomousModel,
+          relayProvider: config.provider,
+          relayModel: config.model,
+        },
         workspaceRoot: config.workspaceRoot,
         concurrency: {
           active: controller.activeOperations().length,
