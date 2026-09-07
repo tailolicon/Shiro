@@ -19,6 +19,18 @@ import { RelayError, parseReply, relayPrompt } from './chatgpt-relay.js'
 
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000
 
+// Grok Build normally injects its full coding-agent system prompt even when
+// every tool is disabled. That costs tens of thousands of input tokens on
+// every Harness model round and gives the model a second, competing agent
+// identity. The Harness request already carries the complete system prompt,
+// messages, and scoped tool schemas, so the CLI only needs this small adapter
+// contract around it.
+const BACKEND_SYSTEM_PROMPT = [
+  'You are a stateless language-model backend for the DeepSeek Harness request in the user message.',
+  'Treat EXACT_HARNESS_REQUEST_JSON.system, messages, tools, and generation settings as the authoritative request.',
+  'Do not inspect files, run tools, or act as a separate coding agent; return only the schema-constrained model decision.',
+].join(' ')
+
 // Prompts routinely exceed the Windows 32K command-line limit, so the request
 // always travels via --prompt-file rather than a positional argument.
 const BLOCKS_SCHEMA = JSON.stringify({
@@ -107,6 +119,7 @@ export class GrokCliRunner {
       const args = [
         '--prompt-file', promptFile,
         '--json-schema', BLOCKS_SCHEMA,
+        '--system-prompt-override', BACKEND_SYSTEM_PROMPT,
         '--verbatim',
         // 2, not 1: the schema-constrained final answer sometimes lands on a
         // second internal turn. With every tool disabled the extra turn can

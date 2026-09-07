@@ -95,9 +95,10 @@ test('grok runner disables the CLI agent surface and maps efforts onto CLI level
     }, captured),
   })
   await runner.complete(request, undefined, { model: 'grok-4.5', effort: 'light' })
-  for (const flag of ['--tools=', '--no-subagents', '--no-plan', '--disable-web-search', '--verbatim', '--json-schema']) {
+  for (const flag of ['--tools=', '--no-subagents', '--no-plan', '--disable-web-search', '--verbatim', '--json-schema', '--system-prompt-override']) {
     assert.ok(captured.args.includes(flag), `missing ${flag}`)
   }
+  assert.match(captured.args[captured.args.indexOf('--system-prompt-override') + 1], /stateless language-model backend/)
   assert.equal(captured.args[captured.args.indexOf('--max-turns') + 1], '2')
   assert.equal(captured.args[captured.args.indexOf('-m') + 1], 'grok-4.5')
   assert.equal(captured.args[captured.args.indexOf('--reasoning-effort') + 1], 'low')

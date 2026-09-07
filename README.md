@@ -146,7 +146,7 @@ argv/confinement này; ở đó reset/restore/rebase/push *có* mặt nhưng b�
 
 ### Grok Build CLI
 
-Nếu máy đã cài và đăng nhập Grok Build CLI (`%USERPROFILE%\.grok\bin\grok.exe`, xác thực qua grok.com), model selector có thêm provider `Shiro · Grok Build` với `grok-4.6` và `grok-4.5`. Bridge chạy CLI ở chế độ headless một lượt với toàn bộ tool/subagent/web-search của CLI bị tắt — DeepSeek Harness vẫn giữ trọn agent loop; Grok chỉ đóng vai trò model. Output bị ép đúng schema blocks qua `--json-schema`, effort `Light/Standard/High/Max` khớp thẳng `low/medium/high/xhigh`, usage token là số thật từ CLI, và mỗi request là một tiến trình riêng nên subagent song song chạy thật sự song song. Ghi đè đường dẫn CLI bằng biến môi trường `SHIRO_GROK_CLI`; không có CLI thì provider tự ẩn.
+Nếu máy đã cài và đăng nhập Grok Build CLI (`%USERPROFILE%\.grok\bin\grok.exe` trên Windows hoặc `~/.grok/bin/grok` trên Linux, xác thực qua grok.com), Shiro tự dùng `shiro-grok/grok-4.6` làm autonomous route mặc định: model → tool → model chạy hoàn toàn trong DeepSeek Harness, không quay lại browser/MCP broker giữa các vòng. Model selector vẫn có `grok-4.6` và `grok-4.5`. Bridge chạy CLI ở chế độ headless với system prompt backend tối giản và toàn bộ tool/subagent/web-search của CLI bị tắt — Harness giữ trọn agent loop; Grok chỉ đóng vai trò model. Output bị ép đúng schema blocks qua `--json-schema`, effort `Light/Standard/High/Max` khớp thẳng `low/medium/high/xhigh`, usage token là số thật từ CLI, và mỗi request là một tiến trình riêng nên subagent song song chạy thật sự song song. Ghi đè đường dẫn CLI bằng `SHIRO_GROK_CLI`; ép `SHIRO_EXECUTION_MODE=relay` để giữ đường ChatGPT Web cũ; không có CLI thì provider tự ẩn và relay vẫn là fallback.
 
 ## Nâng cấp đã chọn lọc
 
