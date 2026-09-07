@@ -59,7 +59,7 @@ Cách này chỉ được dùng khi Shiro chứng minh được thread vẫn kh�
 
 ### Connector actions: direct action trước, Harness sau
 
-Connector Shiro lộ **128 action** cho ChatGPT (trước đây là 12, rồi 74, rồi 118, rồi 122). Việc thường ngày —
+Connector Shiro lộ **130 action** cho ChatGPT (trước đây là 12, rồi 74, rồi 118, rồi 122, rồi 128). Việc thường ngày —
 đọc file, xem `git status`, chạy test, bật dev server, đổi lịch một fleet — là
 **một action, một lượt MCP, không gọi LLM và không tạo durable session**. `harness_start`
 vẫn là đường duy nhất cho công việc lập trình thật sự cần suy luận.
@@ -88,6 +88,7 @@ vẫn là đường duy nhất cho công việc lập trình thật sự cần s
 | Review theo từng hunk, nhận hunk này bỏ hunk kia | `review_diff` → `review_stage_hunk` / `review_revert_hunk` |
 | Worker ChatGPT định kỳ | `fleet_start` |
 | Giao việc cho Claude Code / Codex / Grok / Antigravity CLI thật | `subagent_start` → `subagent_status`/`subagent_log` |
+| Báo workflow rườm rà / action thiếu hoặc khó khám phá | `report_action_gap` → operator xem `action_gap_summary` |
 
 **Sub-agent là CLI thật, không phải mô phỏng.** ChatGPT Web không có kho skill như Codex,
 nhưng một khi nó đang nói chuyện với Shiro, `subagent_start` dispatch `claude`/`codex`/
@@ -131,7 +132,7 @@ Client nên gọi `bridge_capabilities` trước để biết deployment này c�
 là `false` khi không có allowlist, `features.pdf` phụ thuộc poppler) và `bridge_status` để
 biết bridge đang chạy gì. Chi tiết đầy đủ — schema, mã lỗi, phân trang, quy tắc phê
 duyệt, và những thứ cố ý không hỗ trợ — nằm trong
-[`docs/CONNECTOR_ACTIONS.md`](docs/CONNECTOR_ACTIONS.md).
+[`docs/CONNECTOR_ACTIONS.md`](docs/CONNECTOR_ACTIONS.md). Vòng phản hồi tự cải tiến (`report_action_gap` / `action_gap_summary`) được mô tả riêng tại [`docs/ACTION_GAP_FEEDBACK.md`](docs/ACTION_GAP_FEEDBACK.md).
 
 ### Công cụ Git và web
 

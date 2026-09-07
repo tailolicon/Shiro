@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { ACTION_GAP_PROBLEM_TYPES, ACTION_GAP_SEVERITIES, ActionGapCollector, FRICTION_WEIGHTS, defaultActionGapStateDir } from './action-gap.js'
 import { confirmationsAreRequired, ERROR_CODES, fail, requireConfirmation } from './action-errors.js'
 import { classifyByExtension } from './artifact-kind.js'
 import { CLICK_BUTTONS, clickOwnedTabElement, DOM_LIMITS, evaluateInOwnedTab, EVALUATE_LIMITS, queryOwnedTabDom, TYPE_MODES, typeIntoOwnedTabElement } from './browser-dom.js'
@@ -317,6 +318,84 @@ export function registerDirectActions(server, options) {
     }
     return fleetManager
   }
+  const actionGapCollector = options.actionGapCollector ?? new ActionGapCollector({
+    stateDir: defaultActionGapStateDir(config.workspaceRoot),
+    redact: options.redact,
+  })
+
+  // ----------------------------------------------------------- improvement --
+
+  define('report_action_gap', {
+    family: 'improvement',
+    title: 'Report Shiro workflow friction',
+    description: 'Persists one structured, redacted local report when a Shiro workflow is genuinely cumbersome, an action is missing or poorly designed, several actions should be composed, or an existing action was hard to discover. Reports are evidence for later operator review, not a request to auto-install code. Prefer one report per recurring friction pattern, not one per ordinary tool call.',
+    input: {
+      problem_type: z.enum(ACTION_GAP_PROBLEM_TYPES),
+      task: z.string().min(1).max(2000).describe('Short description of the user task that exposed the friction.'),
+      context: z.string().max(4000).optional().describe('Why the current Shiro surface made this task harder than necessary.'),
+      attempted_actions: z.array(z.string().min(1).max(120)).max(30).optional().describe('Shiro actions or manual steps tried, in execution order when practical.'),
+      current_workaround: z.string().max(5000).optional().describe('The cumbersome workaround currently required.'),
+      suggested_action: z.string().min(1).max(120).optional().describe('Candidate action name when obvious. Exact existing-name matches are returned to help catch agent misuse.'),
+      suggested_signature: z.string().max(1000).optional().describe('Compact proposed signature/schema when known; do not invent one just to fill the field.'),
+      severity: z.enum(ACTION_GAP_SEVERITIES).optional().describe('Operational impact. Defaults to medium.'),
+      estimated_savings_calls: z.number().int().min(0).max(100).optional().describe('Estimated direct tool calls saved per occurrence.'),
+      friction: z.object({
+        unnecessary_tool_calls: z.number().int().min(0).max(1000).optional(),
+        retries: z.number().int().min(0).max(1000).optional(),
+        permission_failures: z.number().int().min(0).max(1000).optional(),
+        shell_workarounds: z.number().int().min(0).max(1000).optional(),
+        schema_errors: z.number().int().min(0).max(1000).optional(),
+        agent_confusion: z.number().int().min(0).max(1000).optional(),
+      }).optional().describe(`Optional counters used for deterministic friction scoring. Weights: ${JSON.stringify(FRICTION_WEIGHTS)}.`),
+      evidence: z.array(z.string().max(500)).max(20).optional().describe('Concise error/tool-call/timing evidence. Never include credentials or full sensitive payloads.'),
+      repo_context: z.string().max(1000).optional(),
+      session_context: z.string().max(1000).optional(),
+      source_agent: z.string().max(120).optional().describe('Agent/model label when useful for comparing routing behavior.'),
+      workspace: workspaceField().describe('Optional Shiro workspace id. When supplied, the collector records its id and project-relative context but still stores the report in Shiro local state.'),
+    },
+    output: {
+      id: z.string(),
+      fingerprint: z.string(),
+      submitted_at: z.string(),
+      friction_score: z.number(),
+      existing_action_matches: z.array(z.string()),
+      possible_agent_misuse: z.boolean(),
+      queued: z.boolean(),
+      state_file: z.string(),
+    },
+    annotations: WRITE,
+  }, async args => {
+    let workspaceContext
+    if (args.workspace !== undefined) {
+      const entry = workspaces.get(args.workspace)
+      workspaceContext = { id: entry.id, name: entry.name }
+    }
+    return actionGapCollector.report(args, {
+      knownActions: registry,
+      workspaceContext,
+    })
+  })
+
+  define('action_gap_summary', {
+    family: 'improvement',
+    title: 'Review aggregated Shiro friction',
+    description: 'Reads the durable local action-gap queue and deterministically groups repeated reports by normalized fingerprint. Use this to prioritize recurring high-friction patterns before adding actions. It does not invoke an LLM, mutate reports, generate code, or install actions.',
+    input: {
+      limit: z.number().int().min(1).max(200).optional(),
+      min_count: z.number().int().min(1).max(1000000).optional(),
+      problem_type: z.enum(ACTION_GAP_PROBLEM_TYPES).optional(),
+      severity: z.enum(ACTION_GAP_SEVERITIES).optional(),
+    },
+    output: {
+      total_reports: z.number(),
+      unique_gaps: z.number(),
+      returned: z.number(),
+      malformed_lines: z.number(),
+      items: z.array(looseObject()).describe('Aggregates with count, first/last seen, max severity, friction/savings totals and a representative report.'),
+      state_file: z.string(),
+    },
+    annotations: READ_ONLY,
+  }, args => actionGapCollector.summary(args))
 
   // ---------------------------------------------------------------- bridge --
 

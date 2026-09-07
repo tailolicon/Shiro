@@ -1556,7 +1556,7 @@ export const BRIDGE_VERSION = '0.2.0'
 // Bumped whenever the direct-action surface changes shape, so a client can
 // feature-detect with bridge_capabilities instead of assuming every deployment
 // exposes the same actions.
-export const DIRECT_ACTIONS_VERSION = 3
+export const DIRECT_ACTIONS_VERSION = 4
 
 export function configureMcp(server, controller, config, fleetManager = null, runtime = {}) {
   // Workspaces are resolved first: the artifact resource and harness_get_artifact
