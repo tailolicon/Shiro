@@ -442,7 +442,11 @@ export class TerminalRegistry {
         const hasData = entry.output.end > from
         const quiet = entry.lastOutputAt === null || this.now() - entry.lastOutputAt >= settleMs
         if (hasData && quiet) break
-        if (entry.state !== 'running' && hasData) break
+        // `close` means stdout is drained, so an exited terminal with no
+        // output cannot ever satisfy `hasData`. Waiting in that state would
+        // leave only the unref'ed timeout alive and Node may cancel the read
+        // before it resolves (notably for commands such as `exit 0`).
+        if (entry.state !== 'running') break
         const remaining = deadline - this.now()
         if (remaining <= 0) break
         await this.#awaitChange(entry, hasData ? Math.min(remaining, settleMs) : remaining)
