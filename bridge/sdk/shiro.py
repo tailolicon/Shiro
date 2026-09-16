@@ -31,6 +31,8 @@ __all__ = ["Shiro", "Thread", "ShiroActionError", "ShiroTransportError", "DEFAUL
 
 DEFAULT_PORT = 23157
 PROTOCOL_VERSION = "2025-06-18"
+SHIRO_CLIENT_HEADER = "x-shiro-client"
+SHIRO_CONTROL_HEADER = "x-shiro-omnicast-control"
 
 
 class ShiroTransportError(RuntimeError):
@@ -152,10 +154,12 @@ class Shiro:
         token: Optional[str] = None,
         timeout: float = 120.0,
         env: Optional[Dict[str, str]] = None,
+        control_token: Optional[str] = None,
     ):
         self.url = url or resolve_endpoint(env)
         self._token = token or resolve_token(env)
         self._timeout = timeout
+        self._control_token = (control_token or "").strip()
         self._next_id = 0
         self._session_id: Optional[str] = None
         self._initialized = False
@@ -174,9 +178,14 @@ class Shiro:
             "accept": "application/json, text/event-stream",
             "authorization": f"Bearer {self._token}",
             "mcp-protocol-version": PROTOCOL_VERSION,
+            # Mark this bundled local client so harness_start inherits the
+            # deployment's autonomous loop owner instead of connector relay.
+            SHIRO_CLIENT_HEADER: "shiro-python",
         }
         if self._session_id:
             headers["mcp-session-id"] = self._session_id
+        if self._control_token:
+            headers[SHIRO_CONTROL_HEADER] = self._control_token
         request = urllib.request.Request(self.url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST")
         try:
             with urllib.request.urlopen(request, timeout=self._timeout) as response:

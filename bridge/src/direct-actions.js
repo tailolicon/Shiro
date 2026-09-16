@@ -1,16 +1,20 @@
 import { z } from 'zod'
+import { registerGameDevActions, GAME_TOOLS_VERSION } from './game-dev-actions.js'
 import { ACTION_GAP_PROBLEM_TYPES, ACTION_GAP_SEVERITIES, ActionGapCollector, FRICTION_WEIGHTS, defaultActionGapStateDir } from './action-gap.js'
 import { confirmationsAreRequired, ERROR_CODES, fail, requireConfirmation } from './action-errors.js'
 import { classifyByExtension } from './artifact-kind.js'
 import { CLICK_BUTTONS, clickOwnedTabElement, DOM_LIMITS, evaluateInOwnedTab, EVALUATE_LIMITS, queryOwnedTabDom, TYPE_MODES, typeIntoOwnedTabElement } from './browser-dom.js'
 import { navigateOwnedTab, NAVIGATE_LIMITS, WAIT_UNTIL } from './browser-navigate.js'
 import { captureOwnedTabScreenshot, SCREENSHOT_FORMATS, SCREENSHOT_LIMITS } from './browser-screenshot.js'
+import { collectGeneratedImage, COLLECT_IMAGE_LIMITS } from './browser-collect-image.js'
 import { Confinement } from './confinement.js'
 import { SUBAGENT_ADAPTERS } from './subagent-adapters.js'
 import { SubagentRegistry } from './subagents.js'
+import { DOCUMENT_LIMITS, extractDocxText, extractPdfText, extractXlsx } from './document-extract.js'
 import { EXEC_LIMITS, runCommand } from './exec-actions.js'
 import * as fs from './fs-actions.js'
 import * as git from './git-actions.js'
+import { HOST_LIMITS, hostSystemInfo, listHostProcesses } from './host-info.js'
 import * as media from './media-actions.js'
 import { errorResult, looseObject, resultSchema, toolResult } from './mcp-result.js'
 import { PermissionPolicy, PROFILES } from './permission-profile.js'
@@ -21,6 +25,7 @@ import * as worktrees from './worktree-actions.js'
 import { CONTROL_KEYS, TERMINAL_LIMITS, TERMINAL_SIGNALS, TerminalRegistry } from './terminal-actions.js'
 import { THREAD_LIMITS } from './thread-registry.js'
 import { PRIMARY_WORKSPACE_ID, WORKSPACE_LIMITS, WorkspaceRegistry } from './workspaces.js'
+import { omnicastReturnActionSpecs } from './omnicast-return.js'
 
 // The Shiro connector's direct-action surface.
 //
@@ -267,6 +272,7 @@ export const FLEET_SNAPSHOT_SHAPE = {
 
 export function registerDirectActions(server, options) {
   const { config, controller, fleetManager, processes, metrics } = options
+  const workerControl = options.workerControl
   const workspaces = options.workspaces ?? new WorkspaceRegistry({ projectRoot: config.workspaceRoot, allowedRoots: config.workspaceAllowlist ?? [] })
   const terminals = options.terminals ?? new TerminalRegistry()
   const threads = options.threads
@@ -286,6 +292,12 @@ export function registerDirectActions(server, options) {
   if (processes !== undefined && processes !== null && processes.confinement === null) processes.confinement = confinement
   if (terminals !== undefined && terminals !== null && terminals.confinement === null) terminals.confinement = confinement
   const define = (name, spec, handler) => defineAction(server, registry, metrics, name, spec, handler, policy)
+  for (const action of omnicastReturnActionSpecs({
+    mailbox: options.omnicastReturns,
+    clientKind: config.requestClientKind,
+  })) {
+    define(action.name, action.spec, action.handler)
+  }
   // Every workspace-scoped handler resolves its Sandbox here: an unknown id
   // fails with NOT_FOUND before a single path is touched, and omitting the
   // argument keeps the original fixed-root behaviour.
@@ -411,7 +423,7 @@ export function registerDirectActions(server, options) {
       project_root: z.string().describe('Absolute fixed root. This is the one absolute path in the public contract; every other path is relative to it.'),
       provider: z.string(),
       model: z.string(),
-      execution: looseObject().describe('{default_mode, autonomous_configured, autonomous_provider, autonomous_model, relay_provider, relay_model}'),
+      execution: looseObject().describe('{default_mode, configured_default_mode, client_kind, autonomous_configured, autonomous_provider, autonomous_model, relay_provider, relay_model}'),
       uptime_ms: z.number(),
       started_at: z.string(),
       harness: looseObject().describe('{active_turns, max_concurrent_turns, pending_model_requests}'),
@@ -455,11 +467,16 @@ export function registerDirectActions(server, options) {
       model: config.model,
       execution: {
         default_mode: config.executionMode ?? 'relay',
+        configured_default_mode: config.configuredExecutionMode ?? config.executionMode ?? 'relay',
+        client_kind: config.requestClientKind ?? 'embedded',
         autonomous_configured: (config.autonomousProvider ?? '') !== '',
         autonomous_provider: config.autonomousProvider ?? '',
         autonomous_model: config.autonomousModel ?? '',
         relay_provider: config.provider,
         relay_model: config.model,
+        web_provider: config.webProvider ?? '',
+        web_model: config.webModel ?? '',
+        web_picker_model: config.webRelayModel ?? '',
       },
       uptime_ms: metrics.snapshot(0).uptime_ms,
       started_at: new Date(metrics.startedAt).toISOString(),
@@ -534,9 +551,13 @@ export function registerDirectActions(server, options) {
       download_default_max_bytes: NET_LIMITS.max_bytes_default,
       image_inline_max_bytes: media.MEDIA_LIMITS.image_max_bytes,
       pdf_max_dpi: media.MEDIA_LIMITS.pdf_max_dpi,
+      ...DOCUMENT_LIMITS,
+      ...HOST_LIMITS,
     },
     permission: policy.snapshot(),
     features: {
+      game_development_tools: true,
+      game_tools_version: GAME_TOOLS_VERSION,
       filesystem_writes: true,
       exec: true,
       shell_mode: true,
@@ -557,12 +578,15 @@ export function registerDirectActions(server, options) {
       file_import: true,
       images: true,
       pdf: true,
+      document_extract: true,
+      host_inspect: true,
       fleet: fleetManager !== null && fleetManager !== undefined,
       browser_tabs: fleetManager !== null && fleetManager !== undefined,
       browser_screenshot: relayCapabilities.screenshot === true,
       browser_navigate: relayCapabilities.navigate === true,
       browser_dom: relayCapabilities.dom === true,
       browser_evaluate: relayCapabilities.evaluate === true,
+      browser_collect_generated_image: relayCapabilities.evaluate === true,
       logs: true,
       metrics: true,
     },
@@ -578,6 +602,7 @@ export function registerDirectActions(server, options) {
       { capability: 'browser_tab_focus', reason: 'The audited relay exposes no focus route, and stealing window focus from the user is not something a background connector should do silently.' },
       ...(relayCapabilities.screenshot === true ? [] : [{ capability: 'browser_tab_screenshot (this relay build)', reason: `The action is registered and enforced end to end, but this relay exposes no ${'POST /browser/tabs/screenshot'} route and does not advertise capabilities.browser.screenshot. Capturing a background tab additionally needs a Chrome permission the bundled extension does not request (activeTab/<all_urls> for tabs.captureVisibleTab, or debugger for Page.captureScreenshot), which requires re-approving the extension. Until the relay is extended the action answers UNSUPPORTED with that reason instead of failing obscurely.` }]),
       { capability: 'full-screen terminal rendering', reason: 'terminal_read renders pty output one line at a time (cursor motion and repaints applied), which is what makes REPL and prompt transcripts readable. It is not a 2-D screen emulator, so a curses UI reads as successive repaints; pass raw=true for the exact bytes.' },
+      { capability: 'host_process_stop / host_kill', reason: 'host_process_list is read-only host inspection. Signaling a process this bridge did not start remains process_stop, which only targets bridge-owned children.' },
     ],
     }
   })
@@ -1175,6 +1200,7 @@ export function registerDirectActions(server, options) {
     output: EXEC_OUTPUT_SHAPE,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   }, (args, extra) => {
+    workerControl?.assertSpawnAllowed('exec', args)
     policy.assertCommand({ argv: args.argv, command: args.command, shell: args.shell === true })
     return runCommand(sandboxOf(args), args, { signal: extra?.signal, confinement })
   })
@@ -1196,6 +1222,7 @@ export function registerDirectActions(server, options) {
     output: PROCESS_SHAPE,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   }, args => {
+    workerControl?.assertSpawnAllowed('process', args)
     policy.assertCommand({ argv: args.argv, command: args.command, shell: args.shell === true })
     return processes.start(args, { sandbox: sandboxOf(args), workspaceId: workspaceIdOf(args) })
   })
@@ -1253,7 +1280,7 @@ export function registerDirectActions(server, options) {
   define('process_list', {
     family: 'process',
     title: 'List bridge-owned processes',
-    description: 'Lists only processes this bridge started, newest first. It never enumerates host processes. Filter with state to find what is still running.',
+    description: 'Lists only processes this bridge started, newest first. It never enumerates host processes -- use host_process_list for a redacted /proc snapshot. Filter with state to find what is still running.',
     input: {
       state: z.enum(['running', 'exited', 'stopped', 'failed']).optional(),
       limit: z.number().int().min(1).max(100).optional(),
@@ -1267,6 +1294,50 @@ export function registerDirectActions(server, options) {
     },
     annotations: READ_ONLY,
   }, args => processes.list(args))
+
+  define('host_system_info', {
+    family: 'host',
+    title: 'Read host identity and resource snapshot',
+    description: 'Returns hostname, OS, architecture, CPU count/model, memory, load average, uptime, and this bridge process ids. Read-only and deterministic: no environment dump, no mounts, no network addresses, no Harness session. Related: host_process_list, bridge_status.',
+    input: {},
+    output: {
+      hostname: z.string(),
+      platform: z.string(),
+      type: z.string(),
+      arch: z.string(),
+      release: z.string().optional(),
+      node: z.string(),
+      cpus: looseObject(),
+      memory: looseObject(),
+      loadavg: z.array(z.number()).optional(),
+      uptime_seconds: z.number(),
+      user: looseObject().optional(),
+      self: looseObject(),
+    },
+    annotations: READ_ONLY,
+  }, () => hostSystemInfo())
+
+  define('host_process_list', {
+    family: 'host',
+    title: 'List host processes (read-only)',
+    description: `Read-only /proc snapshot of this host, distinct from process_list which only shows processes this bridge started. Command lines are secret-redacted and clipped to ${HOST_LIMITS.cmdline_max_chars} characters. Never opens environ, cwd or exe, and never sends signals. Linux-only; other platforms return UNSUPPORTED. Paginate with limit/cursor.`,
+    input: {
+      name: z.string().min(1).max(80).optional().describe('Case-insensitive substring match against the process name or command line.'),
+      pid: z.number().int().min(1).optional(),
+      limit: z.number().int().min(1).max(HOST_LIMITS.list_max).optional(),
+      cursor: z.string().optional().describe('Resume after this process id from a previous next_cursor.'),
+      include_kernel: z.boolean().optional().describe('Include kernel threads (empty cmdline). Default false.'),
+    },
+    output: {
+      processes: z.array(looseObject()),
+      total: z.number(),
+      scanned: z.number().optional(),
+      kernel_threads_omitted: z.number().optional(),
+      next_cursor: z.string().optional(),
+      ...truncationShape,
+    },
+    annotations: READ_ONLY,
+  }, args => listHostProcesses(args))
 
   // -------------------------------------------------------- subagents --
 
@@ -1321,7 +1392,10 @@ export function registerDirectActions(server, options) {
     },
     output: SUBAGENT_SHAPE,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
-  }, (args, extra) => subagents.start(args, { sandbox: sandboxOf(args), workspaceId: args.workspace }))
+  }, args => {
+    workerControl?.assertSpawnAllowed('subagent', args)
+    return subagents.start(args, { sandbox: sandboxOf(args), workspaceId: args.workspace })
+  })
 
   define('subagent_status', {
     family: 'subagent',
@@ -1429,6 +1503,7 @@ export function registerDirectActions(server, options) {
     output: TERMINAL_SHAPE,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   }, args => {
+    workerControl?.assertSpawnAllowed('terminal', args)
     policy.assertCommand({ argv: args.argv })
     return terminals.start(args, { sandbox: sandboxOf(args), workspaceId: workspaceIdOf(args) })
   })
@@ -2563,6 +2638,51 @@ export function registerDirectActions(server, options) {
     return { ...captured, resource_uri: options.artifactUri(captured.path, workspaceIdOf(args)) }
   })
 
+  define('browser_tab_collect_generated_image', {
+    family: 'browser',
+    workspaceScoped: true,
+    title: 'Collect exact GPT Image bytes into a workspace',
+    description: `Collects one native Generated image from a verified Shiro-owned ChatGPT tab using that tab's authenticated browser context, then writes the exact response bytes atomically into the selected workspace. This is the production handoff for image workers whose model turn may lose tool connectivity after GPT Image generation: the orchestrator can DOM-collect afterward without using ~/Downloads. Target an exact image_alt or generated_file_id; when both are omitted the newest Generated image is used. The destination is always workspace-relative and sandbox validated. Requires browser evaluate support. Maximum ${COLLECT_IMAGE_LIMITS.max_bytes_cap} bytes.`,
+    input: {
+      browser_tab_id: z.number().int().describe('Owned ChatGPT tab containing the generated image.'),
+      save_to: pathField('Destination inside the selected workspace, for example inputs/worker-inbox/imgw-01/radio/v002/front.png.'),
+      image_alt: z.string().min(1).max(1000).optional().describe('Exact DOM alt text, e.g. Generated image: Vintage Radio Front.'),
+      generated_file_id: z.string().min(1).max(256).optional().describe('Exact native file_... id parsed from the generated image src.'),
+      max_bytes: z.number().int().min(1024).max(COLLECT_IMAGE_LIMITS.max_bytes_cap).optional(),
+      timeout_ms: z.number().int().min(1000).max(COLLECT_IMAGE_LIMITS.timeout_max_ms).optional(),
+      overwrite: z.boolean().optional(),
+    },
+    output: {
+      browser_tab_id: z.number(),
+      fleet: z.string().optional(),
+      slot: z.number().optional(),
+      conversation_url: z.string().optional(),
+      path: z.string(),
+      bytes: z.number(),
+      sha256: z.string(),
+      mime_type: z.string(),
+      width: z.number().optional(),
+      height: z.number().optional(),
+      generated_file_id: z.string().optional(),
+      dom_alt: z.string().optional(),
+      source_url: z.string().optional(),
+      natural_width: z.number().optional(),
+      natural_height: z.number().optional(),
+      resource_uri: z.string(),
+      overwrote: z.boolean(),
+      collected_at: z.string(),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  }, async (args, extra) => {
+    const manager = requireFleet()
+    const collected = await collectGeneratedImage(sandboxOf(args), args, {
+      fleet: manager,
+      transport: manager.transport,
+      signal: extra?.signal,
+    })
+    return { ...collected, resource_uri: options.artifactUri(collected.path, workspaceIdOf(args)) }
+  })
+
   define('browser_tab_navigate', {
     family: 'browser',
     title: 'Point a Shiro-owned tab at a URL',
@@ -2909,6 +3029,81 @@ export function registerDirectActions(server, options) {
     return { value: page.meta, content: [{ type: 'image', data: page.data.toString('base64'), mimeType: page.mimeType }] }
   })
 
+  define('pdf_extract_text', {
+    family: 'media',
+    workspaceScoped: true,
+    title: 'Extract text from a PDF',
+    description: `Extracts text from a PDF via poppler pdftotext, clipped to max_chars (default ${DOCUMENT_LIMITS.text_default_chars}, max ${DOCUMENT_LIMITS.text_max_chars}). Optional first_page/last_page bound the page range. Fails with UNSUPPORTED when poppler is missing. Related: pdf_info, pdf_render_page.`,
+    input: {
+      path: pathField('PDF file relative to the workspace root.'),
+      first_page: z.number().int().min(1).max(DOCUMENT_LIMITS.pdf_max_page).optional(),
+      last_page: z.number().int().min(1).max(DOCUMENT_LIMITS.pdf_max_page).optional(),
+      max_chars: z.number().int().min(1).max(DOCUMENT_LIMITS.text_max_chars).optional(),
+      offset: z.number().int().min(0).optional(),
+      layout: z.boolean().optional().describe('Preserve approximate layout (pdftotext -layout).'),
+    },
+    output: {
+      path: z.string(),
+      first_page: z.number(),
+      last_page: z.number(),
+      text: z.string(),
+      truncated: z.boolean(),
+      next_offset: z.number().optional(),
+      offset: z.number().optional(),
+      chars: z.number().optional(),
+    },
+    annotations: READ_ONLY,
+  }, args => extractPdfText(sandboxOf(args), args))
+
+  define('docx_extract_text', {
+    family: 'media',
+    workspaceScoped: true,
+    title: 'Extract text from a DOCX',
+    description: `Extracts paragraph text from a DOCX inside the workspace. ZIP-bomb and encryption protected; output is clipped to max_chars. Related: xlsx_extract, pdf_extract_text.`,
+    input: {
+      path: pathField('DOCX file relative to the workspace root.'),
+      max_chars: z.number().int().min(1).max(DOCUMENT_LIMITS.text_max_chars).optional(),
+      offset: z.number().int().min(0).optional(),
+    },
+    output: {
+      path: z.string(),
+      paragraphs: z.number(),
+      text: z.string(),
+      truncated: z.boolean(),
+      next_offset: z.number().optional(),
+      offset: z.number().optional(),
+      chars: z.number().optional(),
+    },
+    annotations: READ_ONLY,
+  }, args => extractDocxText(sandboxOf(args), args))
+
+  define('xlsx_extract', {
+    family: 'media',
+    workspaceScoped: true,
+    title: 'Extract a bounded cell window from an XLSX',
+    description: `Reads a bounded cell window from an XLSX inside the workspace. Select a sheet and optional A1:C10 range; cell/row/column caps apply (default ${DOCUMENT_LIMITS.xlsx_default_cells} cells). ZIP-bomb and encryption protected. Not a formula engine.`,
+    input: {
+      path: pathField('XLSX file relative to the workspace root.'),
+      sheet: z.union([z.string().min(1).max(80), z.number().int().min(1).max(256)]).optional().describe('Sheet name or 1-based index. Default: first sheet.'),
+      range: z.string().min(3).max(32).optional().describe('Optional A1:C10 window.'),
+      max_cells: z.number().int().min(1).max(DOCUMENT_LIMITS.xlsx_max_cells).optional(),
+      max_rows: z.number().int().min(1).max(DOCUMENT_LIMITS.xlsx_max_rows).optional(),
+      max_cols: z.number().int().min(1).max(DOCUMENT_LIMITS.xlsx_max_cols).optional(),
+      include_empty: z.boolean().optional(),
+    },
+    output: {
+      path: z.string(),
+      sheet: z.string(),
+      sheets: z.array(z.string()),
+      range: z.string().optional(),
+      rows: z.array(looseObject()),
+      row_count: z.number(),
+      cell_count: z.number(),
+      truncated: z.boolean(),
+    },
+    annotations: READ_ONLY,
+  }, args => extractXlsx(sandboxOf(args), args))
+
   // The file object the ChatGPT connector runtime substitutes for an attachment.
   // OpenAI's Apps SDK reference requires all four properties declared with
   // download_url and file_id required; the string branch exists because field
@@ -3127,6 +3322,7 @@ export function registerDirectActions(server, options) {
       fleet_state_dir: z.string(),
       log_dir: z.string(),
       relay: looseObject().describe('{configured, url, model} -- never the token.'),
+      web: looseObject().describe('{provider, model, picker_model} for the autonomous ChatGPT Web route.'),
       grok: looseObject().describe('{provider, models, cli_configured}'),
       limits: looseObject(),
       redacted: z.boolean(),
@@ -3137,11 +3333,16 @@ export function registerDirectActions(server, options) {
     model: config.model,
     execution: {
       default_mode: config.executionMode ?? 'relay',
+      configured_default_mode: config.configuredExecutionMode ?? config.executionMode ?? 'relay',
+      client_kind: config.requestClientKind ?? 'embedded',
       autonomous_configured: (config.autonomousProvider ?? '') !== '',
       autonomous_provider: config.autonomousProvider ?? '',
       autonomous_model: config.autonomousModel ?? '',
       relay_provider: config.provider,
       relay_model: config.model,
+      web_provider: config.webProvider ?? '',
+      web_model: config.webModel ?? '',
+      web_picker_model: config.webRelayModel ?? '',
     },
     project_root: config.workspaceRoot,
     permission: policy.snapshot(),
@@ -3152,6 +3353,7 @@ export function registerDirectActions(server, options) {
     fleet_state_dir: config.fleetStateDir,
     log_dir: config.logDir,
     relay: { configured: (config.relayUrl ?? '') !== '', url: config.relayUrl ?? '', model: config.relayModel },
+    web: { provider: config.webProvider ?? '', model: config.webModel ?? '', picker_model: config.webRelayModel ?? '' },
     grok: { provider: config.grokProvider, models: config.grokModels ?? [], cli_configured: (config.grokCliPath ?? '') !== '' },
     limits: { ...fs.FS_LIMITS, ...EXEC_LIMITS, ...git.GIT_LIMITS, ...tasks.TASK_LIMITS, ...TERMINAL_LIMITS, ...WORKSPACE_LIMITS },
     redacted: true,
@@ -3171,7 +3373,7 @@ export function registerDirectActions(server, options) {
   }, args => {
     try {
       const normalized = options.validateConfig(args.config ?? {})
-      const { token, relayToken, ...safe } = normalized
+      const { token, relayToken, omnicastControlToken, ...safe } = normalized
       return { valid: true, normalized: options.redact(safe) }
     } catch (error) {
       return { valid: false, message: error.message }
@@ -3214,6 +3416,8 @@ export function registerDirectActions(server, options) {
     },
     annotations: READ_ONLY,
   }, args => metrics.snapshot(args.limit ?? 50))
+
+  registerGameDevActions({ define, sandboxOf, policy, confinement, processes, workspaceIdOf, terminals, controller })
 
   return registry
 }

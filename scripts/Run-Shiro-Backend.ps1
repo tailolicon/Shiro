@@ -36,8 +36,25 @@ $env:SHIRO_BRIDGE_PORT = [string]$McpPort
 $RelayPort = if ([string]::IsNullOrWhiteSpace($RelaySettings.PORT)) { '23158' } else { $RelaySettings.PORT }
 $env:SHIRO_RELAY_URL = "http://127.0.0.1:$RelayPort"
 $env:SHIRO_RELAY_API_TOKEN = $RelaySettings.API_TOKEN
-$env:SHIRO_RELAY_MODEL = 'GPT-5.6 Sol'
+if ([string]::IsNullOrWhiteSpace($env:SHIRO_RELAY_MODEL)) { $env:SHIRO_RELAY_MODEL = 'GPT-5.6 Sol' }
+if ([string]::IsNullOrWhiteSpace($env:SHIRO_WEB_PROVIDER)) { $env:SHIRO_WEB_PROVIDER = 'shiro-web' }
+if ([string]::IsNullOrWhiteSpace($env:SHIRO_WEB_MODEL)) { $env:SHIRO_WEB_MODEL = 'gpt-5.6-sol' }
+if ([string]::IsNullOrWhiteSpace($env:SHIRO_WEB_RELAY_MODEL)) { $env:SHIRO_WEB_RELAY_MODEL = 'GPT-5.6 Sol' }
 $env:DSH_CLIENT_TITLE = 'Shiro'
+
+# Keep DeepSeek Harness as the loop owner while spending ChatGPT Web quota.
+# Connector-originated MCP requests follow the configured autonomous default,
+# so ChatGPT is only the operator/control surface rather than the per-round loop owner.
+if ([string]::IsNullOrWhiteSpace($env:SHIRO_AUTONOMOUS_PROVIDER) -and [string]::IsNullOrWhiteSpace($env:SHIRO_AUTONOMOUS_MODEL)) {
+    $env:SHIRO_AUTONOMOUS_PROVIDER = $env:SHIRO_WEB_PROVIDER
+    $env:SHIRO_AUTONOMOUS_MODEL = $env:SHIRO_WEB_MODEL
+}
+if (([string]::IsNullOrWhiteSpace($env:SHIRO_AUTONOMOUS_PROVIDER)) -ne ([string]::IsNullOrWhiteSpace($env:SHIRO_AUTONOMOUS_MODEL))) {
+    throw 'SHIRO_AUTONOMOUS_PROVIDER and SHIRO_AUTONOMOUS_MODEL must be configured together.'
+}
+if (-not [string]::IsNullOrWhiteSpace($env:SHIRO_AUTONOMOUS_PROVIDER) -and [string]::IsNullOrWhiteSpace($env:SHIRO_EXECUTION_MODE)) {
+    $env:SHIRO_EXECUTION_MODE = 'autonomous'
+}
 
 Push-Location $EngineRoot
 try {

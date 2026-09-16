@@ -2,8 +2,8 @@ import { isAbsolute, resolve } from 'node:path'
 
 // Which directory a Shiro-registered engine tool acts on.
 //
-// The two tools Shiro adds to the Harness engine (shiro-git-tool,
-// shiro-container-tool) used to bind one workspaceRoot at plugin apply() time.
+// The workspace-scoped tools Shiro adds to the Harness engine (shiro-git-tool,
+// shiro-container-tool, shiro-document-tool) used to bind one workspaceRoot at plugin apply() time.
 // That was correct while every session lived in the fixed project root, and
 // silently wrong the moment a session is anchored somewhere else: the agent
 // would read files from workspace B with the engine's own fs tools and then

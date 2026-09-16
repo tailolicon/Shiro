@@ -13,7 +13,7 @@ import { TerminalRegistry } from '../src/terminal-actions.js'
 import { ThreadRegistry } from '../src/thread-registry.js'
 import { WorkspaceRegistry } from '../src/workspaces.js'
 import { BridgeBroker, configureMcp, LOG_STREAMS, readServiceLog } from '../src/index.js'
-import { setConfirmationPolicy } from '../src/action-errors.js'
+import { ActionError, setConfirmationPolicy } from '../src/action-errors.js'
 
 // This file exercises the confirmation brake, which ships OFF: a destructive
 // action no longer costs a refusal-then-repeat round trip on an operator's own
@@ -30,6 +30,8 @@ const ORIGINAL_ACTIONS = [
 ]
 
 const DIRECT_ACTIONS = [
+  'game_toolchain_status', 'unity_command', 'blender_run', 'blender_inspect', 'blender_render',
+  'media_probe', 'audio_analyze', 'desktop_windows', 'desktop_capture', 'desktop_input', 'reload_readiness',
   'report_action_gap', 'action_gap_summary',
   'bridge_status', 'bridge_capabilities', 'session_runtime_status',
   'workspace_list', 'workspace_open', 'workspace_create', 'workspace_close',
@@ -37,12 +39,13 @@ const DIRECT_ACTIONS = [
   'worktree_snapshots', 'worktree_restore', 'worktree_handoff', 'worktree_snapshot_drop',
   'terminal_start', 'terminal_write', 'terminal_read', 'terminal_resize',
   'terminal_signal', 'terminal_stop', 'terminal_list',
-  'image_open', 'image_metadata', 'pdf_info', 'pdf_render_page', 'download_file', 'artifact_import',
-  'browser_tab_screenshot', 'browser_tab_navigate',
+  'image_open', 'image_metadata', 'pdf_info', 'pdf_render_page', 'pdf_extract_text', 'docx_extract_text', 'xlsx_extract', 'download_file', 'artifact_import',
+  'browser_tab_screenshot', 'browser_tab_collect_generated_image', 'browser_tab_navigate',
   'browser_dom_query', 'browser_tab_click', 'browser_tab_type', 'browser_tab_evaluate',
   'fs_read', 'fs_list', 'fs_stat', 'fs_search', 'fs_create_file', 'fs_update_file',
   'fs_mkdir', 'fs_delete', 'fs_move', 'fs_copy',
   'exec_run', 'process_start', 'process_status', 'process_logs', 'process_stop', 'process_list',
+  'host_system_info', 'host_process_list',
   'git_status', 'git_repo_info', 'git_diff', 'git_log', 'git_show', 'git_compare',
   'git_branch_list', 'git_branch_create', 'git_checkout', 'git_add', 'git_commit',
   'git_restore', 'git_reset', 'git_merge', 'git_rebase', 'git_tag_list', 'git_tag_create',
@@ -78,6 +81,9 @@ function testConfig(workspaceRoot, overrides = {}) {
     maxConcurrentTurns: 4,
     relayUrl: '',
     relayModel: 'GPT-5.6 Sol',
+    webProvider: 'shiro-web',
+    webModel: 'gpt-5.6-sol',
+    webRelayModel: 'GPT-5.6 Sol',
     grokProvider: 'shiro-grok',
     grokModels: ['grok-4.6'],
     grokCliPath: '',
@@ -144,7 +150,7 @@ function inertController() {
   }
 }
 
-async function withConnector(run, { fleetManager = null, controller = inertController(), runtime, allowlist = [], allowlistFromBase = false, permissionProfile, permissionRules } = {}) {
+async function withConnector(run, { fleetManager = null, controller = inertController(), runtime, workerControl, allowlist = [], allowlistFromBase = false, permissionProfile, permissionRules } = {}) {
   const base = await mkdtemp(join(tmpdir(), 'shiro-surface-'))
   const root = join(base, 'project')
   await mkdir(root)
@@ -168,6 +174,7 @@ async function withConnector(run, { fleetManager = null, controller = inertContr
       processes: new ProcessRegistry({ sandbox }),
       terminals: new TerminalRegistry(),
       metrics: new ActionMetrics(),
+      ...(workerControl === undefined ? {} : { workerControl }),
     }
   })()
   const connect = async () => {
@@ -250,6 +257,31 @@ test('the connector exposes every original action plus the direct-action surface
   })
 })
 
+test('worker admission gate blocks every direct worker creation path before spawning', async () => {
+  const seen = []
+  const workerControl = {
+    assertSpawnAllowed(kind, args) {
+      seen.push([kind, args.label ?? args.name ?? args.agent ?? args.argv?.[1]])
+      throw new ActionError('PERMISSION_REQUIRED', 'worker creation locked')
+    },
+  }
+  const fleetManager = fakeFleetManager()
+  await withConnector(async ({ call }) => {
+    for (const [name, args] of [
+      ['exec_run', { argv: ['node', 'scripts/Run-Hachimi-Temporary-Fleet.mjs'] }],
+      ['process_start', { argv: ['node', '-e', 'setInterval(()=>{},1000)'], label: 'w1-worker' }],
+      ['terminal_start', { argv: ['python3'], label: 'w2-fastpath' }],
+      ['subagent_start', { agent: 'codex', prompt: 'work' }],
+      ['fleet_start', { name: 'blocked-fleet', size: 1, prompt: 'work' }],
+    ]) {
+      const result = await call(name, args)
+      assert.equal(result.isError, true, name)
+      assert.equal(result.body.error.code, 'PERMISSION_REQUIRED', name)
+    }
+    assert.deepEqual(seen.map(item => item[0]), ['exec', 'process', 'terminal', 'subagent', 'fleet'])
+  }, { fleetManager, workerControl })
+})
+
 test('action-gap actions persist locally, aggregate duplicates and expose existing-action hints', async () => {
   await withConnector(async ({ call, root }) => {
     const first = await call('report_action_gap', {
@@ -307,12 +339,19 @@ test('direct actions never touch the engine, a session, or a model request', asy
       ['fs_search', { query: 'contents' }],
       ['task_list', {}],
       ['process_list', {}],
+      ['host_system_info', {}],
       ['harness_operation_list', {}],
       ['metrics_snapshot', {}],
       ['config_get', {}],
     ]) {
       const result = await call(name, args)
       assert.equal(result.isError, false, `${name} failed: ${JSON.stringify(result.body)}`)
+    }
+
+    if (process.platform === 'linux') {
+      const listed = await call('host_process_list', { pid: process.pid, limit: 1 })
+      assert.equal(listed.isError, false, JSON.stringify(listed.body))
+      assert.equal(listed.body.processes[0].pid, process.pid)
     }
 
     assert.deepEqual(used.forbidden, [], 'a direct action reached an engine entry point')
@@ -435,6 +474,10 @@ test('config and log introspection stay secret-free and allowlisted', async () =
     assert.equal(effective.provider, 'shiro-sol')
     assert.equal(effective.execution.default_mode, 'relay')
     assert.equal(effective.execution.autonomous_configured, false)
+    assert.equal(effective.execution.web_provider, 'shiro-web')
+    assert.equal(effective.execution.web_model, 'gpt-5.6-sol')
+    assert.equal(effective.execution.web_picker_model, 'GPT-5.6 Sol')
+    assert.equal(effective.web.picker_model, 'GPT-5.6 Sol')
     assert.equal(effective.redacted, true)
     assert.equal(effective.relay.configured, false)
     const serialized = JSON.stringify(effective)
@@ -445,6 +488,19 @@ test('config and log introspection stay secret-free and allowlisted', async () =
     })
     assert.equal(valid.body.valid, true)
     assert.ok(!JSON.stringify(valid.body.normalized).includes('a-real-bridge-token-value'), 'validation must not echo the token back')
+
+    const returnLeaseConfig = await call('config_validate', {
+      config: {
+        workspaceRoot: config.workspaceRoot,
+        token: 'a-real-bridge-token-value',
+        port: 23157,
+        omnicastControlToken: 'separate-omnicast-control-secret',
+        omnicastReturnStateFile: join(base, 'state', 'omnicast-return.json'),
+      },
+    })
+    assert.equal(returnLeaseConfig.body.valid, true)
+    assert.ok(!JSON.stringify(returnLeaseConfig.body.normalized).includes('separate-omnicast-control-secret'))
+    assert.equal('omnicastControlToken' in returnLeaseConfig.body.normalized, false)
 
     const autonomous = await call('config_validate', {
       config: {
@@ -459,6 +515,54 @@ test('config and log introspection stay secret-free and allowlisted', async () =
     assert.equal(autonomous.body.normalized.executionMode, 'autonomous')
     assert.equal(autonomous.body.normalized.autonomousProvider, 'native-openai')
     assert.equal(autonomous.body.normalized.autonomousModel, 'gpt-native')
+
+    const mismatchedWebRoute = await call('config_validate', {
+      config: {
+        workspaceRoot: config.workspaceRoot,
+        token: 'a-real-bridge-token-value',
+        port: 23157,
+        webProvider: 'shiro-web',
+        webModel: 'gpt-5.6-sol',
+        autonomousProvider: 'shiro-web',
+        autonomousModel: 'gpt-5.5',
+      },
+    })
+    assert.equal(mismatchedWebRoute.body.valid, false)
+    assert.match(mismatchedWebRoute.body.message, /autonomousModel must match webModel/)
+
+    const prohibitedWebModel = await call('config_validate', {
+      config: {
+        workspaceRoot: config.workspaceRoot,
+        token: 'a-real-bridge-token-value',
+        port: 23157,
+        webModel: 'gpt-6-astra',
+      },
+    })
+    assert.equal(prohibitedWebModel.body.valid, false)
+    assert.match(prohibitedWebModel.body.message, /forbidden by Shiro quota policy/)
+
+    const prohibitedWebPicker = await call('config_validate', {
+      config: {
+        workspaceRoot: config.workspaceRoot,
+        token: 'a-real-bridge-token-value',
+        port: 23157,
+        webRelayModel: 'GPT-6 Pro',
+      },
+    })
+    assert.equal(prohibitedWebPicker.body.valid, false)
+    assert.match(prohibitedWebPicker.body.message, /forbidden by Shiro quota policy/)
+
+    const webRouteWithoutRelay = await call('config_validate', {
+      config: {
+        workspaceRoot: config.workspaceRoot,
+        token: 'a-real-bridge-token-value',
+        port: 23157,
+        autonomousProvider: 'shiro-web',
+        autonomousModel: 'gpt-5.6-sol',
+      },
+    })
+    assert.equal(webRouteWithoutRelay.body.valid, false)
+    assert.match(webRouteWithoutRelay.body.message, /relayUrl and relayToken are configured/)
 
     const collision = await call('config_validate', {
       config: {
@@ -703,6 +807,7 @@ test('include_foreign grants no authority to any content or write action', async
 
     for (const [name, args] of [
       ['browser_tab_screenshot', { browser_tab_id: 4242 }],
+      ['browser_tab_collect_generated_image', { browser_tab_id: 4242, save_to: 'collected.png' }],
       ['browser_tab_navigate', { browser_tab_id: 4242, url: 'https://chatgpt.com/' }],
       ['browser_dom_query', { browser_tab_id: 4242, selector: 'button' }],
       ['browser_tab_click', { browser_tab_id: 4242, element_id: 't4242.g1:1' }],

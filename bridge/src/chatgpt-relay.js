@@ -4,6 +4,80 @@ const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000
 const DEFAULT_MAX_THREAD_TURNS = 40
 const EMPTY_RESPONSE_CODE = 'EMPTY_RESPONSE'
 
+// Every relay instance that targets the same browser bridge shares one physical
+// ChatGPT selection and conversation surface. Keep dispatches exclusive across
+// both the legacy Sol and autonomous Web adapters, and version that shared
+// surface so one adapter never sends a delta after another adapter changed the
+// active browser conversation.
+const RELAY_COORDINATORS = new Map()
+
+function relayCoordinator(url) {
+  let coordinator = RELAY_COORDINATORS.get(url)
+  if (coordinator === undefined) {
+    coordinator = { locked: false, waiters: [], conversationRevision: 0, selectedClientId: '' }
+    RELAY_COORDINATORS.set(url, coordinator)
+  }
+  return coordinator
+}
+
+function abortReason(signal) {
+  if (signal?.reason instanceof Error) return signal.reason
+  const error = new Error(String(signal?.reason ?? 'Request cancelled'))
+  error.name = 'AbortError'
+  return error
+}
+
+function releaseCoordinator(coordinator) {
+  while (coordinator.waiters.length > 0) {
+    const waiter = coordinator.waiters.shift()
+    if (waiter.signal?.aborted) {
+      waiter.signal.removeEventListener('abort', waiter.onAbort)
+      waiter.reject(abortReason(waiter.signal))
+      continue
+    }
+    waiter.signal?.removeEventListener('abort', waiter.onAbort)
+    let released = false
+    waiter.resolve(() => {
+      if (released) return
+      released = true
+      releaseCoordinator(coordinator)
+    })
+    return
+  }
+  coordinator.locked = false
+}
+
+function acquireCoordinator(coordinator, signal) {
+  if (signal?.aborted) return Promise.reject(abortReason(signal))
+  return new Promise((resolveAcquire, rejectAcquire) => {
+    const waiter = {
+      signal,
+      resolve: resolveAcquire,
+      reject: rejectAcquire,
+      onAbort: null,
+    }
+    waiter.onAbort = () => {
+      const index = coordinator.waiters.indexOf(waiter)
+      if (index === -1) return
+      coordinator.waiters.splice(index, 1)
+      signal.removeEventListener('abort', waiter.onAbort)
+      rejectAcquire(abortReason(signal))
+    }
+    if (!coordinator.locked) {
+      coordinator.locked = true
+      let released = false
+      resolveAcquire(() => {
+        if (released) return
+        released = true
+        releaseCoordinator(coordinator)
+      })
+      return
+    }
+    signal?.addEventListener('abort', waiter.onAbort, { once: true })
+    coordinator.waiters.push(waiter)
+  })
+}
+
 // Mirrors `DEFAULT_RETRYABLE_CODES` in engine/packages/llm/llm/src/retry-policy.ts.
 // Bridge cannot import that constant (see the RelayError doc comment below),
 // so the exact five codes are duplicated here; keep them in sync.
@@ -54,11 +128,138 @@ function normalizeLoopbackUrl(value) {
   return url.href.replace(/\/$/, '')
 }
 
-function effortForRelay(value) {
+function isBlankChatGptRootUrl(value) {
+  try {
+    const url = new URL(String(value ?? ''), 'https://chatgpt.com')
+    const host = url.hostname.toLowerCase()
+    return url.protocol === 'https:'
+      && (host === 'chatgpt.com' || host === 'www.chatgpt.com')
+      && (url.pathname === '/' || url.pathname === '')
+  } catch {
+    return false
+  }
+}
+
+function modelForRelay(configuredModel) {
+  const model = asRequiredString(configuredModel, 'relayModel')
+  // Never inherit the browser's currently selected model. A previous manual or
+  // worker tab may still be on GPT-6 Pro; explicitly selecting Sol on every
+  // relay request is the fail-closed quota boundary.
+  return model
+}
+
+function effortForRelay(value, configuredModel = '') {
+  // ChatGPT exposes Astra in ordinary Chat as the distinct `GPT-6 Pro`
+  // model option. The Instant/Medium/High/Extra High controls select Sol,
+  // rather than Astra reasoning effort, so applying one after GPT-6 Pro would
+  // silently switch the underlying model back. Selecting and verifying the
+  // model is sufficient; Harness effort remains advisory on this Web route.
+  if (/astra|gpt-?6\s+pro/i.test(configuredModel)) return ''
   if (value === 'light') return 'instant'
   if (value === 'standard') return 'medium'
-  if (value === 'high' || value === 'max') return 'high'
+  if (value === 'high') return 'high'
+  if (value === 'max') return 'xhigh'
   return 'auto'
+}
+
+function relaySelectionVerification(payload, requested) {
+  const events = Array.isArray(payload?.events) ? payload.events : []
+  const event = events.findLast?.(item => item?.type === 'model.apply.done')
+    ?? [...events].reverse().find(item => item?.type === 'model.apply.done')
+  if (event === undefined) {
+    return {
+      verified: requested.model === '' && requested.effort === '',
+      detail: 'the relay result contains no model.apply.done evidence',
+      verification: {},
+    }
+  }
+  const modelVerified = requested.model === '' || event.modelApplied === true
+  const effortVerified = requested.effort === '' || event.effortApplied === true
+  const selectedModel = event.intelligence?.selectedModel
+  const selectedEffort = event.intelligence?.selectedEffort
+  const observedModel = selectedModel?.label ?? selectedModel?.value ?? selectedModel?.id
+  const observedEffort = selectedEffort?.label ?? selectedEffort?.value ?? selectedEffort?.id
+  return {
+    verified: modelVerified && effortVerified,
+    detail: [
+      modelVerified ? '' : `model ${requested.model} was not confirmed`,
+      effortVerified ? '' : `effort ${requested.effort} was not confirmed`,
+    ].filter(Boolean).join('; '),
+    verification: {
+      model: requested.model !== '' && modelVerified ? String(observedModel ?? requested.model) : undefined,
+      effort: requested.effort !== '' && effortVerified ? String(observedEffort ?? requested.effort) : undefined,
+      evidence: {
+        source: 'browser-picker-pre-submit',
+        event_type: event.type,
+        effect_id: typeof event.effectId === 'string' ? event.effectId : undefined,
+        observed_at: typeof event.time === 'string' ? event.time : undefined,
+        requested_model: requested.model || undefined,
+        requested_effort: requested.effort || undefined,
+        model_applied: event.modelApplied === true,
+        effort_applied: event.effortApplied === true,
+      },
+    },
+  }
+}
+
+function normalizedModelIdentity(value) {
+  return String(value ?? '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '')
+}
+
+function gptVersion(value) {
+  const match = String(value ?? '').trim().toLowerCase().match(/(?:^|[^a-z0-9])gpt[\s._-]*(\d+)(?:[\s._-]+(\d+))?/)
+  if (match === null) return null
+  return { major: Number(match[1]), minor: match[2] === undefined ? null : Number(match[2]) }
+}
+
+function relayResponseModelVerification(payload, requestedModel) {
+  const observedSlug = typeof payload?.observedResponseModelSlug === 'string'
+    ? payload.observedResponseModelSlug.trim()
+    : ''
+  if (requestedModel === '') {
+    return { exactMatch: false, definiteMismatch: false, status: observedSlug === '' ? 'not-requested' : 'observed', observedSlug }
+  }
+  if (observedSlug === '') {
+    return {
+      exactMatch: false,
+      definiteMismatch: false,
+      status: 'missing',
+      observedSlug,
+      detail: 'the completed assistant turn contains no observedResponseModelSlug evidence',
+    }
+  }
+  if (normalizedModelIdentity(requestedModel) === normalizedModelIdentity(observedSlug)) {
+    return { exactMatch: true, definiteMismatch: false, status: 'matched', observedSlug, detail: '' }
+  }
+  const requested = gptVersion(requestedModel)
+  const observed = gptVersion(observedSlug)
+  const definiteMismatch = requested !== null && observed !== null && (
+    requested.major !== observed.major
+    || (requested.minor !== null && observed.minor !== null && requested.minor !== observed.minor)
+  )
+  return {
+    exactMatch: false,
+    definiteMismatch,
+    status: definiteMismatch ? 'mismatched' : 'unverified',
+    observedSlug,
+    detail: definiteMismatch
+      ? `assistant turn ${observedSlug} conflicts with selected model ${requestedModel}`
+      : `assistant turn ${observedSlug} is not an exact identifier match for selected model ${requestedModel}`,
+  }
+}
+
+function relayClientPromptReady(client) {
+  if (!client || typeof client !== 'object') return true
+  if (client.ready === false || client.quarantined === true) return false
+  // Compatibility with older bridge projections: missing readiness fields are
+  // unknown, not failures. Explicit false means the content runtime already
+  // proved that this tab cannot currently accept a prompt.
+  if (client.pageReady === false) return false
+  if (client.composerReady === false) return false
+  if (client.chatMainReady === false) return false
+  if (client.tabObservation?.document?.pageReady === false) return false
+  if (client.tabObservation?.composer?.ready === false) return false
+  return true
 }
 
 function resolveMaxThreadTurns(explicit) {
@@ -523,15 +724,17 @@ export class ChatGptBrowserRelay {
   #toolsHash = ''
   // The browser tab this relay is driving, remembered so a selection lost to
   // a navigation can be restored without a human choosing again.
-  #selectedClientId = null
+  #selectedClientId = ''
   // Count of replies that arrived without the structured protocol.
   #driftCount = 0
   // Set immediately before a dispatch and cleared only on a committed reply.
   // A failed turn may or may not have reached the composer, so the thread's
   // contents become unknown and the next turn must resend everything fresh.
   #forceFull = false
+  #coordinator
+  #observedConversationRevision
 
-  constructor({ url, token, model = 'GPT-5.6 Sol', timeoutMs = DEFAULT_TIMEOUT_MS, fetchImpl = fetch, maxThreadTurns, isReservedClient = () => false, bindSession = null }) {
+  constructor({ url, token, model = 'GPT-5.6 Sol', timeoutMs = DEFAULT_TIMEOUT_MS, fetchImpl = fetch, maxThreadTurns, isReservedClient = () => false, bindSession = null, requireSelectionVerification = false }) {
     this.bindSession = bindSession
     this.url = normalizeLoopbackUrl(url)
     this.token = asRequiredString(token, 'relayToken')
@@ -540,9 +743,64 @@ export class ChatGptBrowserRelay {
     this.fetch = fetchImpl
     this.maxThreadTurns = resolveMaxThreadTurns(maxThreadTurns)
     this.isReservedClient = typeof isReservedClient === 'function' ? isReservedClient : () => false
+    this.requireSelectionVerification = requireSelectionVerification === true
+    this.#coordinator = relayCoordinator(this.url)
+    this.#observedConversationRevision = this.#coordinator.conversationRevision
+    this.#selectedClientId = this.#coordinator.selectedClientId
   }
 
-  async #recordBinding(request, signal, result = {}) {
+  #reconcileSharedConversation() {
+    if (this.#observedConversationRevision === this.#coordinator.conversationRevision) return
+    this.#observedConversationRevision = this.#coordinator.conversationRevision
+    this.#selectedClientId = this.#coordinator.selectedClientId
+    this.#forceFull = true
+  }
+
+  #markSharedConversationChanged() {
+    this.#coordinator.conversationRevision += 1
+    this.#observedConversationRevision = this.#coordinator.conversationRevision
+  }
+
+  #requestedSelection(request) {
+    return {
+      model: modelForRelay(this.model),
+      effort: effortForRelay(request.generation?.reasoning_effort, this.model),
+    }
+  }
+
+  #verifySelection(payload, request, { finalResponse = true } = {}) {
+    const result = relaySelectionVerification(payload, this.#requestedSelection(request))
+    if (this.requireSelectionVerification && !result.verified) {
+      // A final response means the browser prompt already ran, so this failure
+      // must not use a retryable transport code and duplicate the ChatGPT turn.
+      const code = finalResponse ? 'MODEL_SELECTION_UNVERIFIED' : 'TRANSPORT'
+      throw new RelayError(`ChatGPT Web selection was not verified: ${result.detail}`, code)
+    }
+    const response = finalResponse
+      ? relayResponseModelVerification(payload, this.#requestedSelection(request).model)
+      : null
+    if (this.requireSelectionVerification && response?.definiteMismatch) {
+      throw new RelayError(`ChatGPT Web response model mismatch: ${response.detail}`, 'MODEL_RESPONSE_MISMATCH')
+    }
+    const pickerEvidence = result.verification.evidence
+    if (pickerEvidence === undefined && (response === null || response.observedSlug === '')) return undefined
+    return {
+      ...result.verification,
+      // `verified_model` is reserved for an exact completed-turn match. The
+      // picker result stays in evidence when the DOM slug is absent or opaque.
+      ...(response !== null && !response.exactMatch ? { model: undefined } : {}),
+      evidence: {
+        ...(pickerEvidence ?? {}),
+        source: response === null ? 'browser-picker-pre-submit' : 'browser-picker-and-response-turn',
+        ...(response === null ? {} : {
+          observed_response_model_slug: response.observedSlug || undefined,
+          response_model_status: response.status,
+        }),
+      },
+    }
+  }
+
+  async #recordBinding(request, signal, result = {}, verification) {
     if (!this.bindSession || !request.session_id) return
     let binding = { client_id: null, tab_id: null, conversation_id: null, url: null, requested_browser_model: this.model }
     // Only the relay's selected client is authoritative for routing. Never
@@ -562,7 +820,7 @@ export class ChatGptBrowserRelay {
         }
       }
     } catch { /* Unavailable observations remain explicitly unknown. */ }
-    await this.bindSession(request.session_id, binding)
+    await this.bindSession(request.session_id, binding, verification)
   }
 
   async #healthBody(signal) {
@@ -599,11 +857,19 @@ export class ChatGptBrowserRelay {
     }
     const usable = clients.filter(client => client?.ready === true
       && client?.quarantined !== true
+      // `ready` is the transport-level extension heartbeat. A cancelled or
+      // half-navigated ChatGPT conversation can keep that flag true while the
+      // content projection has already proved there is no usable composer.
+      // Never lease such a tab: otherwise every model call burns the full
+      // page-ready timeout before retrying the same broken conversation.
+      && client?.pageReady !== false
+      && client?.composerReady !== false
       && typeof client.id === 'string'
       && !this.isReservedClient(client))
     const remembered = usable.find(client => client.id === this.#selectedClientId)
-    // A conversation URL (/c/<id>) means someone has been chatting there.
-    const blank = usable.filter(client => !/\/c\//.test(String(client.url ?? '')))
+    // Only the literal blank ChatGPT root is safe for silent takeover. /share,
+    // /c, GPTs, projects, and every other page can hold real user work.
+    const blank = usable.filter(client => isBlankChatGptRootUrl(client.url))
     const chosen = remembered ?? (blank.length === 1 ? blank[0] : undefined)
     if (chosen === undefined) return null
     try {
@@ -618,14 +884,25 @@ export class ChatGptBrowserRelay {
       return null
     }
     this.#selectedClientId = chosen.id
+    this.#coordinator.selectedClientId = chosen.id
+    // Browser selection is part of the shared physical conversation state.
+    // Invalidate this instance's delta plan and every sibling relay instance,
+    // even when no model dispatch happened between the two selections.
+    this.#forceFull = true
+    this.#markSharedConversationChanged()
     return chosen.id
   }
 
   async health(signal) {
+    const timeout = AbortSignal.timeout(this.timeoutMs)
+    const combined = signal ? AbortSignal.any([signal, timeout]) : timeout
+    let release
     try {
-      let body = await this.#healthBody(signal)
+      release = await acquireCoordinator(this.#coordinator, combined)
+      this.#reconcileSharedConversation()
+      let body = await this.#healthBody(combined)
       if (body.needsSelection === true) {
-        const selected = await this.#autoSelectClient(signal)
+        const selected = await this.#autoSelectClient(combined)
         if (selected === null) {
           return {
             ready: false,
@@ -634,20 +911,47 @@ export class ChatGptBrowserRelay {
               + 'close the extra tabs or choose one in the Bridge panel',
           }
         }
-        body = await this.#healthBody(signal)
+        body = await this.#healthBody(combined)
       }
       // Remember whichever tab the bridge is driving, so a selection lost to a
       // navigation (every new thread navigates the tab) can be restored.
       if (typeof body.selectedClientId === 'string' && body.selectedClientId !== '') {
+        if (this.#selectedClientId !== '' && body.selectedClientId !== this.#selectedClientId) {
+          // A human or another bridge client changed the selected tab outside
+          // this instance. The browser conversation behind our delta cursor is
+          // no longer known, so invalidate all relay instances before dispatch.
+          this.#forceFull = true
+          this.#markSharedConversationChanged()
+        }
         this.#selectedClientId = body.selectedClientId
+        this.#coordinator.selectedClientId = body.selectedClientId
+      }
+      const connected = Number(body.clients ?? 0)
+      const bridgeReady = body.ok === true && connected > 0 && body.needsSelection !== true
+      if (bridgeReady && body.activeClient && !relayClientPromptReady(body.activeClient)) {
+        // Transport heartbeat is still alive, but ChatGPT has permanently lost
+        // its composer on this conversation. Do not send a delta into that tab:
+        // the relay server will auto-open a fresh prompt-ready tab, and forcing
+        // a full resend here preserves Harness context on the new conversation.
+        this.#forceFull = true
+        this.#selectedClientId = ''
+        this.#coordinator.selectedClientId = ''
+        this.#markSharedConversationChanged()
+        return {
+          ready: true,
+          clients: connected,
+          detail: 'active ChatGPT tab is not prompt-ready; re-anchoring the next model round on a fresh tab',
+        }
       }
       return {
-        ready: body.ok === true && Number(body.clients ?? 0) > 0 && body.needsSelection !== true,
-        clients: Number(body.clients ?? 0),
+        ready: bridgeReady,
+        clients: connected,
         detail: body.needsSelection === true ? 'browser tab selection required' : '',
       }
     } catch (error) {
       return { ready: false, detail: error instanceof Error ? error.message : String(error) }
+    } finally {
+      release?.()
     }
   }
 
@@ -756,14 +1060,26 @@ export class ChatGptBrowserRelay {
   }
 
   #buildBody(request, plan, attachments, stream) {
+    const selection = this.#requestedSelection(request)
     return {
       message: plan.delta === null || plan.delta === undefined
         ? relayPrompt(request)
         : relayDeltaPrompt(request, plan.delta),
-      model: this.model,
-      effort: effortForRelay(request.generation?.reasoning_effort),
+      model: selection.model,
+      effort: selection.effort,
       newSession: plan.newSession,
-      autoOpenTab: false,
+      // Pin the dispatch to the tab health() actually inspected. If another
+      // actor changes the relay selection in the health-to-submit gap, the
+      // server either uses this client or fails; it never sends a delta to the
+      // newly selected unrelated conversation.
+      ...(this.#selectedClientId === '' ? {} : { sourceClientId: this.#selectedClientId }),
+      // A fresh physical tab is needed only when no safe browser client is
+      // already selected. `newSession` resets the ChatGPT conversation inside
+      // the selected tab; it must not also request another physical tab, or a
+      // retry before prompt.submit can fan out blank tabs indefinitely.
+      // If the selected client becomes unusable, the request fails and the
+      // next health/retry can clear/reselect before auto-open is considered.
+      autoOpenTab: plan.newSession && this.#selectedClientId === '',
       ...(attachments === undefined ? {} : { attachments }),
       ...(stream ? { stream: true } : {}),
     }
@@ -824,20 +1140,34 @@ export class ChatGptBrowserRelay {
   async complete(request, signal, images = []) {
     const timeout = AbortSignal.timeout(this.timeoutMs)
     const combined = signal ? AbortSignal.any([signal, timeout]) : timeout
-    const plan = this.#planThread(request)
-    await this.#recordBinding(request, combined)
-    const attachments = images.length > 0 ? await this.#uploadImages(images, combined, signal) : undefined
-    // From here the prompt may reach the composer; only a committed reply
-    // proves what the thread now holds.
-    this.#forceFull = true
-    const response = await this.#post('/chat', this.#buildBody(request, plan, attachments, false), combined, signal)
-    const body = await response.json().catch(() => ({}))
-    await this.#recordBinding(request, combined, body)
-    const rawText = String(body.response ?? body.answer ?? '')
-    const result = parseReply(rawText, request.tools)
-    this.#commitThread(plan, request)
-    if (result.protocolDrift) this.#noteDrift(plan)
-    return result
+    let release
+    try {
+      release = await acquireCoordinator(this.#coordinator, combined)
+    } catch (error) {
+      throw classifyFetchFailure(error, signal)
+    }
+    try {
+      this.#reconcileSharedConversation()
+      const plan = this.#planThread(request)
+      await this.#recordBinding(request, combined)
+      const attachments = images.length > 0 ? await this.#uploadImages(images, combined, signal) : undefined
+      // From here the prompt may reach the composer; only a committed reply
+      // proves what the thread now holds. The shared revision invalidates every
+      // other relay instance that targets this same browser bridge.
+      this.#forceFull = true
+      this.#markSharedConversationChanged()
+      const response = await this.#post('/chat', this.#buildBody(request, plan, attachments, false), combined, signal)
+      const body = await response.json().catch(() => ({}))
+      const verification = this.#verifySelection(body, request)
+      await this.#recordBinding(request, combined, body, verification)
+      const rawText = String(body.response ?? body.answer ?? '')
+      const result = parseReply(rawText, request.tools)
+      this.#commitThread(plan, request)
+      if (result.protocolDrift) this.#noteDrift(plan)
+      return result
+    } finally {
+      release()
+    }
   }
 
   /**
@@ -854,82 +1184,118 @@ export class ChatGptBrowserRelay {
    * issues a second HTTP request to "recover" from a mid-stream problem --
    * once one browser-side prompt has been submitted, resubmitting would
    * duplicate a real ChatGPT turn instead of safely retrying a local parse.
-   */
+  */
   async *streamComplete(request, signal, images = []) {
     const timeout = AbortSignal.timeout(this.timeoutMs)
     const combined = signal ? AbortSignal.any([signal, timeout]) : timeout
-    const plan = this.#planThread(request)
-    await this.#recordBinding(request, combined)
-    const attachments = images.length > 0 ? await this.#uploadImages(images, combined, signal) : undefined
-    // Same rule as complete(): the thread's contents are unknown until commit.
-    this.#forceFull = true
-    const response = await this.#post('/chat', this.#buildBody(request, plan, attachments, true), combined, signal)
-
-    const body = response.body
-    const contentType = response.headers?.get?.('content-type') ?? ''
-    if (!contentType.includes('text/event-stream') || body === null || body === undefined || typeof body.getReader !== 'function') {
-      const parsed = await response.json().catch(() => null)
-      await this.#recordBinding(request, combined, parsed ?? {})
-      const rawText = parsed === null ? '' : String(parsed.response ?? parsed.answer ?? '')
-      const result = parseReply(rawText, request.tools)
-      this.#commitThread(plan, request)
-      if (result.protocolDrift) this.#noteDrift(plan)
-      yield { type: 'final', value: result }
-      return
-    }
-
-    const extractor = new IncrementalTextExtractor()
-    const reader = body.getReader()
-    const decoder = new TextDecoder()
-    let sseBuffer = ''
-    let finalResult
-    let streamError
+    let release
     try {
-      while (finalResult === undefined && streamError === undefined) {
-        let value, done
-        try {
-          ({ value, done } = await reader.read())
-        } catch (error) {
-          // Same taxonomy as #post: a mid-stream timeout or dropped
-          // connection must surface as a retryable TIMEOUT/TRANSPORT code,
-          // while a genuine user abort passes through for the adapter's
-          // aborted-finish handling.
-          throw classifyFetchFailure(error, signal)
+      release = await acquireCoordinator(this.#coordinator, combined)
+    } catch (error) {
+      throw classifyFetchFailure(error, signal)
+    }
+    try {
+        this.#reconcileSharedConversation()
+        const plan = this.#planThread(request)
+        await this.#recordBinding(request, combined)
+        const attachments = images.length > 0 ? await this.#uploadImages(images, combined, signal) : undefined
+        // Same rule as complete(): the thread's contents are unknown until commit.
+        this.#forceFull = true
+        this.#markSharedConversationChanged()
+        const response = await this.#post('/chat', this.#buildBody(request, plan, attachments, true), combined, signal)
+
+        const body = response.body
+        const contentType = response.headers?.get?.('content-type') ?? ''
+        if (!contentType.includes('text/event-stream') || body === null || body === undefined || typeof body.getReader !== 'function') {
+          const parsed = await response.json().catch(() => null)
+          const verification = this.#verifySelection(parsed ?? {}, request)
+          await this.#recordBinding(request, combined, parsed ?? {}, verification)
+          const rawText = parsed === null ? '' : String(parsed.response ?? parsed.answer ?? '')
+          const result = parseReply(rawText, request.tools)
+          this.#commitThread(plan, request)
+          if (result.protocolDrift) this.#noteDrift(plan)
+          yield { type: 'final', value: result }
+          return
         }
-        if (done) break
-        sseBuffer += decoder.decode(value, { stream: true })
-        let frameEnd = sseBuffer.indexOf('\n\n')
-        while (frameEnd !== -1) {
-          const frame = sseBuffer.slice(0, frameEnd)
-          sseBuffer = sseBuffer.slice(frameEnd + 2)
-          const parsed = parseSseFrame(frame)
-          if (parsed !== null) {
-            if (parsed.type === 'request.result') {
-              finalResult = parsed.result
-            } else if (parsed.type === 'request.error') {
-              streamError = sseErrorToRelayError(parsed)
-            } else if (parsed.type === 'answer.snapshot' || parsed.type === 'answer.delta') {
-              const delta = typeof parsed.delta === 'string' ? parsed.delta : ''
-              if (delta.length > 0) for (const chunk of extractor.push(delta)) yield { type: 'delta', text: chunk }
+
+        const extractor = new IncrementalTextExtractor()
+        const reader = body.getReader()
+        const decoder = new TextDecoder()
+        let sseBuffer = ''
+        let finalResult
+        let streamError
+        // Strict Web routes buffer every preview until the terminal assistant
+        // turn supplies response-model evidence. Picker verification alone is
+        // insufficient because ChatGPT may fall back after selection.
+        const bufferUntilFinalVerification = this.requireSelectionVerification
+        const pendingDeltas = []
+        const observedSelectionEvents = []
+        try {
+          while (finalResult === undefined && streamError === undefined) {
+            let value, done
+            try {
+              ({ value, done } = await reader.read())
+            } catch (error) {
+              // Same taxonomy as #post: a mid-stream timeout or dropped
+              // connection must surface as a retryable TIMEOUT/TRANSPORT code,
+              // while a genuine user abort passes through for the adapter's
+              // aborted-finish handling.
+              throw classifyFetchFailure(error, signal)
+            }
+            if (done) break
+            sseBuffer += decoder.decode(value, { stream: true })
+            let frameEnd = sseBuffer.indexOf('\n\n')
+            while (frameEnd !== -1) {
+              const frame = sseBuffer.slice(0, frameEnd)
+              sseBuffer = sseBuffer.slice(frameEnd + 2)
+              const parsed = parseSseFrame(frame)
+              if (parsed !== null) {
+                if (parsed.type === 'request.result') {
+                  finalResult = parsed.result
+                } else if (parsed.type === 'request.error') {
+                  streamError = sseErrorToRelayError(parsed)
+                } else if (parsed.type === 'model.apply.done') {
+                  // Model selection precedes prompt submission. Required Web
+                  // routes verify it immediately, but still retain answer bytes
+                  // until the completed turn proves its observed model family.
+                  observedSelectionEvents.push(parsed)
+                  this.#verifySelection({ events: [parsed] }, request, { finalResponse: false })
+                } else if (parsed.type === 'answer.snapshot' || parsed.type === 'answer.delta') {
+                  const delta = typeof parsed.delta === 'string' ? parsed.delta : ''
+                  if (delta.length > 0) {
+                    for (const chunk of extractor.push(delta)) {
+                      if (bufferUntilFinalVerification) pendingDeltas.push(chunk)
+                      else yield { type: 'delta', text: chunk }
+                    }
+                  }
+                }
+              }
+              if (finalResult !== undefined || streamError !== undefined) break
+              frameEnd = sseBuffer.indexOf('\n\n')
             }
           }
-          if (finalResult !== undefined || streamError !== undefined) break
-          frameEnd = sseBuffer.indexOf('\n\n')
+        } finally {
+          try { await reader.cancel() } catch {}
         }
-      }
-    } finally {
-      try { await reader.cancel() } catch {}
-    }
 
-    if (streamError !== undefined) throw streamError
-    if (finalResult === undefined) {
-      throw new RelayError('ChatGPT browser relay stream ended before a result was received', 'TRANSPORT')
+        if (streamError !== undefined) throw streamError
+        if (finalResult === undefined) {
+          throw new RelayError('ChatGPT browser relay stream ended before a result was received', 'TRANSPORT')
+        }
+        const terminalEvents = Array.isArray(finalResult.events) ? finalResult.events : []
+        const verificationPayload = observedSelectionEvents.length === 0
+          ? finalResult
+          : { ...finalResult, events: [...terminalEvents, ...observedSelectionEvents] }
+        const verification = this.#verifySelection(verificationPayload, request)
+        const rawText = String(finalResult.answer ?? '')
+        const result = parseReply(rawText, request.tools)
+        await this.#recordBinding(request, combined, finalResult, verification)
+        this.#commitThread(plan, request)
+        if (result.protocolDrift) this.#noteDrift(plan)
+        for (const text of pendingDeltas) yield { type: 'delta', text }
+        yield { type: 'final', value: result }
+    } finally {
+      release()
     }
-    await this.#recordBinding(request, combined, finalResult)
-    const rawText = String(finalResult.answer ?? '')
-    const result = parseReply(rawText, request.tools)
-    this.#commitThread(plan, request)
-    if (result.protocolDrift) this.#noteDrift(plan)
-    yield { type: 'final', value: result }
   }
 }

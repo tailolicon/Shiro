@@ -64,7 +64,7 @@ test('the documented public entrypoints are all exported', async () => {
   // docs/CONNECTOR_ACTIONS.md and README call the JS SDK public; an export map
   // that omits it makes `import '@shiro-ai/harness-bridge/sdk'` fail for every
   // consumer that is not reading the source tree directly.
-  for (const subpath of ['.', './container-tool', './git-tool', './sdk']) {
+  for (const subpath of ['.', './container-tool', './git-tool', './host-tool', './document-tool', './sdk']) {
     assert.ok(pkg.exports[subpath], `${subpath} must be exported`)
     assert.ok(existsSync(join(ROOT, pkg.exports[subpath])), `${subpath} points at a missing file`)
   }

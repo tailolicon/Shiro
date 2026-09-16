@@ -136,6 +136,8 @@ $Profile = [ordered]@{
         '@deepseek-ai/dsh-settings' = "link:$EngineLink/packages/settings/settings"
         '@deepseek-ai/dsh-subagent' = "link:$EngineLink/packages/subagent/subagent"
         '@deepseek-ai/dsh-tools' = "link:$EngineLink/packages/core/tools"
+        '@deepseek-ai/dsh-experimental-agent-team' = "link:$EngineLink/packages/experimental/agent-team"
+        '@deepseek-ai/dsh-experimental-tool-agent-team' = "link:$EngineLink/packages/experimental/tool-agent-team"
         '@shiro-ai/harness-bridge' = "link:$BridgeLink"
         '@deepseek-ai/dsh-web-search-exa' = "link:$WebSearchExaLink"
         'dsh-client-auto-continue' = "file:$AutoContinueLink"
@@ -330,8 +332,8 @@ function Find-ChromePath {
 }
 
 if (-not $NoDesktop -and [int]($RelayHealth.clients) -lt 1) {
-    # Keep GPT-5.6 Sol reachable without a visible browser: run the companion
-    # extension inside a dedicated, minimized Chrome profile. Login and the
+    # Keep the Sol-only ChatGPT Web relay reachable without a visible browser: run the companion
+    # extension inside a dedicated, minimized Chrome profile. Shiro policy forbids GPT-6 Pro/Astra. Login and the
     # one-time Bridge-token connection persist in that profile, so after the
     # first setup this starts silently.
     $ChromeProfileRoot = Join-Path $RuntimeRoot 'chrome-profile'

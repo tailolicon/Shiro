@@ -22,12 +22,16 @@ const TOKEN = 'test-bridge-token'
  * where an SSE frame or a missing header actually goes wrong.
  */
 async function bridge(workspaceRoot) {
+  const clientMarkers = []
+  const controlMarkers = []
   const controller = {
     broker: new BridgeBroker(),
     async sessions() { return { workspace_id: 'project', sessions: [] } },
     async status() { return { status: 'idle' } },
   }
   const server = createServer(async (req, res) => {
+    clientMarkers.push(req.headers['x-shiro-client'] ?? '')
+    controlMarkers.push(req.headers['x-shiro-omnicast-control'] ?? '')
     if ((req.headers.authorization ?? '') !== `Bearer ${TOKEN}`) {
       res.writeHead(401, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ error: 'unauthorized' }))
@@ -42,7 +46,7 @@ async function bridge(workspaceRoot) {
   })
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
   const { port } = server.address()
-  return { port, url: `http://127.0.0.1:${port}/mcp`, close: () => new Promise(resolve => server.close(resolve)) }
+  return { port, url: `http://127.0.0.1:${port}/mcp`, clientMarkers, controlMarkers, close: () => new Promise(resolve => server.close(resolve)) }
 }
 
 async function havePython() {
@@ -83,6 +87,9 @@ with Shiro() as shiro:
         out["error"] = [error.code, error.action, bool(str(error))]
     out["thread_id"] = shiro.thread("  session-9 ").id
 
+with Shiro(control_token="private-control") as controlled:
+    out["controlled_read"] = controlled.fs_read(path="note.txt")["content"]
+
 # A wrong token must fail as transport, not as a confusing action error.
 try:
     Shiro(token="wrong").fs_read(path="note.txt")
@@ -103,7 +110,12 @@ print(json.dumps(out))
   assert.ok(result.listed >= 1)
   assert.deepEqual(result.error, ['NOT_FOUND', 'fs_read', true])
   assert.equal(result.thread_id, 'session-9')
+  assert.match(result.controlled_read, /hello from python/)
   assert.equal(result.unauthorized, true)
+  assert.ok(service.clientMarkers.length > 0)
+  assert.ok(service.clientMarkers.every(marker => marker === 'shiro-python'))
+  assert.ok(service.controlMarkers.includes('private-control'))
+  assert.ok(service.controlMarkers.every(marker => marker === '' || marker === 'private-control'))
 })
 
 test('the shiro command drives a real bridge over HTTP', async t => {

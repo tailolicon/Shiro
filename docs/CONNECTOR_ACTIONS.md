@@ -1,6 +1,6 @@
 # Shiro connector — direct actions và Harness agent
 
-Tài liệu này mô tả bề mặt MCP mà connector Shiro cung cấp cho ChatGPT: **131 action** (cộng thêm tool plugin DSH đăng ký ở layer global; tổng cuối cùng phụ thuộc các plugin đang bật, xem "Kho plugin DSH")
+Tài liệu này mô tả bề mặt MCP mà connector Shiro cung cấp cho ChatGPT: **148 action** (cộng thêm tool plugin DSH đăng ký ở layer global; tổng cuối cùng phụ thuộc các plugin đang bật, xem "Kho plugin DSH")
 chia theo họ, quy ước schema/lỗi/phân trang, và ranh giới an toàn của từng nhóm.
 
 ## Direct Actions vs Harness Agent
@@ -51,6 +51,8 @@ thì mới trả tiền cho một Harness turn; còn lại thì một action là
 | Thực sự *nhìn* một ảnh | `image_open` | `fs_read` base64 |
 | Kích thước/định dạng ảnh mà không tải bytes | `image_metadata` | `fs_stat` |
 | Thực sự *nhìn* một trang PDF | `pdf_info` → `pdf_render_page` | trích text bằng CLI |
+| Trích text PDF / DOCX / XLSX | `pdf_extract_text`, `docx_extract_text`, `xlsx_extract` | `exec_run` với pdftotext/unzip |
+| Xem host đang chạy gì (read-only) | `host_system_info`, `host_process_list` | `exec_run` với `ps` |
 | Đọc lại một thread như dòng sự kiện | `thread_events` | `harness_session_log` (thô hơn) |
 | Bẻ lái một turn đang chạy mà không hủy | `turn_steer` | `harness_cancel` rồi start lại |
 | Thử một hướng khác từ giữa thread | `thread_fork` | copy prompt sang session mới |
@@ -95,7 +97,8 @@ hợp đồng công khai chỉ có `project_root` (`bridge_status`/`bridge_capab
 `path` của mỗi workspace (`workspace_list`/`workspace_open`).
 
 **Workspace.** Action họ `filesystem`/`process`(exec+start)/`git`/`task`/`artifact`/
-`media`/`network`/`terminal` nhận thêm tham số tùy chọn `workspace`. Bỏ trống = workspace
+`media`/`network`/`terminal` nhận thêm tham số tùy chọn `workspace`. Họ `host` thì không:
+`host_system_info`/`host_process_list` mô tả máy chạy bridge, không một workspace. Bỏ trống `workspace` = workspace
 `project` (root cố định), tức mọi lời gọi cũ giữ nguyên hành vi. Chi tiết ở mục
 **workspace** bên dưới.
 
@@ -202,9 +205,9 @@ trên đúng cây đó:
 - Engine workspace định danh theo path (`apiProxy.workspace.create({path})`), session neo
   theo `cwd` của workspace.
 - Tool fs/bash built-in của engine vốn đã resolve theo `exec.agent.session.header.cwd`.
-- Hai tool Shiro tự đăng ký (`shiro-git-tool`, `shiro-container-tool`) nay theo cùng quy tắc
+- Tool Shiro tự đăng ký (`shiro-git-tool`, `shiro-container-tool`, `shiro-document-tool`) nay theo cùng quy tắc
   đó (`bridge/src/session-root.js`) thay vì bind một root lúc `apply()` — nếu không, agent
-  sẽ đọc file ở workspace B rồi commit vào repo Shiro.
+  sẽ đọc file ở workspace B rồi commit vào repo Shiro. `shiro-host-tool` không theo cwd vì nó đọc máy, không đọc workspace.
 - **Session được namespace theo workspace**: `harness_sessions({workspace})` chỉ liệt kê
   session của workspace đó, và resume một session từ workspace khác bị từ chối kèm lý do.
 - Workspace phải **đang mở** thì mới neo được: id lạ fail `NOT_FOUND` **trước khi** engine
@@ -307,6 +310,14 @@ một byte nào** (cố ý không dùng `--3way`: nó ghi conflict marker vào t
 | `process_stop` | destructive | SIGTERM rồi SIGKILL sau `grace_ms` |
 | `process_list` | read | **Chỉ** tiến trình do bridge khởi động |
 
+### host — máy chạy bridge, chỉ đọc
+| Action | Loại | Mô tả |
+|---|---|---|
+| `host_system_info` | read | Hostname, OS, arch, CPU, memory, load, uptime, pid của bridge. **Không** dump environment |
+| `host_process_list` | read | Snapshot `/proc` có giới hạn; cmdline được redact + cắt. **Không** mở environ/cwd/exe, **không** gửi tín hiệu |
+
+`process_list` vẫn chỉ thấy tiến trình do bridge tạo. `host_process_list` là lớp đọc máy, Linux-only, phân trang `limit`/`cursor`. Muốn dừng một tiến trình lạ thì **không có action** — `process_stop` chỉ tín hiệu child do bridge spawn.
+
 ### subagent — Claude Code / Codex / Grok / Antigravity CLI thật, chạy như sub-agent của Shiro
 | Action | Loại | Mô tả |
 |---|---|---|
@@ -389,6 +400,9 @@ debugger, TUI — cần một tty thật cộng kênh gõ tiếp. Đó là họ 
 | `image_metadata` | read | Định dạng + kích thước pixel đọc thẳng từ header, không giải mã |
 | `pdf_info` | read | Số trang, tiêu đề, khổ giấy, trạng thái mã hóa (poppler `pdfinfo`) |
 | `pdf_render_page` | read | Render **một trang** thành PNG trả inline (poppler `pdftoppm`) |
+| `pdf_extract_text` | read | Text PDF qua poppler `pdftotext`; trần ký tự + khoảng trang |
+| `docx_extract_text` | read | Text đoạn từ DOCX; chống zip-bomb/mã hóa, trần ký tự |
+| `xlsx_extract` | read | Cửa sổ ô XLSX (sheet + range A1:C10 + trần cell/row/col) |
 
 `fs_read` trả base64 cho một PNG, thứ chẳng nói lên điều gì với model. Hai action `*_open`
 trả content block thật để ảnh/trang PDF đi tới được model. `pdf_render_page` render qua
@@ -694,6 +708,35 @@ từ chối thử lại sẽ bỏ rơi nó.
 
 ## Gọi từ shell và từ script
 
+### OmniCast return-only mailbox
+
+Long OmniCast prose does not return through ChatGPT DOM. A marked local client calls
+`omnicast_return_open` with an unpredictable nonce, the selected connector client id,
+and a separate local-only control credential that is never sent through the tunnel.
+The lease is persisted. While it exists, every
+inbound ChatGPT connector request is built with exactly one registered action:
+`omnicast_submit_story`. The normal filesystem, shell, Git, browser, Harness and mirrored
+engine tools are absent server-side for that request, even if ChatGPT cached their old
+catalog. The browser relay accepts the matching passive prompt once and records its
+user-turn key in a separate nonce-bound reservation; Shiro remains the sole writer of result
+state, so a concurrent connector receipt cannot be overwritten. BrowserBridge, workflow,
+turn/session, `/chat`, OpenAI-compatible, recovery and diagnostic answer paths are excluded
+for the lifetime of the lease. `/browser/clients` retains only metadata required for idle
+proof and strips DOM answer bytes. An ambiguous browser submission is reserved but never
+retried. The model submits `{nonce, text}`; OmniCast long-polls `omnicast_return_read` and
+validates nonce/UTF-8 byte count/SHA-256. `omnicast_return_close` uses a separate exclusive
+close claim and succeeds only when Shiro itself proves the exact bound browser turn idle;
+the caller cannot assert that fact. Expiry and restart both remain fail-closed until that
+server-proved close safely reconciles the persisted lease.
+
+| Action | Caller | Purpose |
+|---|---|---|
+| `omnicast_return_open` | marked local CLI/SDK + private control token | Open one nonce/client/TTL/byte-bound persisted lease |
+| `omnicast_submit_story` | inbound ChatGPT connector only | Submit the exact generated text |
+| `omnicast_return_status` | marked local CLI/SDK + private control token | Inspect/reconcile a lease without returning prose |
+| `omnicast_return_read` | marked local CLI/SDK + private control token | Poll/read the persisted connector result |
+| `omnicast_return_close` | marked local CLI/SDK + private control token | Atomically reopen the normal catalog after server-proved idle |
+
 ChatGPT không phải client duy nhất. Cùng một bề mặt action dùng được từ terminal và từ
 code, qua ba lớp mỏng dùng chung đúng endpoint MCP đó:
 
@@ -765,9 +808,10 @@ turn rồi treo chờ người khác trả lời — nên nó không tồn tại
   chỉ tới process group của pty do bridge tạo; khi bridge tắt, mọi terminal bị kill.
 - **Ra mạng có kiểm soát**: `download_file` chỉ http(s), chặn credential trong URL, chặn
   dải link-local, giới hạn redirect và byte, và luôn đòi `confirm`.
-- **Chỉ tiến trình của bridge**: `process_list` không liệt kê tiến trình hệ thống;
+- **Chỉ tiến trình của bridge (ghi/tín hiệu)**: `process_list` không liệt kê tiến trình hệ thống;
   `process_stop` không gửi tín hiệu cho tiến trình lạ. Khi bridge tắt, mọi tiến trình
-  nó khởi động bị kill.
+  nó khởi động bị kill. `host_process_list` **chỉ đọc** `/proc`, redact cmdline, không mở
+  environ, và cố ý **không** có `host_process_stop`.
 - **Che secret**: remote URL có credential, output `git_fetch`/`pull`/`push`, `config_get`
   và `logs_tail` đều đi qua redactor (`bridge/src/redact.js`).
 - **`logs_tail` là ngoại lệ có kiểm soát**: log dịch vụ nằm ngoài project root, nên

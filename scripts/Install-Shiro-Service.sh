@@ -17,16 +17,19 @@ set -Eeuo pipefail
 #   shiro-backend.service   foreground dsh engine,  Restart=always
 #   shiro-tunnel.service    foreground tunnel client, Restart=always,
 #                           skipped cleanly (Condition) until it is configured
-#   shiro-chromium.service  the dedicated fleet browser, Restart=always
+#   shiro-chromium.service  the dedicated fleet browser, Restart=on-failure
 #   shiro-watchdog.timer    HTTP health checks -- catches alive-but-dead-port
 #   shiro.target            groups the lot; WantedBy=graphical-session.target,
 #                           so on Omarchy (autologin straight into Hyprland)
 #                           "machine on" means "Shiro up"
 #
-# Restart=always + StartLimitIntervalSec=0 is the contract "phải luôn luôn
-# sống": systemd never gives up on a crashed piece. Deliberate stops go through
-# Stop-Shiro.sh (which stops the target, so nothing fights the supervisor),
-# and code updates go through Reload-Shiro.sh.
+# Long-running daemon pieces use Restart=always + StartLimitIntervalSec=0 so
+# systemd never gives up on a crashed backend/relay/tunnel. Chromium is the one
+# deliberate exception: a second Chromium invocation for an already-owned
+# --user-data-dir forwards its URL into the existing browser and exits 0. With
+# Restart=always that becomes a 5-second new-tab loop, so the browser uses
+# Restart=on-failure instead. Deliberate stops go through Stop-Shiro.sh and code
+# updates go through Reload-Shiro.sh.
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$script_dir/.." && pwd)"
@@ -156,7 +159,9 @@ After=shiro-prepare.service shiro-relay.service graphical-session.target
 [Service]
 Environment=PATH=$unit_path
 ExecStart=/usr/bin/chromium --user-data-dir=$runtime_root/chrome-profile --load-extension=$runtime_root/chatgpt-extension --no-first-run --no-default-browser-check --disable-background-timer-throttling --ozone-platform-hint=auto --start-minimized https://chatgpt.com/
-Restart=always
+# Chromium exits 0 when this profile is already owned and forwards the URL to
+# that browser. Restart=always would therefore inject a new tab every cycle.
+Restart=on-failure
 RestartSec=5
 StartLimitIntervalSec=0
 SyslogIdentifier=shiro-chromium

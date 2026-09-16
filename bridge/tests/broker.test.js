@@ -81,6 +81,56 @@ test('adapter bypasses a ready relay while an MCP root turn is running', async (
   assert.deepEqual(chunks.at(-1), { type: 'finish', reason: { kind: 'stop' } })
 })
 
+test('autonomous Web adapter uses the browser relay during an MCP root turn and never publishes a broker handoff', async () => {
+  const broker = new BridgeBroker()
+  broker.operationProbe = () => true
+  let relayCalls = 0
+  const relay = {
+    health: async () => ({ ready: true, clients: 2 }),
+    complete: async request => {
+      relayCalls += 1
+      return {
+        blocks: [{ type: 'text', text: `web:${request.messages[0].content[0].text}` }],
+        finishReason: 'stop',
+      }
+    },
+  }
+  const adapter = new ChatGptSolAdapter(
+    broker,
+    'shiro-web',
+    'gpt-5.6-sol',
+    relay,
+    () => undefined,
+    { browserRelayRequired: true },
+  )
+  const chunks = await collect(adapter.stream({ ...options, provider: 'shiro-web' }))
+  assert.equal(relayCalls, 1)
+  assert.equal(broker.snapshot().length, 0)
+  assert.equal(chunks.find(chunk => chunk.type === 'text-delta').text, 'web:test')
+  assert.deepEqual(chunks.at(-1), { type: 'finish', reason: { kind: 'stop' } })
+})
+
+test('autonomous Web adapter fails closed instead of falling back to the MCP broker when no safe relay tab is ready', async () => {
+  const broker = new BridgeBroker()
+  broker.operationProbe = () => true
+  const relay = {
+    health: async () => ({ ready: false, clients: 2, detail: 'no safe blank ChatGPT tab' }),
+  }
+  const adapter = new ChatGptSolAdapter(
+    broker,
+    'shiro-web',
+    'gpt-5.6-sol',
+    relay,
+    () => undefined,
+    { browserRelayRequired: true },
+  )
+  await assert.rejects(
+    collect(adapter.stream({ ...options, provider: 'shiro-web' })),
+    error => error instanceof RelayError && error.code === 'TRANSPORT' && /no safe blank ChatGPT tab/.test(error.message),
+  )
+  assert.equal(broker.snapshot().length, 0)
+})
+
 test('adapter returns to the relay when no MCP root turn is running', async () => {
   const broker = new BridgeBroker()
   broker.operationProbe = () => false
@@ -161,6 +211,75 @@ test('turn completion exposes the terminal reason and latest text', () => {
     assistant_text: 'done',
     reason: { kind: 'completed' },
   })
+})
+
+test('turn completion exposes submit_final tool text without requiring another model round', () => {
+  const page = {
+    events: [
+      { event: { seq: 1, type: 'assistant/message', data: { message: { content: [{ type: 'tool-call', id: 'final-1', name: 'submit_final', arguments: '{"text":"done fast"}' }] } } } },
+      { event: { seq: 2, type: 'tool/call', data: { callId: 'final-1', name: 'submit_final', arguments: '{"text":"done fast"}' } } },
+      { event: { seq: 3, type: 'tool/result', data: { message: { source: { kind: 'tool', callId: 'final-1' }, content: [{ type: 'tool-result', toolCallId: 'final-1', content: [{ type: 'text', text: 'done fast' }], isError: false }] } } } },
+      { event: { seq: 4, type: 'turn/end', data: { reason: { kind: 'completed' } } } },
+    ],
+  }
+  assert.deepEqual(turnCompletion(page, 0), {
+    event: page.events[3].event,
+    assistant_text: 'done fast',
+    reason: { kind: 'completed' },
+  })
+})
+
+test('turn completion exposes nested Code Mode submit_final text without promoting run_code output by guess', () => {
+  const page = {
+    events: [
+      { event: { seq: 1, type: 'assistant/message', data: { message: { content: [{ type: 'tool-call', id: 'code-1', name: 'run_code', arguments: '{}' }] } } } },
+      { event: { seq: 2, type: 'tool/call', data: { callId: 'code-1', name: 'run_code', arguments: '{}' } } },
+      { event: { seq: 3, type: 'tool/code-dispatch', data: { rootCallId: 'code-1', parentCallId: 'code-1', subCallId: 'code-1:code:1', name: 'read', isError: false, content: [{ type: 'text', text: 'private read output' }] } } },
+      { event: { seq: 4, type: 'tool/code-dispatch', data: { rootCallId: 'code-1', parentCallId: 'code-1', subCallId: 'code-1:code:2', name: 'submit_final', isError: false, content: [{ type: 'text', text: 'nested final' }] } } },
+      { event: { seq: 5, type: 'tool/result', data: { message: { source: { kind: 'tool', callId: 'code-1' }, content: [{ type: 'tool-result', toolCallId: 'code-1', content: [{ type: 'text', text: 'outer run_code output' }], isError: false }] } } } },
+      { event: { seq: 6, type: 'step/end', data: { turn: 1, step: 1 } } },
+      { event: { seq: 7, type: 'turn/end', data: { reason: { kind: 'completed' } } } },
+    ],
+  }
+  assert.deepEqual(turnCompletion(page, 0), {
+    event: page.events[6].event,
+    assistant_text: 'nested final',
+    reason: { kind: 'completed' },
+  })
+})
+
+test('turn completion does not promote ordinary run_code output without a nested submit_final event', () => {
+  const page = {
+    events: [
+      { event: { seq: 1, type: 'tool/call', data: { callId: 'code-1', name: 'run_code' } } },
+      { event: { seq: 2, type: 'tool/code-dispatch', data: { rootCallId: 'code-1', name: 'read', isError: false, content: [{ type: 'text', text: 'private nested output' }] } } },
+      { event: { seq: 3, type: 'tool/result', data: { message: { source: { kind: 'tool', callId: 'code-1' }, content: [{ type: 'tool-result', toolCallId: 'code-1', content: [{ type: 'text', text: 'private run_code output' }], isError: false }] } } } },
+      { event: { seq: 4, type: 'turn/end', data: { reason: { kind: 'completed' } } } },
+    ],
+  }
+  assert.equal(turnCompletion(page, 0)?.assistant_text, '')
+})
+
+test('turn completion does not promote nested submit_final text from a non-completed turn', () => {
+  const page = {
+    events: [
+      { event: { seq: 1, type: 'tool/call', data: { callId: 'code-1', name: 'run_code' } } },
+      { event: { seq: 2, type: 'tool/code-dispatch', data: { rootCallId: 'code-1', name: 'submit_final', isError: false, content: [{ type: 'text', text: 'must not escape' }] } } },
+      { event: { seq: 3, type: 'turn/end', data: { reason: { kind: 'interrupted' } } } },
+    ],
+  }
+  assert.equal(turnCompletion(page, 0)?.assistant_text, '')
+})
+
+test('turn completion never promotes an ordinary tool result to assistant text', () => {
+  const page = {
+    events: [
+      { event: { seq: 1, type: 'tool/call', data: { callId: 'read-1', name: 'read' } } },
+      { event: { seq: 2, type: 'tool/result', data: { message: { source: { kind: 'tool', callId: 'read-1' }, content: [{ type: 'tool-result', toolCallId: 'read-1', content: [{ type: 'text', text: 'private tool output' }], isError: false }] } } } },
+      { event: { seq: 3, type: 'turn/end', data: { reason: { kind: 'completed' } } } },
+    ],
+  }
+  assert.equal(turnCompletion(page, 0)?.assistant_text, '')
 })
 
 // --- Task 1: real error taxonomy + retry policy -----------------------------

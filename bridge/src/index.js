@@ -19,16 +19,29 @@ import { ProcessRegistry } from './exec-actions.js'
 import { Sandbox } from './sandbox.js'
 import { TerminalRegistry } from './terminal-actions.js'
 import { ThreadRegistry } from './thread-registry.js'
+import { ShiroWorkerControl } from './worker-control.js'
 import { normalizeProfile, normalizeRules, PermissionPolicy } from './permission-profile.js'
 import { normalizeAllowedRoots, PRIMARY_WORKSPACE_ID, WorkspaceRegistry } from './workspaces.js'
 import { ChatGptBrowserRelay, RelayError, RELAY_RETRYABLE_CODES } from './chatgpt-relay.js'
 import { errorResult, looseObject, resultSchema, toolResult } from './mcp-result.js'
 import { BrowserFleetTransport, FleetManager } from './fleet-manager.js'
+import { CodexCliRunner, resolveCodexCliPath } from './codex-cli.js'
 import { GrokCliRunner, resolveGrokCliPath } from './grok-cli.js'
 import { redactSecrets } from './redact.js'
+import {
+  OmnicastReturnMailbox,
+  omnicastLeaseIsIdle,
+  registerOmnicastReturnOnly,
+} from './omnicast-return.js'
 
 const DEFAULT_PROVIDER = 'shiro-sol'
 const DEFAULT_MODEL = 'gpt-5.6-sol'
+// Hard quota safety policy: Shiro's ChatGPT Web/browser route is capped at
+// GPT-5.6 Sol.  GPT-6 Pro/Astra is intentionally forbidden so background
+// workers, fleets and autonomous turns cannot burn the user's Pro quota.
+const DEFAULT_WEB_MODEL = 'gpt-5.6-sol'
+const DEFAULT_WEB_RELAY_MODEL = 'GPT-5.6 Sol'
+const PROHIBITED_CHATGPT_WEB_MODEL = /(?:gpt[\s._-]*6(?:\b|[\s._-])|\bastra\b|\bgpt[\s._-]*pro\b|\bgpt[\s._-]*6[\s._-]*pro\b)/i
 const DEFAULT_PORT = 23157
 const DEFAULT_MAX_CONCURRENT_TURNS = 4
 // One MCP tool call must stay well under the client's per-call patience
@@ -40,6 +53,33 @@ const PROGRESS_INTERVAL_MS = 2_000
 // One harness_get_request page must stay far below the size where the MCP
 // client starts eliding tool results from its context.
 const REQUEST_PAGE_MAX_BYTES = 80_000
+export const SHIRO_CLIENT_HEADER = 'x-shiro-client'
+export const SHIRO_CONTROL_HEADER = 'x-shiro-omnicast-control'
+
+export function mcpRequestHasControlCredential(headers = {}, expectedToken = '') {
+  const raw = headers[SHIRO_CONTROL_HEADER]
+  const supplied = String(Array.isArray(raw) ? (raw[0] ?? '') : (raw ?? ''))
+  return expectedToken !== '' && safeEqual(supplied, expectedToken)
+}
+
+/**
+ * Resolve the loop owner for one HTTP MCP caller.
+ *
+ * Every caller follows the deployment-wide execution default. In Shiro's normal
+ * autonomous configuration this keeps the complete model→tool→model loop inside
+ * Harness even when the operator entered through a ChatGPT connector, so the
+ * connector is only a control/observation surface rather than a per-round relay.
+ * An explicit harness_start execution_mode still wins for every caller.
+ */
+export function mcpRequestExecutionContext(headers = {}, configuredMode = 'relay') {
+  const raw = headers[SHIRO_CLIENT_HEADER]
+  const marker = String(Array.isArray(raw) ? (raw[0] ?? '') : (raw ?? '')).trim().toLowerCase()
+  const internal = marker === 'shiro-cli' || marker === 'shiro-python'
+  return {
+    clientKind: internal ? marker : 'connector',
+    defaultExecutionMode: configuredMode,
+  }
+}
 
 export const REASONING_EFFORTS = Object.freeze([
   { id: 'light', name: 'Light', description: 'Ưu tiên phản hồi nhanh cho việc đơn giản.' },
@@ -71,6 +111,14 @@ function requiredString(value, label) {
   return value.trim()
 }
 
+function enforceChatGptWebQuotaCap(value, label) {
+  const model = requiredString(value, label)
+  if (PROHIBITED_CHATGPT_WEB_MODEL.test(model)) {
+    throw new Error(`${label}=${model} is forbidden by Shiro quota policy; maximum allowed ChatGPT Web model is GPT-5.6 Sol with xhigh effort`)
+  }
+  return model
+}
+
 function normalizeConfig(config = {}) {
   const port = Number(config.port ?? DEFAULT_PORT)
   const waitMs = Number(config.waitMs ?? 25_000)
@@ -97,15 +145,32 @@ function normalizeConfig(config = {}) {
   const permissionRules = normalizeRules(config.permissionRules ?? {})
   const configuredFleetStateDir = typeof config.fleetStateDir === 'string' ? config.fleetStateDir.trim() : ''
   const configuredLogDir = typeof config.logDir === 'string' ? config.logDir.trim() : ''
+  const omnicastControlToken = typeof config.omnicastControlToken === 'string' ? config.omnicastControlToken.trim() : ''
+  const omnicastReturnStateFile = typeof config.omnicastReturnStateFile === 'string' ? config.omnicastReturnStateFile.trim() : ''
+  if ((omnicastControlToken === '') !== (omnicastReturnStateFile === '')) {
+    throw new Error('omnicastControlToken and omnicastReturnStateFile must be configured together')
+  }
   const provider = requiredString(config.provider ?? DEFAULT_PROVIDER, 'provider')
-  const model = requiredString(config.model ?? DEFAULT_MODEL, 'model')
+  const model = enforceChatGptWebQuotaCap(config.model ?? DEFAULT_MODEL, 'model')
+  const relayModel = enforceChatGptWebQuotaCap(config.relayModel ?? 'GPT-5.6 Sol', 'relayModel')
+  const webProvider = requiredString(config.webProvider ?? 'shiro-web', 'webProvider')
+  if (webProvider === provider) throw new Error('webProvider must differ from provider because provider is reserved for the legacy MCP relay route')
+  const webModel = enforceChatGptWebQuotaCap(config.webModel ?? DEFAULT_WEB_MODEL, 'webModel')
+  const webRelayModel = enforceChatGptWebQuotaCap(config.webRelayModel ?? DEFAULT_WEB_RELAY_MODEL, 'webRelayModel')
   const autonomousProvider = typeof config.autonomousProvider === 'string' ? config.autonomousProvider.trim() : ''
-  const autonomousModel = typeof config.autonomousModel === 'string' ? config.autonomousModel.trim() : ''
+  const autonomousModelRaw = typeof config.autonomousModel === 'string' ? config.autonomousModel.trim() : ''
+  const autonomousModel = autonomousModelRaw === '' ? '' : enforceChatGptWebQuotaCap(autonomousModelRaw, 'autonomousModel')
   if ((autonomousProvider === '') !== (autonomousModel === '')) {
     throw new Error('autonomousProvider and autonomousModel must be configured together')
   }
   if (autonomousProvider !== '' && autonomousProvider === provider) {
     throw new Error('autonomousProvider must differ from provider because provider is reserved for the legacy relay adapter')
+  }
+  if (autonomousProvider === webProvider && autonomousModel !== webModel) {
+    throw new Error('autonomousModel must match webModel when autonomousProvider selects webProvider')
+  }
+  if (autonomousProvider === webProvider && relayUrl === '') {
+    throw new Error('autonomousProvider cannot select webProvider unless relayUrl and relayToken are configured')
   }
   const executionMode = config.executionMode === undefined || config.executionMode === null || config.executionMode === ''
     ? (autonomousProvider === '' ? 'relay' : 'autonomous')
@@ -139,10 +204,22 @@ function normalizeConfig(config = {}) {
     // inside it; logs_tail reads them through a fixed stream allowlist rather
     // than through the sandboxed filesystem actions.
     logDir: resolve(configuredLogDir || resolve(workspaceRoot, '..', '.ShiroRuntime', 'logs')),
+    omnicastControlToken,
+    omnicastReturnStateFile: omnicastReturnStateFile === '' ? '' : resolve(omnicastReturnStateFile),
     token: requiredString(config.token, 'token'),
     relayUrl,
     relayToken,
-    relayModel: requiredString(config.relayModel ?? 'GPT-5.6 Sol', 'relayModel'),
+    relayModel,
+    webProvider,
+    webModel,
+    // Browser/ChatGPT Web route is deliberately capped at Sol.  The browser
+    // effort may be xhigh, but the model must never switch to GPT-6 Pro/Astra.
+    webRelayModel,
+    codexProvider: requiredString(config.codexProvider ?? 'shiro-codex', 'codexProvider'),
+    codexCliPath: typeof config.codexCliPath === 'string' ? config.codexCliPath.trim() : '',
+    codexModels: Array.isArray(config.codexModels) && config.codexModels.length > 0
+      ? config.codexModels.map(model => enforceChatGptWebQuotaCap(model, 'codexModels[]'))
+      : ['gpt-5.6-sol'],
     grokProvider: requiredString(config.grokProvider ?? 'shiro-grok', 'grokProvider'),
     grokCliPath: typeof config.grokCliPath === 'string' ? config.grokCliPath.trim() : '',
     grokModels: Array.isArray(config.grokModels) && config.grokModels.length > 0
@@ -165,6 +242,13 @@ function modelIdForSpeed(model, speedProfile) {
   const profile = SPEED_PROFILES.find(candidate => candidate.id === speedProfile)
   if (profile === undefined) throw new Error(`unsupported speed profile: ${speedProfile}`)
   return `${baseModelId(model)}${profile.suffix}`
+}
+
+function modelDisplayName(model) {
+  const base = baseModelId(model)
+  if (base === 'gpt-6-astra') return 'GPT-6 Astra'
+  if (base === 'gpt-5.6-sol') return 'GPT-5.6 Sol'
+  return base
 }
 
 function profileForModel(model, configuredModel = DEFAULT_MODEL) {
@@ -206,7 +290,7 @@ function modelInfo(provider, model, configuredModel = DEFAULT_MODEL) {
   return {
     provider,
     id: model,
-    name: `Shiro · GPT-5.6 Sol · ${profile.name}`,
+    name: `Shiro · ${modelDisplayName(configuredModel)} · ${profile.name}`,
     description: profile.description,
     inputModalities: ['text', 'image'],
     reasoning: {
@@ -493,16 +577,17 @@ async function resolveImageAttachments(options, attachmentStore, signal) {
 }
 
 export class ChatGptSolAdapter {
-  constructor(broker, provider, model, relay = null, resolveAttachments = () => undefined) {
+  constructor(broker, provider, model, relay = null, resolveAttachments = () => undefined, options = {}) {
     this.broker = broker
     this.provider = provider
     this.model = model
     this.relay = relay
     this.resolveAttachments = resolveAttachments
+    this.browserRelayRequired = options.browserRelayRequired === true
   }
 
   providerInfo(provider) {
-    return { id: provider, name: 'Shiro · GPT-5.6 Sol' }
+    return { id: provider, name: `Shiro · ${modelDisplayName(this.model)}` }
   }
 
   providerRetryPolicy() {
@@ -541,8 +626,19 @@ export class ChatGptSolAdapter {
     let response
     let usedStreaming = false
     let streamedFirstBlock = false
-    if (this.relay !== null && !this.broker.mcpTurnActive(options.sessionId)) {
+    if (this.browserRelayRequired && this.relay === null) {
+      throw new RelayError('ChatGPT Web browser relay is not configured for the autonomous Web route', 'TRANSPORT')
+    }
+    const browserRelayAllowed = this.relay !== null
+      && (this.browserRelayRequired || !this.broker.mcpTurnActive(options.sessionId))
+    if (browserRelayAllowed) {
       const status = await this.relay.health(options.signal)
+      if (!status.ready && this.browserRelayRequired) {
+        throw new RelayError(
+          `ChatGPT Web browser relay is not ready: ${status.detail || 'no safe ready ChatGPT tab'}`,
+          'TRANSPORT',
+        )
+      }
       if (status.ready) {
         try {
           const { images, requestMessages } = await resolveImageAttachments(
@@ -581,11 +677,16 @@ export class ChatGptSolAdapter {
             // so any streaming-path failure must also propagate rather than
             // silently switch response sources.
             throw error
+          } else if (this.browserRelayRequired) {
+            throw new RelayError(`ChatGPT Web browser relay failed: ${asError(error).message}`, 'TRANSPORT', { cause: error })
           } else {
             process.stderr.write(`shiro-relay: ${asError(error).message}; falling back to MCP handoff\n`)
           }
         }
       }
+    }
+    if (response === undefined && this.browserRelayRequired) {
+      throw new RelayError('ChatGPT Web browser relay produced no response', 'EMPTY_RESPONSE')
     }
     if (response === undefined) {
       const pending = this.broker.enqueue(options)
@@ -684,6 +785,81 @@ export class GrokBuildAdapter {
   }
 }
 
+function codexModelInfo(provider, model) {
+  return {
+    provider,
+    id: model,
+    name: `Shiro · Codex · ${model}`,
+    description: 'Codex CLI (đăng nhập ChatGPT) chạy không tool làm model thuần cho Harness.',
+    inputModalities: ['text'],
+    reasoning: {
+      efforts: REASONING_EFFORTS,
+      defaultEffort: 'standard',
+    },
+  }
+}
+
+/**
+ * Subscription-authenticated Codex route. Each request is an isolated,
+ * ephemeral process with Codex's own tool surface disabled; Harness alone
+ * owns tool execution and continuation rounds.
+ */
+export class CodexCliAdapter {
+  constructor(runner, provider, models) {
+    this.runner = runner
+    this.provider = provider
+    this.models = models
+  }
+
+  providerInfo(provider) {
+    return { id: provider, name: 'Shiro · Codex' }
+  }
+
+  providerRetryPolicy() {
+    return {
+      mode: 'normal',
+      maxRetries: 3,
+      retryableCodes: [...RELAY_RETRYABLE_CODES],
+      initialDelayMs: 500,
+      maxDelayMs: 10_000,
+      jitterRatio: 0.1,
+    }
+  }
+
+  async listModels(provider) {
+    return this.models.map(model => codexModelInfo(provider, model))
+  }
+
+  async resolveModel(provider, model) {
+    if (!this.models.includes(model)) throw new Error(`unknown Codex model: ${model}`)
+    return codexModelInfo(provider, model)
+  }
+
+  async prepareCall(provider, model, signal) {
+    return {
+      model: await this.resolveModel(provider, model, signal),
+      stream: options => this.stream(options),
+    }
+  }
+
+  async *stream(options) {
+    let response
+    try {
+      response = await this.runner.complete(publicRequest(randomUUID(), options), options.signal, {
+        model: options.model,
+        effort: options.reasoningEffort,
+      })
+    } catch (error) {
+      if (options.signal?.aborted) {
+        yield { type: 'finish', reason: { kind: 'aborted', failure: { message: 'Harness cancelled the Codex CLI request', code: 'ABORTED' } } }
+        return
+      }
+      throw error
+    }
+    yield* emitBlocks(response.blocks.map(normalizeBlock), response.usage, response.finishReason, -1)
+  }
+}
+
 function rpcId(prefix) {
   return `${prefix}-${randomUUID()}`
 }
@@ -706,24 +882,90 @@ function latestSeq(page) {
 }
 
 export function turnCompletion(page, afterSeq) {
-  const completed = page.events
-    .map(entry => entry.event)
+  const events = page.events.map(entry => entry.event)
+  const completed = events
     .filter(event => event.seq > afterSeq && event.type === 'turn/end')
     .at(-1)
   if (completed === undefined) return null
-  const laterTurnStarted = page.events.some(({ event }) => (
+  const laterTurnStarted = events.some(event => (
     event.seq > completed.seq && event.type === 'turn/start'
   ))
   if (laterTurnStarted) return null
-  const texts = page.events.flatMap(({ event }) => {
-    if (event.seq <= afterSeq || event.type !== 'assistant/message') return []
-    const content = event.data?.message?.content
-    if (!Array.isArray(content)) return []
-    return content.filter(block => block?.type === 'text' && typeof block.text === 'string').map(block => block.text)
-  })
+
+  // A `submit_final` result is deliberately allowed to be the terminal
+  // user-facing answer. DSH commits that result and closes the turn through
+  // `exec.concludeTurn()`, so there is no later assistant/message whose sole job
+  // would be to echo the same text. Code Mode forwards that terminal marker from
+  // a nested tool to `run_code`; its durable `tool/code-dispatch` event preserves
+  // the exact nested tool identity and output, so use that authoritative event
+  // instead of guessing from an ordinary run_code result or turn shape.
+  const completedNormally = completed.data?.reason?.kind === 'completed'
+  const runCodeCallIds = new Set(events.flatMap(event => (
+    event.seq > afterSeq
+      && event.seq <= completed.seq
+      && event.type === 'tool/call'
+      && event.data?.name === 'run_code'
+      && typeof event.data?.callId === 'string'
+      ? [event.data.callId]
+      : []
+  )))
+  const finalCallIds = new Set(events.flatMap(event => (
+    completedNormally
+      && event.seq > afterSeq
+      && event.seq <= completed.seq
+      && event.type === 'tool/call'
+      && event.data?.name === 'submit_final'
+      && typeof event.data?.callId === 'string'
+      ? [event.data.callId]
+      : []
+  )))
+  const candidates = []
+  for (const event of events) {
+    if (event.seq <= afterSeq || event.seq > completed.seq) continue
+    if (event.type === 'assistant/message') {
+      const content = event.data?.message?.content
+      if (!Array.isArray(content)) continue
+      const text = content
+        .filter(block => block?.type === 'text' && typeof block.text === 'string')
+        .map(block => block.text)
+        .at(-1)
+      if (text !== undefined) candidates.push({ seq: event.seq, text })
+      continue
+    }
+    if (event.type === 'tool/code-dispatch') {
+      const data = event.data ?? {}
+      if (completedNormally
+        && data.name === 'submit_final'
+        && data.isError === false
+        && runCodeCallIds.has(data.rootCallId)) {
+        const content = Array.isArray(data.content) ? data.content : []
+        const text = content
+          .filter(item => item?.type === 'text' && typeof item.text === 'string')
+          .map(item => item.text)
+          .at(-1)
+        if (text !== undefined) candidates.push({ seq: event.seq, text })
+      }
+      continue
+    }
+    if (event.type !== 'tool/result') continue
+    const message = event.data?.message
+    const callId = message?.source?.callId ?? message?.callId ?? event.data?.callId
+    if (!finalCallIds.has(callId)) continue
+    const blocks = Array.isArray(message?.content) ? message.content : []
+    for (const block of blocks) {
+      if (block?.type !== 'tool-result' || block.isError === true) continue
+      const nested = Array.isArray(block.content) ? block.content : []
+      const text = nested
+        .filter(item => item?.type === 'text' && typeof item.text === 'string')
+        .map(item => item.text)
+        .at(-1)
+      if (text !== undefined) candidates.push({ seq: event.seq, text })
+    }
+  }
+  candidates.sort((left, right) => left.seq - right.seq)
   return {
     event: completed,
-    assistant_text: texts.at(-1) ?? '',
+    assistant_text: candidates.at(-1)?.text ?? '',
     reason: completed.data?.reason ?? { kind: 'completed' },
   }
 }
@@ -1499,7 +1741,7 @@ export class BridgeController {
             speed: operation.speedProfile,
             effort: operation.reasoningEffort,
           },
-          instruction: `Fetch the full body of request_id with harness_get_request (paginate with messages_from if truncated), act as GPT-5.6 Sol with requested speed=${operation.speedProfile} and effort=${operation.reasoningEffort}, then answer with harness_continue. Return Harness tool calls as tool_call blocks; do not execute those tools outside Harness. Submit every pending request, then continue until status is completed.`,
+          instruction: `Fetch the full body of request_id with harness_get_request (paginate with messages_from if truncated), act as ${modelDisplayName(operation.modelId ?? this.config.model)} with requested speed=${operation.speedProfile} and effort=${operation.reasoningEffort}, then answer with harness_continue. Return Harness tool calls as tool_call blocks; do not execute those tools outside Harness. Submit every pending request, then continue until status is completed.`,
         }
       }
       const interactions = this.interactionSnapshot(operation)
@@ -1867,7 +2109,7 @@ export const HARNESS_ACTION_DESCRIPTORS = Object.freeze([
   { name: 'harness_start', title: 'Start a full Shiro coding task', family: 'harness', read_only: false, destructive: false, requires_confirmation: false },
   { name: 'harness_sessions', title: 'List resumable Shiro sessions', family: 'harness', read_only: true, destructive: false, requires_confirmation: false },
   { name: 'harness_get_request', title: 'Fetch the full body of one pending model request', family: 'harness', read_only: true, destructive: false, requires_confirmation: false },
-  { name: 'harness_continue', title: 'Return one Sol model decision to Shiro', family: 'harness', read_only: false, destructive: false, requires_confirmation: false },
+  { name: 'harness_continue', title: 'Return one relay model decision to Shiro', family: 'harness', read_only: false, destructive: false, requires_confirmation: false },
   { name: 'harness_status', title: 'Inspect active Shiro tasks', family: 'harness', read_only: true, destructive: false, requires_confirmation: false },
   { name: 'harness_respond', title: 'Answer a Harness question or approval request', family: 'harness', read_only: false, destructive: false, requires_confirmation: false },
   { name: 'harness_get_artifact', title: 'Fetch a produced file or image over MCP', family: 'artifact', read_only: true, destructive: false, requires_confirmation: false },
@@ -1882,9 +2124,25 @@ export const BRIDGE_VERSION = '0.2.0'
 // Bumped whenever the direct-action surface changes shape, so a client can
 // feature-detect with bridge_capabilities instead of assuming every deployment
 // exposes the same actions.
-export const DIRECT_ACTIONS_VERSION = 4
+export const DIRECT_ACTIONS_VERSION = 7
 
 export function configureMcp(server, controller, config, fleetManager = null, runtime = {}) {
+  const requestDefaultExecutionMode = runtime.requestDefaultExecutionMode ?? config.executionMode ?? 'relay'
+  const requestClientKind = runtime.requestClientKind ?? 'embedded'
+  // A local OmniCast client opens this short critical section before prompting
+  // ChatGPT. While it is active an inbound connector request receives exactly
+  // one tool, so prompt text cannot grant itself filesystem/shell/git access.
+  if (runtime.requestControlAuthorized !== true
+    && runtime.omnicastReturns?.restrictsConnector()) {
+    registerOmnicastReturnOnly(server, {
+      mailbox: runtime.omnicastReturns,
+      // An unverified routing marker has no authority. Build the same one-tool
+      // catalog as a real connector even when it claimed `shiro-python`.
+      clientKind: 'connector',
+      metrics: runtime.metrics,
+    })
+    return
+  }
   // Workspaces are resolved first: the artifact resource and harness_get_artifact
   // both address files through them, not through the raw project root, so a file
   // produced in a secondary workspace is fetchable by the same URI scheme.
@@ -2054,6 +2312,7 @@ export function configureMcp(server, controller, config, fleetManager = null, ru
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, async ({ name, size, prompt, interval_minutes: intervalMinutes, chat_mode: chatMode, stagger_seconds: staggerSeconds, max_session_runs: maxSessionRuns }) => {
     try {
+      runtime.workerControl?.assertSpawnAllowed('fleet', { name, size })
       return toolResult(await requireFleetManager().start({ name, size, prompt, intervalMinutes, chatMode, staggerSeconds, maxSessionRuns }))
     } catch (error) { return errorResult(error) }
   })
@@ -2090,7 +2349,7 @@ export function configureMcp(server, controller, config, fleetManager = null, ru
 
   registerGatedTool('harness_start', {
     title: 'Start a full Shiro coding task',
-    description: `Starts one Shiro task. It runs in the fixed project root ${config.workspaceRoot} unless workspace names another root opened with workspace_open. Up to ${config.maxConcurrentTurns ?? DEFAULT_MAX_CONCURRENT_TURNS} root turns may run concurrently. Default execution is ${config.executionMode ?? 'relay'}. In autonomous mode the selected ctx.llm provider streams directly into DeepSeek Harness, which owns every model→tool→model round locally; the Web/MCP client only reads thread_events/status and handles approvals or user steering. Relay mode preserves the legacy model_requests + harness_continue protocol. Agent presets are the scoped-tool mechanism: hidden tools are omitted from the model schema and execution surface.`,
+    description: `Starts one Shiro task. It runs in the fixed project root ${config.workspaceRoot} unless workspace names another root opened with workspace_open. Up to ${config.maxConcurrentTurns ?? DEFAULT_MAX_CONCURRENT_TURNS} root turns may run concurrently. This ${requestClientKind} request defaults to ${requestDefaultExecutionMode}. In autonomous mode the selected ctx.llm provider streams directly into DeepSeek Harness, which owns every model→tool→model round locally; the MCP client only reads thread_events/status and handles approvals or user steering. In relay mode the calling ChatGPT conversation supplies model rounds through model_requests + harness_continue, so no secondary ChatGPT Web model tab is opened. Agent presets are the scoped-tool mechanism: hidden tools are omitted from the model schema and execution surface.`,
     inputSchema: {
       prompt: z.string().min(1).describe('The user task for Shiro.'),
       workspace: z.string().min(1).optional().describe('Workspace id from workspace_list to run the task in. Omit for the fixed project root. Sessions are namespaced per workspace, so session_id must belong to the same one.'),
@@ -2098,7 +2357,7 @@ export function configureMcp(server, controller, config, fleetManager = null, ru
       session_id: z.string().min(1).optional().describe('Optional durable Harness session id returned by harness_sessions for this workspace. Omit to create a new session.'),
       speed_profile: z.enum(['fast', 'balanced', 'deep']).optional().describe('Optional Shiro operating profile. Omit for balanced; explicit values remain supported for clients that expose this field.'),
       reasoning_effort: z.enum(['light', 'standard', 'high', 'max']).optional().describe('Optional reasoning effort. Omit to use the selected profile default (balanced defaults to standard).'),
-      execution_mode: z.enum(['autonomous', 'relay']).optional().describe('Override this turn only. autonomous requires autonomousProvider/autonomousModel to be configured; omit to use the bridge default.'),
+      execution_mode: z.enum(['autonomous', 'relay']).optional().describe(`Override this turn only. autonomous requires autonomousProvider/autonomousModel to be configured; omit to use this caller's ${requestDefaultExecutionMode} default.`),
     },
     outputSchema: resultSchema(outcomeShape),
     // The engine's tools can edit workspace files and reach the web
@@ -2118,7 +2377,7 @@ export function configureMcp(server, controller, config, fleetManager = null, ru
         reasoningEffort,
         requestWaitOptions(extra, 'Starting Shiro task'),
         harnessWorkspace(workspace),
-        executionMode,
+        executionMode ?? requestDefaultExecutionMode,
       ))
     } catch (error) { return errorResult(error) }
   })
@@ -2399,7 +2658,12 @@ export function configureMcp(server, controller, config, fleetManager = null, ru
     sandboxProvider: typeof runtime.sandboxProvider === 'function' ? runtime.sandboxProvider() : (runtime.sandboxProvider ?? null),
     continuation: runtime.continuation ?? null,
     subagents: runtime.subagents ?? undefined,
-    config,
+    config: {
+      ...config,
+      executionMode: requestDefaultExecutionMode,
+      configuredExecutionMode: config.executionMode ?? 'relay',
+      requestClientKind,
+    },
     controller,
     fleetManager,
     sandbox,
@@ -2408,6 +2672,7 @@ export function configureMcp(server, controller, config, fleetManager = null, ru
     policy,
     processes: runtime.processes ?? new ProcessRegistry({ sandbox }),
     terminals: runtime.terminals ?? new TerminalRegistry(),
+    workerControl: runtime.workerControl,
     metrics: runtime.metrics ?? new ActionMetrics(),
     bridgeVersion: BRIDGE_VERSION,
     directActionsVersion: DIRECT_ACTIONS_VERSION,
@@ -2419,6 +2684,7 @@ export function configureMcp(server, controller, config, fleetManager = null, ru
     readLog: args => readServiceLog(config.logDir ?? resolve(config.workspaceRoot, '..', '.ShiroRuntime', 'logs'), args),
     redact: value => redactSecrets(value),
     validateConfig: candidate => normalizeConfig(candidate),
+    omnicastReturns: runtime.omnicastReturns,
   })
 
   // Mirror the engine's plugin tools LAST, so `taken` is the complete set of
@@ -2448,14 +2714,24 @@ async function handleMcpRequest(req, res, controller, config, fleetManager, runt
     res.end(JSON.stringify({ error: 'unauthorized' }))
     return
   }
+  const requestContext = mcpRequestExecutionContext(req.headers, config.executionMode ?? 'relay')
+  const requestControlAuthorized = mcpRequestHasControlCredential(
+    req.headers,
+    config.omnicastControlToken,
+  )
   const server = new McpServer(
     { name: 'shiro-harness-bridge', title: 'Shiro', version: '0.1.0' },
     {
       capabilities: { tools: {} },
-      instructions: `Shiro's default execution mode is ${config.executionMode ?? 'relay'}. Send one large task with harness_start. When execution_mode is autonomous, DeepSeek Harness owns the complete streamed model↔tool loop locally: read thread_events with its cursor for progress/tool/diff events, use turn_steer for user steering, and answer only user_input_required interactions with harness_respond. Poll harness_status for terminal state and benchmark metrics. Only legacy relay mode exposes model_requests; fetch those with harness_get_request and answer them with harness_continue. Agent presets scope the model tool surface, and hidden tools are omitted from schemas. Continue until terminal state or a real user interaction is required.`,
+      instructions: `This ${requestContext.clientKind} connection defaults to ${requestContext.defaultExecutionMode}. Send one large task with harness_start. In relay mode, fetch each model_request with harness_get_request and return the current ChatGPT conversation's decision with harness_continue; this keeps the loop in the connector and does not open a secondary ChatGPT Web model tab. When execution_mode is autonomous, DeepSeek Harness owns the complete streamed model↔tool loop locally: read thread_events with its cursor for progress/tool/diff events, use turn_steer for user steering, and answer only user_input_required interactions with harness_respond. Poll harness_status for terminal state and benchmark metrics. Agent presets scope the model tool surface, and hidden tools are omitted from schemas. Continue until terminal state or a real user interaction is required.`,
     },
   )
-  configureMcp(server, controller, config, fleetManager, runtime)
+  configureMcp(server, controller, config, fleetManager, {
+    ...runtime,
+    requestDefaultExecutionMode: requestContext.defaultExecutionMode,
+    requestClientKind: requestContext.clientKind,
+    requestControlAuthorized,
+  })
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined })
   res.on('close', () => { void transport.close(); void server.close() })
   await server.connect(transport)
@@ -2498,6 +2774,29 @@ function startHttpServer(ctx, broker, config, fleetManager) {
   controller.workspaceRegistry = workspaces
   const sandbox = workspaces.primary().sandbox
   const processes = new ProcessRegistry({ sandbox })
+  const omnicastReturns = config.omnicastControlToken === '' ? null : new OmnicastReturnMailbox({
+    controlToken: config.omnicastControlToken,
+    stateFile: config.omnicastReturnStateFile,
+    openProof: async ({ clientId }) => {
+      if (fleetManager === null) return false
+      let clients
+      try { clients = await fleetManager.transport.clients() } catch { return false }
+      const client = clients.find(item => item?.id === clientId)
+      const generation = client?.tabObservation?.generation?.state
+      return client !== undefined
+        && client.ready === true
+        && client.quarantined !== true
+        && !client.activeRequest
+        && [undefined, null, 'idle', 'stopped'].includes(generation)
+    },
+    idleProof: async (lease, reservation) => {
+      if (fleetManager === null) return false
+      let clients
+      try { clients = await fleetManager.transport.clients() } catch { return false }
+      const client = clients.find(item => item?.id === lease.clientId)
+      return omnicastLeaseIsIdle({ lease, client, reservation })
+    },
+  })
   const runtime = {
     workspaces,
     policy: new PermissionPolicy({ profile: config.permissionProfile, rules: config.permissionRules }),
@@ -2526,7 +2825,11 @@ function startHttpServer(ctx, broker, config, fleetManager) {
     subagents: new SubagentRegistry({ processes }),
     terminals: new TerminalRegistry(),
     metrics: new ActionMetrics(),
+    omnicastReturns,
   }
+  const workerControl = new ShiroWorkerControl({ fleetManager, processes, terminals: runtime.terminals })
+  runtime.workerControl = workerControl
+  ctx.provide('shiroWorkers', workerControl)
   const http = createServer((req, res) => {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1')
     if (url.pathname === '/health') {
@@ -2542,6 +2845,9 @@ function startHttpServer(ctx, broker, config, fleetManager) {
           autonomousModel: config.autonomousModel,
           relayProvider: config.provider,
           relayModel: config.model,
+          webProvider: config.webProvider,
+          webModel: config.webModel,
+          webPickerModel: config.webRelayModel,
         },
         workspaceRoot: config.workspaceRoot,
         concurrency: {
@@ -2551,6 +2857,7 @@ function startHttpServer(ctx, broker, config, fleetManager) {
         browserRelay: {
           configured: config.relayUrl !== '',
           url: config.relayUrl,
+          pickerModel: config.webRelayModel,
         },
         speedProfiles: SPEED_PROFILES.map(({ id, name, description, defaultEffort }) => ({ id, name, description, defaultEffort })),
         reasoningEfforts: REASONING_EFFORTS,
@@ -2575,7 +2882,7 @@ function startHttpServer(ctx, broker, config, fleetManager) {
   http.on('listening', () => {
     process.stderr.write(`shiro-bridge: http://127.0.0.1:${config.port}/mcp (workspace ${config.workspaceRoot})\n`)
   })
-  return { http, controller, fleetManager, runtime }
+  return { http, controller, fleetManager, runtime, workerControl }
 }
 
 export const name = 'llm-shiro-harness-bridge'
@@ -2597,6 +2904,15 @@ export function apply(ctx, rawConfig = {}) {
     model: config.relayModel,
     isReservedClient: client => fleetManager?.isReservedClient(client) ?? false,
   })
+  const webRelay = config.relayUrl === '' ? null : new ChatGptBrowserRelay({
+    url: config.relayUrl,
+    token: config.relayToken,
+    model: config.webRelayModel,
+    // Astra must be observed in the Web picker before a reply can enter the
+    // Harness transcript. Accounts without the rollout fail closed here.
+    requireSelectionVerification: true,
+    isReservedClient: client => fleetManager?.isReservedClient(client) ?? false,
+  })
   // 'attachments' is deliberately not a hard `inject` dependency (unlike
   // 'llm'/'apiProxy' above): it is an optional durable-image service that
   // may not be mounted in every Shiro composition, and a hard inject would
@@ -2605,6 +2921,26 @@ export function apply(ctx, rawConfig = {}) {
   // /adapter.ts resolves it (`resolveAttachments: () => ctx.get('attachments')`).
   const adapter = new ChatGptSolAdapter(broker, config.provider, config.model, relay, () => ctx.get('attachments'))
   ctx.llm.registerAdapter([config.provider], adapter)
+  // Dedicated autonomous ChatGPT Web route. Unlike the legacy provider above,
+  // this route always drives the browser relay even when the current root turn
+  // itself came from MCP/Web, so Harness remains the loop owner and the broker
+  // never asks the caller to act as the model between local tool rounds.
+  const webAdapter = new ChatGptSolAdapter(
+    broker,
+    config.webProvider,
+    config.webModel,
+    webRelay,
+    () => ctx.get('attachments'),
+    { browserRelayRequired: true },
+  )
+  ctx.llm.registerAdapter([config.webProvider], webAdapter)
+  const codexCliPath = resolveCodexCliPath(config.codexCliPath)
+  if (codexCliPath !== null) {
+    const codexRunner = new CodexCliRunner({ cliPath: codexCliPath })
+    ctx.llm.registerAdapter([config.codexProvider], new CodexCliAdapter(codexRunner, config.codexProvider, config.codexModels))
+  } else if (config.codexCliPath !== '') {
+    process.stderr.write(`shiro-codex: configured Codex CLI not found at ${config.codexCliPath}; route disabled\n`)
+  }
   const grokCliPath = resolveGrokCliPath(config.grokCliPath)
   if (grokCliPath !== null) {
     const grokRunner = new GrokCliRunner({ cliPath: grokCliPath })
@@ -2614,7 +2950,9 @@ export function apply(ctx, rawConfig = {}) {
   }
   ctx.effect(() => {
     const serving = startHttpServer(ctx, broker, config, fleetManager)
-    if (relay) relay.bindSession = (sessionId, binding, verification) => serving.controller.bindBrowser(sessionId, binding, verification)
+    const bindSession = (sessionId, binding, verification) => serving.controller.bindBrowser(sessionId, binding, verification)
+    if (relay) relay.bindSession = bindSession
+    if (webRelay) webRelay.bindSession = bindSession
     return async () => {
       // Kill every bridge-owned background process before anything else: a
       // dev server started through process_start or an interactive terminal

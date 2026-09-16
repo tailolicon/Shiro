@@ -17,6 +17,9 @@ const MIN_FREE_MEMORY_RATIO = 0.15
 const REQUEST_TIMEOUT_MS = 75_000
 const BUSY_RETRY_MS = 5 * 60_000
 const NEW_TAB_SETTLE_MS = 12_000
+const SAME_TAB_RETRY_MS = 5_000
+const ROUND_CLEANUP_POLL_MS = 5_000
+const ROUND_CLEANUP_TIMEOUT_MS = 27 * 60_000
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url))
 const repoRoot = path.resolve(scriptDirectory, '..')
@@ -60,6 +63,28 @@ export function fleetSizeArgument(args = [], fallback = DEFAULT_FLEET_SIZE) {
   const value = Number(raw)
   if (!Number.isInteger(value) || value < 1 || value > 20) {
     throw new Error('--fleet-size must be an integer from 1 to 20')
+  }
+  return value
+}
+
+export function intervalMinutesArgument(args = [], fallback = DEFAULT_INTERVAL_MINUTES) {
+  const prefix = '--interval-minutes='
+  const raw = args.find((argument) => argument.startsWith(prefix))?.slice(prefix.length) || ''
+  if (!raw) return fallback
+  const value = Number(raw)
+  if (!Number.isFinite(value) || value <= 0 || value > 10_080) {
+    throw new Error('--interval-minutes must be a positive number up to 10080')
+  }
+  return value
+}
+
+export function maxSessionRunsArgument(args = [], fallback = DEFAULT_MAX_SESSION_RUNS) {
+  const prefix = '--max-session-runs='
+  const raw = args.find((argument) => argument.startsWith(prefix))?.slice(prefix.length) || ''
+  if (!raw) return fallback
+  const value = Number(raw)
+  if (!Number.isInteger(value) || value < 1 || value > 1000) {
+    throw new Error('--max-session-runs must be an integer from 1 to 1000')
   }
   return value
 }
@@ -117,8 +142,15 @@ export function isTemporaryChatUrl(url) {
   }
 }
 
-export function hasExpectedChatMode(html, temporaryOnly = true, url = '') {
-  if (temporaryOnly) return isTemporaryChatUrl(url) && hasActiveTemporaryChatControl(html)
+export function hasPersonalizedTemporaryChatControl(html) {
+  return /<button[^>]*aria-label="Personalized"[^>]*>/i.test(String(html || ''))
+}
+
+export function hasExpectedChatMode(html, temporaryOnly = true, url = '', personalizedTemporary = false) {
+  if (temporaryOnly) {
+    const temporary = isTemporaryChatUrl(url) && hasActiveTemporaryChatControl(html)
+    return temporary && (!personalizedTemporary || hasPersonalizedTemporaryChatControl(html))
+  }
   // Existing normal conversations may omit the Temporary toggle entirely.
   // Their persistent /c/... URL plus the absence of an active Temporary
   // control is the stable fail-closed evidence for normal mode.
@@ -133,10 +165,31 @@ export function hasSendControl(html) {
   return /<button[^>]*(?:data-testid="(?:send-button|composer-submit-button)"|class="[^"]*composer-submit-button[^"]*"|aria-label="(?:Send prompt|Send message|Send|Gửi prompt|Gửi tin nhắn|Gửi câu lệnh|Gửi|Start Voice)")[^>]*>/i.test(String(html || ''))
 }
 
+export function hasSettledObservedProgress(client) {
+  if (!isGenerating(client)) return false
+  if (client?.activeRequest?.requestId) return false
+  const generation = client?.tabObservation?.generation || {}
+  if (generation.activeTool || generation.stopVisible === true) return false
+  const output = client?.tabObservation?.output || {}
+  const items = Array.isArray(output.progressItems) ? output.progressItems : []
+  if (output.finalMessage !== true || !String(output.answer || '').trim() || !items.length) return false
+  return items.every((item) => {
+    if (item?.active === true) return false
+    const state = String(item?.state || '').toLowerCase()
+    return ['completed', 'done', 'stopped'].includes(state)
+  })
+}
+
 export function cleanupBusyEvidence(client, html) {
   if (client?.activeRequest?.requestId) return 'active_request'
   if (client?.tabObservation?.generation?.activeTool) return 'active_tool'
   if (hasActiveGenerationControl(html)) return 'stop_control'
+  // ChatGPT Web can leave its streaming marker stuck on after the turn has
+  // actually ended. The relay then reports generation=active forever even
+  // though there is no request/tool/stop button and every observed progress
+  // item is complete. Treat that exact evidence as settled instead of
+  // deadlocking cohort cleanup.
+  if (hasSettledObservedProgress(client)) return ''
   if (isGenerating(client)
     && !(client?.tabObservation?.output?.finalMessage === true && hasSendControl(html))) {
     return 'unsettled_generation'
@@ -175,6 +228,22 @@ export function fleetNeedsRotation(fleet, maxSessionRuns = DEFAULT_MAX_SESSION_R
 
 export function hasRemainingRounds(round, maxRounds = DEFAULT_MAX_ROUNDS) {
   return maxRounds <= 0 || round < maxRounds
+}
+
+/** Never open more browser tabs in a round than the requested worker slots. */
+export function launchOpenAttemptBudget(fleetSize, retained = 0) {
+  return Math.min(DEFAULT_MAX_LAUNCH_ATTEMPTS, Math.max(0, fleetSize - retained))
+}
+
+/** Relay contention/readiness failures are retried in the same tab, never by opening another tab. */
+export function isRetryableLaunchError(error) {
+  return /Relay HTTP (?:423|5\d\d):/i.test(String(error?.message || error || ''))
+}
+
+/** Milliseconds a recurring fleet must wait before its next round. */
+export function nextRoundDelayMs(nextRunAtMs, now = Date.now()) {
+  const target = Number(nextRunAtMs)
+  return Number.isFinite(target) ? Math.max(0, target - now) : 0
 }
 
 function memoryRisk() {
@@ -238,6 +307,28 @@ class RelayClient {
     return { html: String(payload.html || ''), metadata: payload.metadata || {} }
   }
 
+  async queryDom(sourceClientId, selector, signal) {
+    return await this.request('POST', '/browser/dom/query', {
+      sourceClientId,
+      selector,
+      maxResults: 200,
+      maxTextBytes: 2_000,
+      visibleOnly: true,
+      includeHidden: false,
+      timeoutMs: 15_000,
+    }, signal)
+  }
+
+  async clickElement(sourceClientId, elementId, signal) {
+    return await this.request('POST', '/browser/dom/click', {
+      sourceClientId,
+      elementId,
+      button: 'left',
+      clickCount: 1,
+      timeoutMs: 15_000,
+    }, signal)
+  }
+
   async submit(sourceClientId, prompt, signal, { temporaryOnly = true, allowWindowBlur = false } = {}) {
     return await this.request('POST', '/browser/passive-prompt', {
       sourceClientId,
@@ -280,13 +371,32 @@ function isGenerating(client) {
   return client?.tabObservation?.generation?.state === 'active'
 }
 
-async function verifiedChatMode(relay, client, signal, temporaryOnly = true) {
-  if (!client?.ready || client?.quarantined) return false
-  const capture = await relay.captureLayout(client.id, signal)
-  return hasExpectedChatMode(capture.html, temporaryOnly, client.url)
+async function ensurePersonalizedTemporary(relay, client, signal) {
+  const initial = await relay.queryDom(client.id, 'button', signal)
+  const buttons = Array.isArray(initial?.elements) ? initial.elements : []
+  if (buttons.some((element) => /^Personalized$/i.test(String(element.name || element.text || '').trim()))) return true
+  const trigger = buttons.find((element) => /^Unpersonalized$/i.test(String(element.name || element.text || '').trim()))
+  if (!trigger?.element_id) throw new Error('Temporary Chat personalization control was not found')
+  await relay.clickElement(client.id, trigger.element_id, signal)
+  await delay(500, signal)
+  const menu = await relay.queryDom(client.id, '[role="menuitemradio"]', signal)
+  const items = Array.isArray(menu?.elements) ? menu.elements : []
+  const personalized = items.find((element) => /^Personalized(?:\s|$)/i.test(String(element.text || element.name || '').trim())
+    && !/^Unpersonalized(?:\s|$)/i.test(String(element.text || element.name || '').trim()))
+  if (!personalized?.element_id) throw new Error('Personalized Temporary Chat option was not found')
+  await relay.clickElement(client.id, personalized.element_id, signal)
+  await delay(750, signal)
+  const verified = await relay.queryDom(client.id, 'button', signal)
+  return (verified?.elements || []).some((element) => /^Personalized$/i.test(String(element.name || element.text || '').trim()))
 }
 
-async function cleanupOwnedFleet(relay, fleet, signal, log, temporaryOnly = true) {
+async function verifiedChatMode(relay, client, signal, temporaryOnly = true, personalizedTemporary = false) {
+  if (!client?.ready || client?.quarantined) return false
+  const capture = await relay.captureLayout(client.id, signal)
+  return hasExpectedChatMode(capture.html, temporaryOnly, client.url, personalizedTemporary)
+}
+
+async function cleanupOwnedFleet(relay, fleet, signal, log, temporaryOnly = true, personalizedTemporary = false) {
   const clients = await relay.clients(signal)
   const results = []
   for (const owned of fleet) {
@@ -297,7 +407,13 @@ async function cleanupOwnedFleet(relay, fleet, signal, log, temporaryOnly = true
     }
     try {
       const capture = await relay.captureLayout(current.id, signal)
-      if (!hasExpectedChatMode(capture.html, temporaryOnly, current.url)) {
+      // The Personalized selector is only a launch-time assertion. ChatGPT can
+      // hide that control after submission, so requiring it again during
+      // cleanup strands otherwise verified runner-owned tabs forever. The tab
+      // id is from this runner's own fleet and the URL still proves Temporary
+      // vs normal mode; use live generation evidence only for the close gate.
+      const cleanupModeMatches = temporaryOnly ? isTemporaryChatUrl(current.url) : !isTemporaryChatUrl(current.url)
+      if (!cleanupModeMatches) {
         results.push({ ...owned, state: 'close_refused_wrong_chat_mode' })
         continue
       }
@@ -316,7 +432,80 @@ async function cleanupOwnedFleet(relay, fleet, signal, log, temporaryOnly = true
   return results
 }
 
-async function launchChatTarget({ relay, prompt, signal, log, temporaryOnly = true }) {
+async function forceCloseStaleOwnedFleet(relay, fleet, signal, log, temporaryOnly = true) {
+  const clients = await relay.clients(signal)
+  const results = []
+  for (const owned of fleet) {
+    const current = clients.find((client) => client.browserTabId === owned.tabId)
+    if (!current) {
+      results.push({ ...owned, state: 'already_closed' })
+      continue
+    }
+    const wrongUrl = temporaryOnly ? !isTemporaryChatUrl(current.url) : isTemporaryChatUrl(current.url)
+    if (wrongUrl) {
+      results.push({ ...owned, state: 'force_close_refused_wrong_url' })
+      continue
+    }
+    if (current?.activeRequest?.requestId || current?.tabObservation?.generation?.activeTool) {
+      results.push({ ...owned, state: 'force_close_refused_active_work' })
+      continue
+    }
+    try {
+      // This tab id comes only from this runner's in-memory fleet. At the
+      // deadline, an orphaned streaming bit must not keep it alive forever.
+      await relay.close(current.id, current.url, signal)
+      log(`Force-closed stale runner-owned tab ${current.browserTabId} after cleanup deadline.`)
+      results.push({ ...owned, state: 'closed', detail: 'forced_after_cleanup_deadline' })
+    } catch (error) {
+      results.push({ ...owned, state: 'force_close_failed', detail: error.message })
+    }
+  }
+  return results
+}
+
+async function cleanupOwnedFleetWhenIdle(
+  relay,
+  fleet,
+  signal,
+  log,
+  temporaryOnly = true,
+  personalizedTemporary = false,
+  deadlineMs = Date.now() + ROUND_CLEANUP_TIMEOUT_MS,
+) {
+  let pending = [...fleet]
+  const completed = []
+  let lastSummary = ''
+  while (pending.length && !signal.aborted && Date.now() < deadlineMs) {
+    const pass = await cleanupOwnedFleet(relay, pending, signal, log, temporaryOnly, personalizedTemporary)
+    const retry = []
+    for (const item of pass) {
+      if (['closed', 'already_closed'].includes(item.state)) completed.push(item)
+      else retry.push(item)
+    }
+    pending = retry
+    const currentSummary = JSON.stringify(summary(pending))
+    if (pending.length && currentSummary !== lastSummary) {
+      log(`Cleanup waiting on ${pending.length} tab(s): ${currentSummary}.`)
+      lastSummary = currentSummary
+    }
+    if (pending.length && !signal.aborted && Date.now() < deadlineMs) {
+      await delay(Math.min(ROUND_CLEANUP_POLL_MS, Math.max(0, deadlineMs - Date.now())), signal)
+    }
+  }
+  if (pending.length && !signal.aborted) {
+    log(`Cleanup deadline reached with ${pending.length} tab(s); attempting safe stale close.`)
+    const forced = await forceCloseStaleOwnedFleet(relay, pending, signal, log, temporaryOnly)
+    const retry = []
+    for (const item of forced) {
+      if (['closed', 'already_closed'].includes(item.state)) completed.push(item)
+      else retry.push(item)
+    }
+    pending = retry
+  }
+  return [...completed, ...pending]
+}
+
+async function launchChatTarget({ relay, prompt, signal, log, temporaryOnly = true, personalizedTemporary = false }) {
   const risk = memoryRisk()
   if (risk) return { state: 'memory_guard', detail: risk }
   const clients = await relay.clients(signal)
@@ -330,35 +519,79 @@ async function launchChatTarget({ relay, prompt, signal, log, temporaryOnly = tr
     // write. Normal sessions require the inactive Temporary toggle; Temporary
     // sessions require the active toggle.
     await delay(NEW_TAB_SETTLE_MS, signal)
-    if (!await verifiedChatMode(relay, opened, signal, temporaryOnly)) {
-      throw new Error(`Fresh ChatGPT tab did not render verified ${temporaryOnly ? 'Temporary' : 'normal'} chat mode`)
-    }
-    const response = await relay.submit(opened.id, prompt, signal, { temporaryOnly, allowWindowBlur: true })
-    log(`Submitted prompt to fresh ${temporaryOnly ? 'Temporary' : 'normal'} tab ${opened.browserTabId}.`)
-    return {
-      id: opened.id,
-      tabId: opened.browserTabId,
-      state: 'submitted',
-      submittedUserTurnKey: String(response.result?.submittedUserTurnKey || response.submittedUserTurnKey || ''),
+    for (let attempt = 1; attempt <= DEFAULT_MAX_LAUNCH_ATTEMPTS; attempt += 1) {
+      try {
+        if (temporaryOnly && personalizedTemporary) {
+          const personalized = await ensurePersonalizedTemporary(relay, opened, signal)
+          if (!personalized) throw new Error('Fresh Temporary Chat could not be switched to Personalized')
+        }
+        if (!await verifiedChatMode(relay, opened, signal, temporaryOnly, personalizedTemporary)) {
+          throw new Error(`Fresh ChatGPT tab did not render verified ${personalizedTemporary ? 'Personalized Temporary' : (temporaryOnly ? 'Temporary' : 'normal')} chat mode`)
+        }
+        const response = await relay.submit(opened.id, prompt, signal, { temporaryOnly, allowWindowBlur: true })
+        log(`Submitted prompt to fresh ${personalizedTemporary ? 'Personalized Temporary' : (temporaryOnly ? 'Temporary' : 'normal')} tab ${opened.browserTabId}.`)
+        return {
+          id: opened.id,
+          tabId: opened.browserTabId,
+          state: 'submitted',
+          submittedUserTurnKey: String(response.result?.submittedUserTurnKey || response.submittedUserTurnKey || ''),
+        }
+      } catch (error) {
+        // A timed-out submit may already have crossed into ChatGPT. Live
+        // generation is acceptance evidence: keep this tab as the worker
+        // instead of retrying the prompt or opening a replacement.
+        const current = (await relay.clients(signal).catch(() => []))
+          .find((client) => client.browserTabId === opened.browserTabId)
+        if (current && (isGenerating(current) || current.activeRequest?.requestId)) {
+          log(`Prompt submission became uncertain in tab ${opened.browserTabId}; retaining the active tab as its worker slot.`)
+          return {
+            id: current.id,
+            tabId: current.browserTabId,
+            state: 'submitted_uncertain',
+            detail: error.message,
+          }
+        }
+        if (!isRetryableLaunchError(error) || attempt >= DEFAULT_MAX_LAUNCH_ATTEMPTS) throw error
+        log(`Tab ${opened.browserTabId} is not ready for submission yet; retrying the same tab (${attempt}/${DEFAULT_MAX_LAUNCH_ATTEMPTS}).`)
+        await delay(SAME_TAB_RETRY_MS, signal)
+      }
     }
   } catch (error) {
+    let retained = null
     if (opened) {
       try {
         const current = (await relay.clients(signal)).find((client) => client.browserTabId === opened.browserTabId)
-        if (current && !isGenerating(current) && !current.activeRequest?.requestId) {
-          await relay.close(current.id, current.url, signal)
+        if (current) {
+          retained = current
+          if (!isGenerating(current) && !current.activeRequest?.requestId) {
+            await relay.close(current.id, current.url, signal)
+            retained = null
+          }
         }
-      } catch {}
+      } catch {
+        // A failed client-list or close call cannot prove the tab disappeared.
+        // Retain its original identity so it consumes a fleet slot and later
+        // cleanup can retry instead of opening a replacement beside it.
+        retained = opened
+      }
+    }
+    if (retained) {
+      return {
+        id: retained.id,
+        tabId: retained.browserTabId,
+        state: 'launch_retained',
+        detail: error.message,
+      }
     }
     return { id: opened?.id || '', tabId: opened?.browserTabId || null, state: 'failed', detail: error.message }
   }
 }
 
-async function adoptChatTarget(relay, tabId, signal, temporaryOnly = true) {
+async function adoptChatTarget(relay, tabId, signal, temporaryOnly = true, personalizedTemporary = false) {
   if (!Number.isInteger(tabId)) return null
   const client = (await relay.clients(signal)).find((candidate) => candidate.browserTabId === tabId)
-  if (!client || !await verifiedChatMode(relay, client, signal, temporaryOnly)) {
-    throw new Error(`Cannot adopt tab ${tabId}: it is not a verified ${temporaryOnly ? 'Temporary' : 'normal'} chat`)
+  if (!client || !await verifiedChatMode(relay, client, signal, temporaryOnly, personalizedTemporary)) {
+    throw new Error(`Cannot adopt tab ${tabId}: it is not a verified ${personalizedTemporary ? 'Personalized Temporary' : (temporaryOnly ? 'Temporary' : 'normal')} chat`)
   }
   return {
     id: client.id,
@@ -369,31 +602,37 @@ async function adoptChatTarget(relay, tabId, signal, temporaryOnly = true) {
 }
 
 async function launchRound({ relay, promptTemplate, adopted = [], staggerMs, signal, log, temporaryOnly = true,
-  fleetSize = DEFAULT_FLEET_SIZE }) {
+  personalizedTemporary = false, fleetSize = DEFAULT_FLEET_SIZE }) {
   const results = [...adopted]
-  let successful = results.filter(isSuccessfulSession).length
+  let occupied = results.filter(isRetainedSession).length
   let launchAttempts = 0
-  while (!signal.aborted && successful < fleetSize && launchAttempts < DEFAULT_MAX_LAUNCH_ATTEMPTS) {
+  const openAttemptBudget = launchOpenAttemptBudget(fleetSize, occupied)
+  while (!signal.aborted && occupied < fleetSize && launchAttempts < openAttemptBudget) {
     if (launchAttempts > 0) await delay(staggerMs, signal)
-    const slot = successful + 1
+    const slot = occupied + 1
     const prompt = renderFleetPrompt(promptTemplate, slot, fleetSize)
-    const launched = await launchChatTarget({ relay, prompt, signal, log, temporaryOnly })
-    const result = isSuccessfulSession(launched)
-      ? { ...launched, slot, runCount: 1 }
+    const launched = await launchChatTarget({ relay, prompt, signal, log, temporaryOnly, personalizedTemporary })
+    const result = isRetainedSession(launched)
+      ? { ...launched, slot, runCount: isSuccessfulSession(launched) ? 1 : 0 }
       : launched
     results.push(result)
     launchAttempts += 1
-    if (isSuccessfulSession(result)) successful += 1
+    if (isRetainedSession(result)) occupied += 1
     if (result.state === 'memory_guard' || result.state === 'no_control_tab') break
   }
   return results
 }
 
 export function isSuccessfulSession(result) {
-  return ['submitted', 'reused_submitted', 'already_generating', 'adopted_submitted'].includes(result?.state)
+  return ['submitted', 'submitted_uncertain', 'reused_submitted', 'already_generating', 'adopted_submitted'].includes(result?.state)
 }
 
-async function inspectReusableFleet(relay, fleet, signal, temporaryOnly = true) {
+/** A still-open tab occupies a slot even when submission could not be confirmed. */
+export function isRetainedSession(result) {
+  return isSuccessfulSession(result) || result?.state === 'launch_retained'
+}
+
+async function inspectReusableFleet(relay, fleet, signal, temporaryOnly = true, personalizedTemporary = false) {
   const clients = await relay.clients(signal)
   const inspected = []
   for (const owned of fleet) {
@@ -404,7 +643,7 @@ async function inspectReusableFleet(relay, fleet, signal, temporaryOnly = true) 
     }
     try {
       const capture = await relay.captureLayout(current.id, signal)
-      if (!hasExpectedChatMode(capture.html, temporaryOnly, current.url)) {
+      if (!hasExpectedChatMode(capture.html, temporaryOnly, current.url, personalizedTemporary)) {
         inspected.push({ owned, current, state: 'wrong_chat_mode' })
         continue
       }
@@ -418,7 +657,7 @@ async function inspectReusableFleet(relay, fleet, signal, temporaryOnly = true) 
 }
 
 async function reuseFleetRound({ relay, fleet, promptTemplate, signal, log, temporaryOnly = true,
-  staggerMs = DEFAULT_STAGGER_SECONDS * 1000, fleetSize = DEFAULT_FLEET_SIZE }) {
+  personalizedTemporary = false, staggerMs = DEFAULT_STAGGER_SECONDS * 1000, fleetSize = DEFAULT_FLEET_SIZE, maxSessionRuns = DEFAULT_MAX_SESSION_RUNS }) {
   const attempts = fleet.map(async (owned, index) => {
     if (index > 0) await delay(index * staggerMs, signal)
     const slot = Number.isInteger(owned.slot) ? owned.slot : index + 1
@@ -432,7 +671,7 @@ async function reuseFleetRound({ relay, fleet, promptTemplate, signal, log, temp
         runCount: sessionRunCount(owned) + 1,
         submittedUserTurnKey: String(response.result?.submittedUserTurnKey || response.submittedUserTurnKey || ''),
       }
-      log(`Submitted run ${session.runCount}/${DEFAULT_MAX_SESSION_RUNS} to runner-owned ${temporaryOnly ? 'Temporary' : 'normal'} tab ${owned.tabId}.`)
+      log(`Submitted run ${session.runCount}/${maxSessionRuns} to runner-owned ${personalizedTemporary ? 'Personalized Temporary' : (temporaryOnly ? 'Temporary' : 'normal')} tab ${owned.tabId}.`)
       return session
     } catch (error) {
       return { ...owned, slot, state: 'reuse_failed', detail: error.message }
@@ -453,11 +692,31 @@ function summary(results) {
 async function main() {
   const rawArgs = process.argv.slice(2)
   const args = new Set(rawArgs)
+  if (args.has('--help') || args.has('-h')) {
+    console.log([
+      'Usage: node scripts/Run-Hachimi-Temporary-Fleet.mjs --prompt-file=<path> [options]',
+      '',
+      'The legacy embedded hachimi-tl-vi prompt is disabled. An explicit --prompt-file is required.',
+      'Common options: --fleet-size=N --interval-minutes=N --max-session-runs=N --once',
+      '              --personalized-temporary --normal-chat --close-after-round',
+    ].join('\n'))
+    return
+  }
+  const promptFile = promptFileArgument(rawArgs)
+  if (!promptFile) {
+    console.error('Refusing to launch: the legacy embedded hachimi-tl-vi prompt is disabled; pass --prompt-file=<path> explicitly.')
+    process.exitCode = 2
+    return
+  }
   const once = args.has('--once')
   const resumeStatus = args.has('--resume-status')
   const temporaryOnly = !args.has('--normal-chat')
-  const chatMode = temporaryOnly ? 'temporary' : 'normal'
+  const personalizedTemporary = temporaryOnly && args.has('--personalized-temporary')
+  const closeAfterRound = args.has('--close-after-round')
+  const chatMode = personalizedTemporary ? 'temporary_personalized' : (temporaryOnly ? 'temporary' : 'normal')
   const fleetSize = fleetSizeArgument(rawArgs)
+  const intervalMinutes = intervalMinutesArgument(rawArgs)
+  const maxSessionRuns = maxSessionRunsArgument(rawArgs)
   const runStatusPath = path.join(path.dirname(statusPath), statusNameArgument(rawArgs))
   const adoptValue = rawArgs.find((argument) => argument.startsWith('--adopt-tabs='))?.split('=', 2)[1]
     || rawArgs.find((argument) => argument.startsWith('--adopt-tab='))?.split('=', 2)[1]
@@ -465,10 +724,7 @@ async function main() {
   if (adoptTabIds.length > fleetSize) throw new Error('adopted tab count exceeds --fleet-size')
   const env = parseEnvFile(await fs.readFile(runtimeEnvPath, 'utf8'))
   if (!env.API_TOKEN) throw new Error(`Relay token is missing from ${runtimeEnvPath}`)
-  const promptFile = promptFileArgument(rawArgs)
-  const promptTemplate = promptFile
-    ? await fs.readFile(path.resolve(process.cwd(), promptFile), 'utf8')
-    : extractEmbeddedPrompt(await fs.readFile(consoleScriptPath, 'utf8'))
+  const promptTemplate = await fs.readFile(path.resolve(process.cwd(), promptFile), 'utf8')
   if (!promptTemplate.trim()) throw new Error('Fleet prompt is empty')
   const relay = new RelayClient({
     baseUrl: `http://127.0.0.1:${env.PORT || 23158}`,
@@ -494,15 +750,15 @@ async function main() {
       }
     }
     let adopted = []
-    for (const tabId of adoptTabIds) adopted.push(await adoptChatTarget(relay, tabId, controller.signal, temporaryOnly))
+    for (const tabId of adoptTabIds) adopted.push(await adoptChatTarget(relay, tabId, controller.signal, temporaryOnly, personalizedTemporary))
     while (!controller.signal.aborted && hasRemainingRounds(round)) {
       let reusableTargets = null
       let deferredResults = []
       if (fleet.length) {
-        const inspected = await inspectReusableFleet(relay, fleet, controller.signal, temporaryOnly)
+        const inspected = await inspectReusableFleet(relay, fleet, controller.signal, temporaryOnly, personalizedTemporary)
         const busy = inspected.filter((item) => ['busy', 'inspect_failed'].includes(item.state))
         const missingOrInvalid = inspected.some((item) => ['missing', 'wrong_chat_mode'].includes(item.state))
-        const rotationRequired = fleetNeedsRotation(fleet)
+        const rotationRequired = fleetNeedsRotation(fleet, maxSessionRuns)
         const ready = inspected.filter((item) => item.state === 'ready')
         if (busy.length && (rotationRequired || missingOrInvalid || !ready.length)) {
           const retry = busy.map(({ owned, state, detail }) => ({ ...owned, state, detail }))
@@ -510,8 +766,8 @@ async function main() {
             running: true,
             pid: process.pid,
             fleetSize,
-            intervalMinutes: DEFAULT_INTERVAL_MINUTES,
-            maxSessionRuns: DEFAULT_MAX_SESSION_RUNS,
+            intervalMinutes,
+            maxSessionRuns,
             chatMode,
             round,
             updatedAt: new Date().toISOString(),
@@ -526,15 +782,15 @@ async function main() {
         }
 
         if (rotationRequired || missingOrInvalid) {
-          const cleanup = await cleanupOwnedFleet(relay, fleet, controller.signal, log, temporaryOnly)
+          const cleanup = await cleanupOwnedFleet(relay, fleet, controller.signal, log, temporaryOnly, personalizedTemporary)
           const blocked = cleanup.filter((item) => !['closed', 'already_closed'].includes(item.state))
           if (blocked.length) {
             await writeStatus({
               running: true,
               pid: process.pid,
               fleetSize,
-              intervalMinutes: DEFAULT_INTERVAL_MINUTES,
-              maxSessionRuns: DEFAULT_MAX_SESSION_RUNS,
+              intervalMinutes,
+              maxSessionRuns,
               chatMode,
               round,
               updatedAt: new Date().toISOString(),
@@ -570,7 +826,9 @@ async function main() {
           signal: controller.signal,
           log,
           temporaryOnly,
+          personalizedTemporary,
           fleetSize,
+          maxSessionRuns,
         })
         results = [...reused.results, ...deferredResults]
         if (reusableTargets) {
@@ -588,18 +846,20 @@ async function main() {
           signal: controller.signal,
           log,
           temporaryOnly,
+          personalizedTemporary,
           fleetSize,
         })
-        fleet = results.filter((result) => isSuccessfulSession(result) && Number.isInteger(result.tabId))
+        fleet = results.filter((result) => isRetainedSession(result) && Number.isInteger(result.tabId))
       }
       adopted = []
+      const nextRunAtMs = once || !hasRemainingRounds(round) ? null : Date.now() + intervalMinutes * 60_000
       const status = {
         running: !once && hasRemainingRounds(round) && !controller.signal.aborted,
         pid: process.pid,
         fleetSize,
         activeFleetSize: fleet.length,
-        intervalMinutes: DEFAULT_INTERVAL_MINUTES,
-        maxSessionRuns: DEFAULT_MAX_SESSION_RUNS,
+        intervalMinutes,
+        maxSessionRuns,
         chatMode,
         staggerSeconds: DEFAULT_STAGGER_SECONDS,
         round,
@@ -609,12 +869,46 @@ async function main() {
         summary: summary(results),
         sessions: fleet,
         results,
-        nextRunAt: once || !hasRemainingRounds(round) ? null : new Date(Date.now() + DEFAULT_INTERVAL_MINUTES * 60_000).toISOString(),
+        closeAfterRound,
+        nextRunAt: nextRunAtMs == null ? null : new Date(nextRunAtMs).toISOString(),
       }
       await writeStatus(status, runStatusPath)
       log(`Round ${round} result: ${JSON.stringify(status.summary)}.`)
+
+      if (closeAfterRound && fleet.length && !controller.signal.aborted) {
+        log(`Waiting for ${fleet.length} runner-owned ${chatMode} tab(s) to finish, then closing them before the next round.`)
+        const cleanupDeadlineMs = Math.min(
+          nextRunAtMs ?? Number.POSITIVE_INFINITY,
+          Date.now() + ROUND_CLEANUP_TIMEOUT_MS,
+        )
+        const cleanup = await cleanupOwnedFleetWhenIdle(
+          relay,
+          fleet,
+          controller.signal,
+          log,
+          temporaryOnly,
+          personalizedTemporary,
+          cleanupDeadlineMs,
+        )
+        const blocked = cleanup.filter((item) => !['closed', 'already_closed'].includes(item.state))
+        fleet = blocked
+        await writeStatus({
+          ...status,
+          running: !once && hasRemainingRounds(round) && !controller.signal.aborted,
+          activeFleetSize: fleet.length,
+          sessions: fleet,
+          cleanup,
+          cleanupCompletedAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        }, runStatusPath)
+        if (!fleet.length) log(`Round ${round} cleanup complete: all runner-owned worker tabs are closed.`)
+      }
+
       if (once || !hasRemainingRounds(round) || controller.signal.aborted) break
-      await delay(DEFAULT_INTERVAL_MINUTES * 60_000, controller.signal)
+      if (closeAfterRound && fleet.length) {
+        log(`Round ${round} cleanup is incomplete; refusing to open another cohort while runner-owned tabs remain.`)
+      }
+      await delay(nextRoundDelayMs(nextRunAtMs), controller.signal)
     }
   } finally {
     process.removeListener('SIGINT', stop)

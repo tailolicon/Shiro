@@ -6,12 +6,19 @@ import { join } from 'node:path'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
-import { BridgeBroker, configureMcp } from '../src/index.js'
+import {
+  BridgeBroker,
+  configureMcp,
+  mcpRequestExecutionContext,
+  mcpRequestHasControlCredential,
+  SHIRO_CLIENT_HEADER,
+  SHIRO_CONTROL_HEADER,
+} from '../src/index.js'
 import { publicSessionStatus } from '../src/session-status.js'
 
-async function withMcp(controller, workspaceRoot, run, fleetManager = null) {
+async function withMcp(controller, workspaceRoot, run, fleetManager = null, runtime = {}) {
   const server = new McpServer({ name: 'shiro-mcp-test', version: '0.0.0' })
-  configureMcp(server, controller, { workspaceRoot, waitMs: 25_000 }, fleetManager)
+  configureMcp(server, controller, { workspaceRoot, waitMs: 25_000 }, fleetManager, runtime)
   const client = new Client({ name: 'shiro-mcp-test-client', version: '0.0.0' })
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
   await server.connect(serverTransport)
@@ -57,8 +64,9 @@ function fakeController() {
         model_requests: [],
       }
     },
-    async start(prompt, agentPreset, sessionId, speedProfile, reasoningEffort) {
+    async start(prompt, agentPreset, sessionId, speedProfile, reasoningEffort, waitOptions, workspace, executionMode) {
       calls.push(['start', prompt, agentPreset, sessionId, speedProfile, reasoningEffort])
+      calls.push(['startExecutionMode', executionMode])
       return { status: 'running', state: 'running', pending_action: 'poll', operation_id: 'operation-test', session_id: 'session-test', root_session_id: 'session-test', model_requests: [] }
     },
     async submit() {
@@ -76,6 +84,55 @@ function fakeController() {
     },
   }
 }
+
+test('HTTP callers follow the configured loop owner unless a turn explicitly overrides it', () => {
+  assert.deepEqual(mcpRequestExecutionContext({}, 'autonomous'), {
+    clientKind: 'connector',
+    defaultExecutionMode: 'autonomous',
+  })
+  assert.deepEqual(mcpRequestExecutionContext({ [SHIRO_CLIENT_HEADER]: 'shiro-cli' }, 'autonomous'), {
+    clientKind: 'shiro-cli',
+    defaultExecutionMode: 'autonomous',
+  })
+  assert.deepEqual(mcpRequestExecutionContext({ [SHIRO_CLIENT_HEADER]: ['shiro-cli'] }, 'relay'), {
+    clientKind: 'shiro-cli',
+    defaultExecutionMode: 'relay',
+  })
+  assert.deepEqual(mcpRequestExecutionContext({ [SHIRO_CLIENT_HEADER]: 'shiro-python' }, 'autonomous'), {
+    clientKind: 'shiro-python',
+    defaultExecutionMode: 'autonomous',
+  })
+})
+
+test('the routing marker cannot impersonate the separate OmniCast control credential', () => {
+  const headers = { [SHIRO_CLIENT_HEADER]: 'shiro-python' }
+  assert.equal(mcpRequestHasControlCredential(headers, 'private-control-secret'), false)
+  assert.equal(mcpRequestHasControlCredential({
+    ...headers,
+    [SHIRO_CONTROL_HEADER]: 'ordinary-bridge-bearer',
+  }, 'private-control-secret'), false)
+  assert.equal(mcpRequestHasControlCredential({
+    ...headers,
+    [SHIRO_CONTROL_HEADER]: 'private-control-secret',
+  }, 'private-control-secret'), true)
+})
+
+test('request default is applied unless harness_start explicitly overrides it', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'shiro-mcp-routing-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+
+  const connectorController = fakeController()
+  await withMcp(connectorController, root, async client => {
+    await client.callTool({ name: 'harness_start', arguments: { prompt: 'connector default' } })
+  }, null, { requestDefaultExecutionMode: 'relay', requestClientKind: 'connector' })
+  assert.deepEqual(connectorController.calls.find(call => call[0] === 'startExecutionMode'), ['startExecutionMode', 'relay'])
+
+  const explicitController = fakeController()
+  await withMcp(explicitController, root, async client => {
+    await client.callTool({ name: 'harness_start', arguments: { prompt: 'explicit override', execution_mode: 'autonomous' } })
+  }, null, { requestDefaultExecutionMode: 'relay', requestClientKind: 'connector' })
+  assert.deepEqual(explicitController.calls.find(call => call[0] === 'startExecutionMode'), ['startExecutionMode', 'autonomous'])
+})
 
 function fakeFleetManager() {
   const calls = []

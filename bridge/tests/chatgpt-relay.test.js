@@ -4,7 +4,7 @@ import { ChatGptBrowserRelay, RelayError, parseReply, relayDeltaPrompt, relayPro
 
 const request = {
   request_id: 'request-test',
-  model: 'gpt-5.6-sol',
+  model: 'gpt-6-astra',
   messages: [{ role: 'user', content: [{ type: 'text', text: 'Read package.json' }] }],
   tools: [{ name: 'read', description: 'Read a file', inputSchema: { type: 'object' } }],
   generation: { reasoning_effort: 'standard' },
@@ -55,10 +55,194 @@ test('browser relay stays loopback-only and maps a Harness tool call', async () 
   const sent = JSON.parse(calls[1].init.body)
   // First main-thread call of a fresh relay instance rotates (cold start).
   assert.equal(sent.newSession, true)
-  assert.equal(sent.autoOpenTab, false)
+  assert.equal(sent.autoOpenTab, true)
+  assert.equal(sent.model, 'GPT-5.6 Sol')
   assert.equal(sent.effort, 'medium')
   assert.match(sent.message, /DeepSeek Harness/)
   assert.match(sent.message, /Read package\.json/)
+})
+
+test('browser relay keeps the dedicated tab on default GPT-5.6 Sol and selects Instant power for Harness light effort', async () => {
+  const calls = []
+  const relay = new ChatGptBrowserRelay({
+    url: 'http://127.0.0.1:23158',
+    token: 'relay-test-token',
+    model: 'GPT-5.6 Sol',
+    fetchImpl: async (_url, init = {}) => {
+      calls.push(JSON.parse(init.body))
+      return Response.json({ response: PROTOCOL_OK })
+    },
+  })
+
+  await relay.complete({ ...request, tools: [], generation: { reasoning_effort: 'light' } })
+  assert.equal(calls[0].model, 'GPT-5.6 Sol')
+  assert.equal(calls[0].effort, 'instant')
+})
+
+test('Sol maps Harness max effort to Extra High without changing model', async () => {
+  const calls = []
+  const relay = new ChatGptBrowserRelay({
+    url: 'http://127.0.0.1:23158',
+    token: 'relay-test-token',
+    model: 'GPT-5.6 Sol',
+    fetchImpl: async (_url, init = {}) => {
+      calls.push(JSON.parse(init.body))
+      return Response.json({ response: PROTOCOL_OK })
+    },
+  })
+  await relay.complete({ ...request, session_id: 'sol-xhigh', tools: [], generation: { reasoning_effort: 'max' } })
+  assert.equal(calls[0].model, 'GPT-5.6 Sol')
+  assert.equal(calls[0].effort, 'xhigh')
+})
+
+test('Astra selects GPT-6 Pro without applying Sol-only Web power labels', async () => {
+  const calls = []
+  const relay = new ChatGptBrowserRelay({
+    url: 'http://127.0.0.1:23158',
+    token: 'relay-test-token',
+    model: 'GPT-6 Pro',
+    fetchImpl: async (_url, init = {}) => {
+      calls.push(JSON.parse(init.body))
+      return Response.json({ response: PROTOCOL_OK })
+    },
+  })
+
+  for (const reasoning_effort of ['light', 'standard', 'high', 'max']) {
+    await relay.complete({ ...request, session_id: reasoning_effort, tools: [], generation: { reasoning_effort } })
+  }
+  assert.deepEqual(calls.map(call => call.effort), ['', '', '', ''])
+  assert.ok(calls.every(call => call.model === 'GPT-6 Pro'))
+})
+
+test('Astra selection verification fails closed and records observed evidence', async () => {
+  const bindings = []
+  let verified = false
+  const relay = new ChatGptBrowserRelay({
+    url: 'http://127.0.0.1:23158',
+    token: 'relay-test-token',
+    model: 'GPT-6 Pro',
+    requireSelectionVerification: true,
+    bindSession: (...args) => bindings.push(args),
+    fetchImpl: async url => {
+      if (url.endsWith('/health')) return Response.json({ ok: true, clients: 1, selectedClientId: 'astra-tab' })
+      if (url.endsWith('/browser/clients')) return Response.json({ clients: [{ id: 'astra-tab', tabId: 6, url: 'https://chatgpt.com/c/astra' }] })
+      return Response.json({
+        response: PROTOCOL_OK,
+        observedResponseModelSlug: verified ? 'gpt-6-pro' : 'gpt-5-6-thinking',
+        events: [{
+          type: 'model.apply.done', effectId: 'effect-astra', modelApplied: verified, effortApplied: false,
+          intelligence: { selectedModel: { label: 'GPT-6 Pro' }, selectedEffort: null },
+        }],
+      })
+    },
+  })
+
+  await assert.rejects(relay.complete({ ...request, session_id: 'session-astra' }), error => (
+    error instanceof RelayError && error.code === 'MODEL_SELECTION_UNVERIFIED' && /not verified/.test(error.message)
+  ))
+  verified = true
+  await relay.complete({ ...request, session_id: 'session-astra' })
+  const [, , evidence] = bindings.at(-1)
+  assert.equal(evidence.model, 'GPT-6 Pro')
+  assert.equal(evidence.effort, undefined)
+  assert.equal(evidence.evidence.source, 'browser-picker-and-response-turn')
+  assert.equal(evidence.evidence.observed_response_model_slug, 'gpt-6-pro')
+  assert.equal(evidence.evidence.response_model_status, 'matched')
+})
+
+test('Astra keeps picker-only evidence honest when the completed turn has no model slug', async () => {
+  const bindings = []
+  const modelEvent = {
+    type: 'model.apply.done', effectId: 'effect-astra-missing-slug', modelApplied: true, effortApplied: false,
+    intelligence: { selectedModel: { label: 'GPT-6 Pro' }, selectedEffort: null },
+  }
+  const relay = new ChatGptBrowserRelay({
+    url: 'http://127.0.0.1:23158',
+    token: 'relay-test-token',
+    model: 'GPT-6 Pro',
+    requireSelectionVerification: true,
+    bindSession: (...args) => bindings.push(args),
+    fetchImpl: async url => {
+      if (url.endsWith('/health')) return Response.json({ ok: true, clients: 1 })
+      if (url.endsWith('/browser/clients')) return Response.json({ clients: [] })
+      return Response.json({ response: PROTOCOL_OK, events: [modelEvent] })
+    },
+  })
+
+  await relay.complete({ ...request, session_id: 'session-astra-missing-slug', tools: [] })
+  const [, , evidence] = bindings.at(-1)
+  assert.equal(evidence.model, undefined)
+  assert.equal(evidence.evidence.model_applied, true)
+  assert.equal(evidence.evidence.response_model_status, 'missing')
+})
+
+test('an unfamiliar GPT-6 response slug is recorded but never claimed as an exact model match', async () => {
+  const bindings = []
+  const modelEvent = {
+    type: 'model.apply.done', effectId: 'effect-astra-opaque-slug', modelApplied: true, effortApplied: false,
+    intelligence: { selectedModel: { label: 'GPT-6 Pro' }, selectedEffort: null },
+  }
+  const relay = new ChatGptBrowserRelay({
+    url: 'http://127.0.0.1:23158', token: 'relay-test-token', model: 'GPT-6 Pro',
+    requireSelectionVerification: true,
+    bindSession: (...args) => bindings.push(args),
+    fetchImpl: async url => {
+      if (url.endsWith('/health')) return Response.json({ ok: true, clients: 1 })
+      if (url.endsWith('/browser/clients')) return Response.json({ clients: [] })
+      return Response.json({
+        response: PROTOCOL_OK,
+        observedResponseModelSlug: 'gpt-6-mini',
+        events: [modelEvent],
+      })
+    },
+  })
+
+  await relay.complete({ ...request, session_id: 'session-astra-opaque-slug', tools: [] })
+  const [, , evidence] = bindings.at(-1)
+  assert.equal(evidence.model, undefined)
+  assert.equal(evidence.evidence.observed_response_model_slug, 'gpt-6-mini')
+  assert.equal(evidence.evidence.response_model_status, 'unverified')
+})
+
+test('Astra rejects an observed Sol fallback without a retryable transport code', async () => {
+  const modelEvent = {
+    type: 'model.apply.done', effectId: 'effect-astra-fallback', modelApplied: true, effortApplied: false,
+    intelligence: { selectedModel: { label: 'GPT-6 Pro' }, selectedEffort: null },
+  }
+  const relay = new ChatGptBrowserRelay({
+    url: 'http://127.0.0.1:23158',
+    token: 'relay-test-token',
+    model: 'GPT-6 Pro',
+    requireSelectionVerification: true,
+    fetchImpl: async () => Response.json({
+      response: PROTOCOL_OK,
+      observedResponseModelSlug: 'gpt-5-6-thinking',
+      events: [modelEvent],
+    }),
+  })
+
+  await assert.rejects(relay.complete({ ...request, tools: [] }), error => (
+    error instanceof RelayError
+    && error.code === 'MODEL_RESPONSE_MISMATCH'
+    && /gpt-5-6-thinking/.test(error.message)
+  ))
+})
+
+test('browser relay still explicitly selects a configured non-default Web model', async () => {
+  const calls = []
+  const relay = new ChatGptBrowserRelay({
+    url: 'http://127.0.0.1:23158',
+    token: 'relay-test-token',
+    model: 'GPT-5.5',
+    fetchImpl: async (_url, init = {}) => {
+      calls.push(JSON.parse(init.body))
+      return Response.json({ response: PROTOCOL_OK })
+    },
+  })
+
+  await relay.complete({ ...request, tools: [], generation: { reasoning_effort: 'light' } })
+  assert.equal(calls[0].model, 'GPT-5.5')
+  assert.equal(calls[0].effort, 'instant')
 })
 
 test('browser relay rejects non-loopback endpoints and unknown tool names', async () => {
@@ -364,6 +548,89 @@ test('streamComplete emits incremental text deltas that assemble into the buffer
   assert.equal(final.finishReason, 'stop')
 })
 
+test('required Astra verification withholds streamed deltas when picker evidence is missing', async () => {
+  const wireText = JSON.stringify({
+    blocks: [{ type: 'text', text: 'must not leak' }],
+    finishReason: 'stop',
+  })
+  const frames = [
+    sseFrame({ type: 'answer.delta', requestId: 'r-unverified', text: wireText, delta: wireText }),
+    sseFrame({ type: 'request.result', requestId: 'r-unverified', result: { answer: wireText, events: [] } }),
+  ]
+  const relay = new ChatGptBrowserRelay({
+    url: 'http://127.0.0.1:23158',
+    token: 'relay-test-token',
+    model: 'GPT-6 Pro',
+    requireSelectionVerification: true,
+    fetchImpl: async () => sseResponse(frames),
+  })
+  const emitted = []
+  await assert.rejects(async () => {
+    for await (const item of relay.streamComplete({ ...request, tools: [] })) emitted.push(item)
+  }, error => error instanceof RelayError && error.code === 'MODEL_SELECTION_UNVERIFIED' && /not verified/.test(error.message))
+  assert.deepEqual(emitted, [], 'an unverified model response must not emit even preview text')
+})
+
+test('required Astra streaming releases only after picker and completed-turn model evidence', async () => {
+  const wireText = JSON.stringify({
+    blocks: [{ type: 'text', text: 'verified Astra text' }],
+    finishReason: 'stop',
+  })
+  const modelEvent = {
+    type: 'model.apply.done', requestId: 'r-verified', effectId: 'effect-model',
+    model: 'GPT-6 Pro', modelApplied: true, effortApplied: false,
+    intelligence: { selectedModel: { label: 'GPT-6 Pro' }, selectedEffort: null },
+  }
+  const frames = [
+    sseFrame(modelEvent),
+    sseFrame({ type: 'answer.delta', requestId: 'r-verified', text: wireText, delta: wireText }),
+    sseFrame({
+      type: 'request.result', requestId: 'r-verified',
+      result: { answer: wireText, observedResponseModelSlug: 'gpt-6-pro', events: [modelEvent] },
+    }),
+  ]
+  const relay = new ChatGptBrowserRelay({
+    url: 'http://127.0.0.1:23158',
+    token: 'relay-test-token',
+    model: 'GPT-6 Pro',
+    requireSelectionVerification: true,
+    fetchImpl: async () => sseResponse(frames),
+  })
+  const { deltas, final } = await collectStream(relay.streamComplete({ ...request, tools: [] }))
+  assert.equal(deltas.join(''), 'verified Astra text')
+  assert.deepEqual(final.blocks, [{ type: 'text', text: 'verified Astra text' }])
+})
+
+test('required Astra streaming emits no bytes for an observed Sol fallback', async () => {
+  const wireText = JSON.stringify({
+    blocks: [{ type: 'text', text: 'must remain hidden' }],
+    finishReason: 'stop',
+  })
+  const modelEvent = {
+    type: 'model.apply.done', requestId: 'r-fallback', effectId: 'effect-fallback',
+    modelApplied: true, effortApplied: false,
+    intelligence: { selectedModel: { label: 'GPT-6 Pro' }, selectedEffort: null },
+  }
+  const frames = [
+    sseFrame(modelEvent),
+    sseFrame({ type: 'answer.delta', requestId: 'r-fallback', text: wireText, delta: wireText }),
+    sseFrame({
+      type: 'request.result', requestId: 'r-fallback',
+      result: { answer: wireText, observedResponseModelSlug: 'gpt-5-6-thinking', events: [modelEvent] },
+    }),
+  ]
+  const relay = new ChatGptBrowserRelay({
+    url: 'http://127.0.0.1:23158', token: 'relay-test-token', model: 'GPT-6 Pro',
+    requireSelectionVerification: true,
+    fetchImpl: async () => sseResponse(frames),
+  })
+  const emitted = []
+  await assert.rejects(async () => {
+    for await (const item of relay.streamComplete({ ...request, tools: [] })) emitted.push(item)
+  }, error => error instanceof RelayError && error.code === 'MODEL_RESPONSE_MISMATCH')
+  assert.deepEqual(emitted, [])
+})
+
 test('streamComplete never streams a prose-prefixed reply whose embedded JSON parses to tool calls', async () => {
   // "Here's the plan: {json}" replies stream nothing: extractJson() can still
   // recover the embedded object (blocks[0] = tool_call), so streamed text
@@ -463,6 +730,7 @@ test('a continuation turn sends only the new events, not the whole transcript', 
   // Turns 2 and 3 continue the same thread with only the fresh events.
   for (const body of calls.slice(1)) {
     assert.equal(body.newSession, false)
+    assert.equal(body.autoOpenTab, false, 'a delta continuation must never be eligible for a fresh tab')
     assert.match(body.message, /NEW_HARNESS_EVENTS_JSON/)
     assert.doesNotMatch(body.message, /EXACT_HARNESS_REQUEST_JSON/)
   }
@@ -477,6 +745,186 @@ test('a continuation turn sends only the new events, not the whole transcript', 
     calls[2].message.length < relayPrompt(transcript(2)).length,
     'a continuation must cost less than resending the transcript',
   )
+})
+
+test('concurrent calls serialize planning so a queued continuation uses the committed prefix', async () => {
+  const calls = []
+  let releaseFirst
+  const firstPending = new Promise(resolve => { releaseFirst = resolve })
+  let firstDispatched
+  const firstSeen = new Promise(resolve => { firstDispatched = resolve })
+  const relay = new ChatGptBrowserRelay({
+    url: 'http://127.0.0.1:23159',
+    token: 'relay-test-token',
+    fetchImpl: async (_url, init = {}) => {
+      calls.push(JSON.parse(init.body))
+      if (calls.length === 1) {
+        firstDispatched()
+        await firstPending
+      }
+      return Response.json({ response: PROTOCOL_OK })
+    },
+  })
+
+  const first = relay.complete(transcript(0, { session_id: 'shared-session' }))
+  await firstSeen
+  const second = relay.complete(transcript(1, { session_id: 'shared-session' }))
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(calls.length, 1, 'the second browser dispatch must wait for the first commit')
+  releaseFirst()
+  await Promise.all([first, second])
+
+  assert.deepEqual(calls.map(body => body.newSession), [true, false])
+  assert.equal(calls[1].autoOpenTab, false)
+  assert.match(calls[1].message, /NEW_HARNESS_EVENTS_JSON/)
+})
+
+test('coordinator queue time counts against the relay request timeout', async () => {
+  let releaseFirst
+  let markFirstStarted
+  const firstPending = new Promise(resolve => { releaseFirst = resolve })
+  const firstStarted = new Promise(resolve => { markFirstStarted = resolve })
+  let chatCalls = 0
+  const fetchImpl = async url => {
+    if (!url.endsWith('/chat')) return Response.json({ ok: true })
+    chatCalls += 1
+    if (chatCalls === 1) {
+      markFirstStarted()
+      await firstPending
+    }
+    return Response.json({ response: PROTOCOL_OK })
+  }
+  const firstRelay = new ChatGptBrowserRelay({
+    url: 'http://127.0.0.1:23161', token: 'relay-test-token', timeoutMs: 5_000, fetchImpl,
+  })
+  const queuedRelay = new ChatGptBrowserRelay({
+    url: 'http://127.0.0.1:23161', token: 'relay-test-token', timeoutMs: 25, fetchImpl,
+  })
+
+  const first = firstRelay.complete(transcript(0))
+  await firstStarted
+  await assert.rejects(queuedRelay.complete(transcript(0)), error => (
+    error instanceof RelayError && error.code === 'TIMEOUT'
+  ))
+  assert.equal(chatCalls, 1, 'a request that expired in the queue must never reach ChatGPT')
+  releaseFirst()
+  await first
+})
+
+test('a stalled health probe is bounded by the relay timeout', async () => {
+  const relay = new ChatGptBrowserRelay({
+    url: 'http://127.0.0.1:23164', token: 'relay-test-token', timeoutMs: 25,
+    fetchImpl: async (_url, init = {}) => await new Promise((resolve, reject) => {
+      init.signal?.addEventListener('abort', () => reject(init.signal.reason), { once: true })
+    }),
+  })
+
+  const started = Date.now()
+  const status = await relay.health()
+  assert.equal(status.ready, false)
+  assert.ok(Date.now() - started < 1_000, 'loopback health must not hang past its configured deadline')
+  assert.match(status.detail, /timeout|aborted/i)
+})
+
+test('a browser selection change invalidates delta plans in every relay instance', async () => {
+  const chatBodies = []
+  let selecting = false
+  let postSelectionHealth = false
+  const fetchImpl = async (url, init = {}) => {
+    if (url.endsWith('/chat')) {
+      chatBodies.push(JSON.parse(init.body))
+      return Response.json({ response: PROTOCOL_OK })
+    }
+    if (url.endsWith('/browser/clients')) {
+      return Response.json({ clients: [
+        { id: 'human-tab', ready: true, url: 'https://chatgpt.com/c/human' },
+        { id: 'new-shiro-tab', ready: true, url: 'https://chatgpt.com/' },
+      ] })
+    }
+    if (url.endsWith('/browser/select')) {
+      assert.equal(JSON.parse(init.body).clientId, 'new-shiro-tab')
+      postSelectionHealth = true
+      return Response.json({ ok: true })
+    }
+    if (url.endsWith('/health')) {
+      if (selecting && !postSelectionHealth) return Response.json({ ok: true, clients: 2, needsSelection: true })
+      return Response.json({
+        ok: true, clients: 1, needsSelection: false, selectedClientId: postSelectionHealth ? 'new-shiro-tab' : 'old-shiro-tab',
+      })
+    }
+    return Response.json({ ok: true })
+  }
+  const conversationRelay = new ChatGptBrowserRelay({
+    url: 'http://127.0.0.1:23162', token: 'relay-test-token', fetchImpl,
+  })
+  const selectionRelay = new ChatGptBrowserRelay({
+    url: 'http://127.0.0.1:23162', token: 'relay-test-token', fetchImpl,
+  })
+
+  await conversationRelay.complete(transcript(0))
+  await conversationRelay.complete(transcript(1))
+  assert.equal(chatBodies[1].newSession, false)
+  selecting = true
+  assert.equal((await selectionRelay.health()).ready, true)
+  await conversationRelay.complete(transcript(2))
+
+  assert.equal(chatBodies[2].newSession, true)
+  assert.equal(chatBodies[2].autoOpenTab, false, 'a selected healthy tab resets its conversation in place')
+  assert.match(chatBodies[2].message, /EXACT_HARNESS_REQUEST_JSON/)
+})
+
+test('a manually changed selected tab invalidates the current relay delta plan', async () => {
+  const chatBodies = []
+  let selectedClientId = 'old-shiro-tab'
+  const relay = new ChatGptBrowserRelay({
+    url: 'http://127.0.0.1:23163', token: 'relay-test-token',
+    fetchImpl: async (url, init = {}) => {
+      if (url.endsWith('/health')) {
+        return Response.json({ ok: true, clients: 1, needsSelection: false, selectedClientId })
+      }
+      if (url.endsWith('/chat')) {
+        chatBodies.push(JSON.parse(init.body))
+        return Response.json({ response: PROTOCOL_OK })
+      }
+      return Response.json({ ok: true })
+    },
+  })
+
+  assert.equal((await relay.health()).ready, true)
+  await relay.complete(transcript(0))
+  await relay.complete(transcript(1))
+  assert.equal(chatBodies[1].newSession, false)
+  assert.equal(chatBodies[1].sourceClientId, 'old-shiro-tab')
+  selectedClientId = 'manually-selected-tab'
+  assert.equal((await relay.health()).ready, true)
+  await relay.complete(transcript(2))
+
+  assert.equal(chatBodies[2].newSession, true)
+  assert.equal(chatBodies[2].autoOpenTab, false, 'manual selection must not fan out another physical tab')
+  assert.equal(chatBodies[2].sourceClientId, 'manually-selected-tab')
+})
+
+test('separate Sol and Astra relay instances invalidate each other browser-thread deltas', async () => {
+  const calls = []
+  const fetchImpl = async (_url, init = {}) => {
+    calls.push(JSON.parse(init.body))
+    return Response.json({ response: PROTOCOL_OK })
+  }
+  const astra = new ChatGptBrowserRelay({
+    url: 'http://127.0.0.1:23160', token: 'relay-test-token', model: 'GPT-6 Pro', fetchImpl,
+  })
+  const sol = new ChatGptBrowserRelay({
+    url: 'http://127.0.0.1:23160', token: 'relay-test-token', model: 'GPT-5.6 Sol', fetchImpl,
+  })
+
+  await astra.complete(transcript(0, { session_id: 'astra-session' }))
+  await sol.complete(transcript(0, { session_id: 'sol-session' }))
+  await astra.complete(transcript(1, { session_id: 'astra-session' }))
+
+  assert.deepEqual(calls.map(body => body.newSession), [true, true, true])
+  assert.ok(calls.every(body => body.autoOpenTab === true))
+  assert.match(calls[2].message, /EXACT_HARNESS_REQUEST_JSON/)
+  assert.doesNotMatch(calls[2].message, /NEW_HARNESS_EVENTS_JSON/)
 })
 
 test('a compacted or rewound transcript rotates to a fresh thread and resends in full', async () => {
@@ -708,11 +1156,23 @@ test('a blank second tab is selected automatically so Shiro keeps working', asyn
   assert.deepEqual(posted, ['shiro-tab'], 'the blank tab is chosen, never the human conversation')
 })
 
+test('a share page is treated as user work, not as a blank worker tab', async () => {
+  const { relay, posted } = tabRelay({
+    clients: [
+      { id: 'shared-chat', ready: true, url: 'https://chatgpt.com/share/6aa8e23d-10ec-83ec-a1c8-33faf543a565' },
+      { id: 'shiro-tab', ready: true, url: 'https://chatgpt.com/' },
+    ],
+  })
+  const status = await relay.health()
+  assert.equal(status.ready, true)
+  assert.deepEqual(posted, ['shiro-tab'], 'the share page must never be classified as blank')
+})
+
 test('two human conversations are never taken over silently', async () => {
   const { relay, posted } = tabRelay({
     clients: [
       { id: 'chat-a', ready: true, url: 'https://chatgpt.com/c/aaa' },
-      { id: 'chat-b', ready: true, url: 'https://chatgpt.com/c/bbb' },
+      { id: 'chat-b', ready: true, url: 'https://chatgpt.com/share/bbb' },
     ],
   })
   const status = await relay.health()
@@ -721,7 +1181,7 @@ test('two human conversations are never taken over silently', async () => {
   assert.match(status.detail, /close the extra tabs or choose one/)
 })
 
-test('a selection lost to a navigation is restored from memory', async () => {
+test('a selection lost to a navigation is restored from shared relay memory', async () => {
   // First health call settles on the driven tab...
   const { relay, posted } = tabRelay({
     clients: [
@@ -742,11 +1202,52 @@ test('a selection lost to a navigation is restored from memory', async () => {
       { id: 'shiro-tab', ready: true, url: 'https://chatgpt.com/c/shiro-thread' },
     ],
   })
-  // Teach the fresh relay the same memory by driving one selected health call.
+  // The coordinator shares the remembered physical tab across relay adapters,
+  // so a fresh instance can restore it without guessing from array order.
   assert.ok(relayWithLostSelection)
   const status = await lost.relay.health()
-  assert.equal(status.ready, false, 'without memory, two conversations stay ambiguous')
-  assert.deepEqual(lost.posted, [])
+  assert.equal(status.ready, true)
+  assert.deepEqual(lost.posted, ['shiro-tab'])
+})
+
+test('a selected tab that loses its composer forces a full fresh-tab re-anchor', async () => {
+  const bodies = []
+  let stale = false
+  const relay = new ChatGptBrowserRelay({
+    url: 'http://127.0.0.1:23158',
+    token: 'relay-test-token',
+    fetchImpl: async (url, init = {}) => {
+      if (url.endsWith('/health')) {
+        return Response.json({
+          ok: true,
+          clients: 1,
+          needsSelection: false,
+          selectedClientId: 'shiro-tab',
+          activeClient: stale
+            ? { id: 'shiro-tab', ready: true, pageReady: false, composerReady: false, chatMainReady: true }
+            : { id: 'shiro-tab', ready: true, pageReady: true, composerReady: true, chatMainReady: true },
+        })
+      }
+      if (url.endsWith('/chat')) {
+        bodies.push(JSON.parse(init.body))
+        return Response.json({ response: PROTOCOL_OK, clientId: 'shiro-tab' })
+      }
+      return Response.json({ ok: true })
+    },
+  })
+
+  await relay.complete(transcript(0))
+  stale = true
+  const status = await relay.health()
+  assert.equal(status.ready, true, 'transport stays usable because the next call can auto-open a fresh tab')
+  assert.match(status.detail, /re-anchoring/)
+  await relay.complete(transcript(1))
+
+  assert.equal(bodies.length, 2)
+  assert.equal(bodies[1].newSession, true, 'the broken browser thread must never receive a delta continuation')
+  assert.equal(bodies[1].autoOpenTab, true)
+  assert.doesNotMatch(bodies[1].message, /^Continue the same Shiro/)
+  assert.match(bodies[1].message, /EXACT_HARNESS_REQUEST_JSON/)
 })
 
 test('an unready or quarantined tab is never selected', async () => {
@@ -754,6 +1255,17 @@ test('an unready or quarantined tab is never selected', async () => {
     clients: [
       { id: 'dead-tab', ready: false, url: 'https://chatgpt.com/' },
       { id: 'bad-tab', ready: true, quarantined: true, url: 'https://chatgpt.com/' },
+    ],
+  })
+  assert.equal((await relay.health()).ready, false)
+  assert.deepEqual(posted, [])
+})
+
+test('a heartbeat-ready tab with a broken page or composer is never selected', async () => {
+  const { relay, posted } = tabRelay({
+    clients: [
+      { id: 'broken-page', ready: true, pageReady: false, composerReady: true, url: 'https://chatgpt.com/' },
+      { id: 'broken-composer', ready: true, pageReady: true, composerReady: false, url: 'https://chatgpt.com/' },
     ],
   })
   assert.equal((await relay.health()).ready, false)

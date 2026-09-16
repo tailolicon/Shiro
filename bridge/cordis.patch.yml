@@ -11,7 +11,47 @@
 - id: llm-deepseek
   name: '@deepseek-ai/dsh-llm-deepseek'
   disabled: true
+# Agent Teams replaces the legacy continuable-child control surface for
+# Shiro-native multi-agent collaboration. Ordinary subagent/subagent_fork stay
+# available as one-shot delegation, while durable peer mail and shared tasks
+# live in the Team domain below.
+- id: tool-subagent-control
+  name: '@deepseek-ai/dsh-tool-subagent-control'
+  disabled: true
+- id: tool-subagent-report
+  name: '@deepseek-ai/dsh-tool-subagent-report'
+  disabled: true
+- id: tool-subagent
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: spawn
+    toolName: subagent
+    backgroundMode: one-shot
+    maxDepth: 1
+- id: tool-subagent-fork
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: fork
+    toolName: subagent_fork
+    backgroundMode: one-shot
+    maxDepth: 1
 - insert:
+    # Native Shiro peer-to-peer coordination. `send_message` is quiet/durable
+    # (it does not spend a model turn just to receive information), while
+    # `followup_task` explicitly wakes a teammate when new reasoning is needed.
+    - id: agent-team
+      name: '@deepseek-ai/dsh-experimental-agent-team'
+      config:
+        maxMembers: 8
+        maxTasks: 256
+        maxPendingMessagesPerMember: 64
+        maxMessageBytes: 65536
+        disposalTimeoutMs: 5000
+    - id: tool-agent-team
+      name: '@deepseek-ai/dsh-experimental-tool-agent-team'
+      config:
+        freshProvider: spawn
+        forkProvider: fork
     - id: web-search-exa-keyless
       name: '@deepseek-ai/dsh-web-search-exa'
       config:
@@ -48,8 +88,22 @@
       name: '@shiro-ai/harness-bridge/container-tool'
       config:
         workspaceRoot: !!js process.env.SHIRO_WORKSPACE_ROOT
+    # Terminal fast-path: when the model has already computed the exact final
+    # answer, this tool commits that text and closes the turn without paying for
+    # a second Web inference round just to echo the tool result.
+    - id: shiro-finish-tool
+      name: '@shiro-ai/harness-bridge/finish-tool'
     - id: shiro-git-tool
       name: '@shiro-ai/harness-bridge/git-tool'
+      config:
+        workspaceRoot: !!js process.env.SHIRO_WORKSPACE_ROOT
+    # Read-only host inspection for the agent loop (same actions as the
+    # connector: host_system_info, host_process_list). Never sends signals.
+    - id: shiro-host-tool
+      name: '@shiro-ai/harness-bridge/host-tool'
+    # Bounded PDF/DOCX/XLSX extractors. Paths follow the session cwd.
+    - id: shiro-document-tool
+      name: '@shiro-ai/harness-bridge/document-tool'
       config:
         workspaceRoot: !!js process.env.SHIRO_WORKSPACE_ROOT
     - id: llm-shiro-harness-bridge
@@ -89,8 +143,19 @@
         relayUrl: !!js process.env.SHIRO_RELAY_URL
         relayToken: !!js process.env.SHIRO_RELAY_API_TOKEN
         relayModel: !!js process.env.SHIRO_RELAY_MODEL ?? 'GPT-5.6 Sol'
+        # Dedicated autonomous provider that always consumes ChatGPT Web through
+        # the browser relay instead of handing model requests back to MCP.
+        webProvider: !!js process.env.SHIRO_WEB_PROVIDER ?? 'shiro-web'
+        webModel: !!js process.env.SHIRO_WEB_MODEL ?? 'gpt-5.6-sol'
+        webRelayModel: !!js process.env.SHIRO_WEB_RELAY_MODEL ?? 'GPT-5.6 Sol'
         fleetStateDir: !!js process.env.SHIRO_FLEET_STATE_DIR ?? ''
         # Service logs live beside the project root, not inside it; logs_tail
         # reads them through a fixed stream allowlist.
         logDir: !!js process.env.SHIRO_LOG_DIR ?? ''
+        # Separate from the MCP bearer token. The secure tunnel never receives
+        # this credential; only marked local OmniCast clients can manage the
+        # persisted return-only lease.
+        omnicastControlToken: !!js process.env.SHIRO_OMNICAST_CONTROL_TOKEN ?? ''
+        omnicastReturnStateFile: !!js process.env.SHIRO_OMNICAST_RETURN_STATE_FILE ?? ''
+        codexCliPath: !!js process.env.SHIRO_CODEX_CLI ?? ''
         grokCliPath: !!js process.env.SHIRO_GROK_CLI ?? ''

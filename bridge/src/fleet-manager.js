@@ -12,6 +12,11 @@ const DEFAULT_LAUNCH_CONCURRENCY = 3
 const DEFAULT_VERIFY_ATTEMPTS = 20
 const DEFAULT_VERIFY_DELAY_MS = 250
 const REQUEST_TIMEOUT_MS = 60_000
+// Fleet/browser workers are quota-capped independently of whichever model a
+// ChatGPT tab happened to use previously. This is intentionally non-configurable
+// at runtime: background work must never consume GPT-6 Pro quota.
+const FLEET_CHATGPT_MODEL = 'GPT-5.6 Sol'
+const FLEET_CHATGPT_EFFORT = 'xhigh'
 const STATE_VERSION = 1
 // Bounded per-fleet run history so fleet_runs can answer "what happened on the
 // last rounds" without the state file growing without limit.
@@ -225,6 +230,8 @@ export class BrowserFleetTransport {
     return await this.request('POST', '/browser/passive-prompt', {
       sourceClientId,
       message: prompt,
+      model: FLEET_CHATGPT_MODEL,
+      effort: FLEET_CHATGPT_EFFORT,
       timeoutMs: 60_000,
     }, signal)
   }

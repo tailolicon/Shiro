@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import { desktopEnvironment } from './desktop-environment.js'
 import { randomUUID } from 'node:crypto'
 import { ActionError, asActionError, fail } from './action-errors.js'
 
@@ -39,7 +40,7 @@ const INHERITED_ENV = Object.freeze([
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
 
 export function buildEnvironment(overlay = {}, source = process.env) {
-  const environment = {}
+  const environment = desktopEnvironment(source)
   for (const name of INHERITED_ENV) {
     const value = source[name]
     if (typeof value === 'string') environment[name] = value

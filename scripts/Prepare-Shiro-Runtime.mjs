@@ -22,6 +22,7 @@ const paths = {
   relayDataRoot,
   relayExtensionRoot,
   tokenFile: path.join(stateRoot, 'bridge-token.txt'),
+  omnicastControlTokenFile: path.join(stateRoot, 'omnicast-control-token.txt'),
   relayEnvFile: path.join(stateRoot, 'chatgpt-relay.env'),
 }
 
@@ -55,6 +56,10 @@ function token(bytes) {
 
 if (!await exists(paths.tokenFile)) await writeFile(paths.tokenFile, token(32), { mode: 0o600 })
 await chmod(paths.tokenFile, 0o600)
+if (!await exists(paths.omnicastControlTokenFile)) {
+  await writeFile(paths.omnicastControlTokenFile, token(32), { mode: 0o600 })
+}
+await chmod(paths.omnicastControlTokenFile, 0o600)
 
 if (!await exists(paths.relayEnvFile)) {
   const lines = [
@@ -117,6 +122,8 @@ const profile = {
     '@deepseek-ai/dsh-settings': link(path.join(engineRoot, 'packages', 'settings', 'settings')),
     '@deepseek-ai/dsh-subagent': link(path.join(engineRoot, 'packages', 'subagent', 'subagent')),
     '@deepseek-ai/dsh-tools': link(path.join(engineRoot, 'packages', 'core', 'tools')),
+    '@deepseek-ai/dsh-experimental-agent-team': link(path.join(engineRoot, 'packages', 'experimental', 'agent-team')),
+    '@deepseek-ai/dsh-experimental-tool-agent-team': link(path.join(engineRoot, 'packages', 'experimental', 'tool-agent-team')),
     '@shiro-ai/harness-bridge': link(path.join(repoRoot, 'bridge')),
     '@deepseek-ai/dsh-web-search-exa': link(path.join(engineRoot, 'packages', 'web', 'web-search-exa')),
     'dsh-client-auto-continue': file(path.join(repoRoot, 'plugins', 'auto-continue')),
@@ -197,7 +204,9 @@ try {
 const optionalBlock = renderOptionalPluginBlock({
   lspServers: discoverLanguageServers(),
   hooksConfigPath,
-  model: process.env.SHIRO_RELAY_MODEL || 'GPT-5.6 Sol',
+  // Codex hook payloads carry the Harness model id, not the ChatGPT picker
+  // label. Honor an explicit autonomous override before the default Web route.
+  model: process.env.SHIRO_AUTONOMOUS_MODEL || process.env.SHIRO_WEB_MODEL || 'gpt-5.6-sol',
 })
 const existingPatch = await readFile(profilePatchPath, 'utf8').catch(() => '')
 const mergedPatch = mergeProfilePatch(existingPatch, optionalBlock)

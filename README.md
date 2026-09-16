@@ -1,13 +1,13 @@
 # Shiro
 
-Shiro biến ChatGPT Web với GPT-5.6 Sol thành một coding agent đầy đủ trên Windows và Omarchy/Arch Linux. Sol đưa ra quyết định; Shiro chạy đọc/ghi file, terminal, test, Git, goal, workflow và subagent qua engine DeepSeek Harness.
+Shiro biến ChatGPT Web với GPT-6 Astra thành một coding agent đầy đủ trên Windows và Omarchy/Arch Linux. Astra đưa ra quyết định; Shiro chạy đọc/ghi file, terminal, test, Git, goal, workflow và subagent qua engine DeepSeek Harness.
 
 Giao diện web cục bộ có launcher native trên Omarchy và có thể được đóng gói thành ứng dụng Windows bằng Pake. Toàn bộ mã nguồn có thể đọc và chỉnh sửa ngay trong repo này.
 
 ## Cấu trúc
 
 - `engine/`: mã nguồn DeepSeek Harness, được dùng làm agent runtime.
-- `bridge/`: adapter và MCP bridge kết nối ChatGPT Sol với Harness.
+- `bridge/`: adapter và MCP bridge kết nối ChatGPT Web với Harness.
 - `relay/chatgpt-bridge/`: browser relay đã audit và ghim commit; giữ ChatGPT Web chạy nền nhưng trả kết quả về đúng agent loop của DSH.
 - `desktop/`: cấu hình Pake và tài nguyên ứng dụng Windows.
 - `plugins/`: các plugin DSH đã audit và ghim đúng commit; mỗi thư mục là một Git submodule có thể đọc/chỉnh sửa.
@@ -59,7 +59,7 @@ Cách này chỉ được dùng khi Shiro chứng minh được thread vẫn kh�
 
 ### Connector actions: direct action trước, Harness sau
 
-Connector Shiro lộ **131 action** cho ChatGPT (trước đây là 12, rồi 74, rồi 118, rồi 122, rồi 128). Việc thường ngày —
+Connector Shiro lộ **148 action** cho ChatGPT (trước đây là 12, rồi 74, rồi 118, rồi 122, rồi 128, rồi 131, rồi 132). Việc thường ngày —
 đọc file, xem `git status`, chạy test, bật dev server, đổi lịch một fleet — là
 **một action, một lượt MCP, không gọi LLM và không tạo durable session**. `harness_start`
 vẫn là đường duy nhất cho công việc lập trình thật sự cần suy luận.
@@ -79,7 +79,10 @@ vẫn là đường duy nhất cho công việc lập trình thật sự cần s
 | Tải file từ URL vào workspace | `download_file` |
 | Đưa file đính kèm trong ChatGPT vào workspace | `artifact_import` |
 | Nhìn ảnh / một trang PDF | `image_open`, `pdf_render_page` |
+| Trích text PDF / DOCX / XLSX | `pdf_extract_text`, `docx_extract_text`, `xlsx_extract` |
+| Xem host (read-only) | `host_system_info`, `host_process_list` |
 | Chụp một tab ChatGPT do Shiro sở hữu | `browser_tab_screenshot` |
+| Thu exact bytes của GPT Image từ DOM thẳng vào workspace | `browser_tab_collect_generated_image` |
 | Điều khiển browser: điều hướng, tìm element, click, gõ | `browser_tab_navigate`, `browser_dom_query`, `browser_tab_click`, `browser_tab_type` |
 | Sửa/refactor nhiều bước | `harness_start` |
 | Đọc lại một thread theo dòng sự kiện | `thread_events` |
@@ -144,9 +147,11 @@ argv/confinement này; ở đó reset/restore/rebase/push *có* mặt nhưng b�
 
 `web_fetch` đã được bật (đọc trọn nội dung một URL, không chỉ snippet search) qua provider first-party đã được làm cứng. Tool `session_search`/`session_trace` cho phép tìm lại phiên cũ. Muốn nối một MCP server ngoài, xem mẫu comment trong `bridge/cordis.patch.yml` (mỗi server một dòng, tool hiện dưới tên `mcp__<server>__<tool>`); Shiro không tự bật vì tool của server đó thừa hưởng toàn bộ quyền tin cậy.
 
-### Grok Build CLI
+### Autonomous model routes
 
-Nếu máy đã cài và đăng nhập Grok Build CLI (`%USERPROFILE%\.grok\bin\grok.exe` trên Windows hoặc `~/.grok/bin/grok` trên Linux, xác thực qua grok.com), Shiro tự dùng `shiro-grok/grok-4.6` làm autonomous route mặc định: model → tool → model chạy hoàn toàn trong DeepSeek Harness, không quay lại browser/MCP broker giữa các vòng. Model selector vẫn có `grok-4.6` và `grok-4.5`. Bridge chạy CLI ở chế độ headless với system prompt backend tối giản và toàn bộ tool/subagent/web-search của CLI bị tắt — Harness giữ trọn agent loop; Grok chỉ đóng vai trò model. Output bị ép đúng schema blocks qua `--json-schema`, effort `Light/Standard/High/Max` khớp thẳng `low/medium/high/xhigh`, usage token là số thật từ CLI, và mỗi request là một tiến trình riêng nên subagent song song chạy thật sự song song. Ghi đè đường dẫn CLI bằng `SHIRO_GROK_CLI`; ép `SHIRO_EXECUTION_MODE=relay` để giữ đường ChatGPT Web cũ; không có CLI thì provider tự ẩn và relay vẫn là fallback.
+Mặc định Shiro dùng `shiro-web/gpt-6-astra`: DeepSeek Harness vẫn giữ toàn bộ model → tool → model loop ở local, nhưng mỗi model round được gửi tự động qua browser relay tới một tab ChatGPT Web an toàn riêng. Relay chọn và xác minh chính xác `GPT-6 Pro` (tên Astra trong model picker của ChatGPT) trước khi gửi prompt; nếu tài khoản chưa được rollout Astra hoặc không có tab ChatGPT Web an toàn/ready thì route fail closed. Relay cũng ghi riêng model slug quan sát trên assistant turn và từ chối fallback rõ ràng sang GPT-5.x; slug thiếu hoặc có tên rollout chưa biết được lưu là `unverified`, không bị báo sai thành model đã xác minh end-to-end. Vì vậy inference tiêu quota ChatGPT Web thay vì quota Codex. Route này không handoff request ngược về MCP caller. Đổi lại, mỗi inference round vẫn phải chịu một browser/model round-trip — phần local tool execution và continuation mới là thứ không quay lại Web. Các mức effort của Harness chỉ là gợi ý trên route này: ChatGPT hiện không cung cấp một control effort riêng cho GPT-6 Pro, còn các lựa chọn Instant/Medium/High/Extra High dùng Sol.
+
+Codex CLI (`~/.local/bin/codex`) và Grok Build CLI (`~/.grok/bin/grok`) vẫn được đăng ký nếu có để làm fallback explicit qua `SHIRO_AUTONOMOUS_PROVIDER`/`SHIRO_AUTONOMOUS_MODEL`. Có thể ép `SHIRO_EXECUTION_MODE=relay` để dùng lại compatibility path cũ, nơi MCP/Web caller trực tiếp trả lời từng model request.
 
 ## Nâng cấp đã chọn lọc
 
@@ -212,7 +217,7 @@ Shiro tự mở một cửa sổ Chrome thu nhỏ dùng profile riêng (`E:\Proj
 1. Đăng nhập `chatgpt.com`.
 2. Mở nút Bridge ở góc phải dưới, dán Bridge token hiển thị trên trang setup (`http://127.0.0.1:23158/setup`, tự mở khi chưa kết nối) rồi chọn Save & connect.
 
-Đăng nhập và token được lưu trong profile riêng, nên từ lần sau mọi thứ tự chạy ẩn hoàn toàn. Nếu không muốn trình duyệt ẩn (tự quản lý tab ChatGPT trong Chrome chính), chạy `Start-Shiro.ps1 -NoHiddenBrowser`. Từ đó luồng local là `DSH UI → GPT-5.6 Sol trong tab ChatGPT đã đăng nhập → DSH agent loop`; mọi file, terminal, test, Git, goal, workflow, subagent và plugin vẫn do DeepSeek Harness chạy và hiển thị trong Shiro.
+Đăng nhập và token được lưu trong profile riêng, nên từ lần sau mọi thứ tự chạy ẩn hoàn toàn. Nếu không muốn trình duyệt ẩn (tự quản lý tab ChatGPT trong Chrome chính), chạy `Start-Shiro.ps1 -NoHiddenBrowser`. Từ đó luồng local là `DSH UI → GPT-6 Pro (Astra) trong tab ChatGPT đã đăng nhập → DSH agent loop`; mọi file, terminal, test, Git, goal, workflow, subagent và plugin vẫn do DeepSeek Harness chạy và hiển thị trong Shiro.
 
 `Start-Shiro-Tunnel.cmd` chỉ còn là đường tùy chọn ngược lại để một cuộc chat trên ChatGPT gọi vào Shiro qua MCP. Direct chat trong Shiro không cần tunnel này. OpenAI runtime API key của tunnel chỉ được giữ trong bộ nhớ và không được ghi vào repo.
 

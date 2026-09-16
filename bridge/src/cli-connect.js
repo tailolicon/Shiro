@@ -10,6 +10,14 @@ import { EXIT } from './cli.js'
 // Shiro can drive it without being told anything twice.
 
 export const DEFAULT_PORT = 23157
+export const SHIRO_CLIENT_HEADER = 'x-shiro-client'
+
+export function clientRequestHeaders(token) {
+  return {
+    authorization: `Bearer ${token}`,
+    [SHIRO_CLIENT_HEADER]: 'shiro-cli',
+  }
+}
 
 export class TransportError extends Error {
   constructor(message) {
@@ -73,7 +81,12 @@ export async function connect({ env = process.env, cwd = process.cwd() } = {}) {
   const { StreamableHTTPClientTransport } = await import('@modelcontextprotocol/sdk/client/streamableHttp.js')
   const client = new Client({ name: 'shiro-cli', version: '0.2.0' }, { capabilities: {} })
   const transport = new StreamableHTTPClientTransport(new URL(url), {
-    requestInit: { headers: { authorization: `Bearer ${token}` } },
+    // The public MCP endpoint defaults unmarked callers to relay mode because
+    // ChatGPT itself supplies those model rounds through the connector. The
+    // bundled local CLI identifies itself so the deployment's autonomous
+    // default remains available without making a second browser tab part of a
+    // connector-originated task.
+    requestInit: { headers: clientRequestHeaders(token) },
   })
   try {
     await client.connect(transport)

@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import test from 'node:test'
+import { fileURLToPath } from 'node:url'
 import {
   DEFAULT_FLEET_SIZE,
   DEFAULT_INTERVAL_MINUTES,
@@ -12,15 +14,20 @@ import {
   promptFileArgument,
   renderFleetPrompt,
   cleanupBusyEvidence,
+  hasSettledObservedProgress,
   hasActiveGenerationControl,
   hasActiveTemporaryChatControl,
   hasExpectedChatMode,
   hasInactiveTemporaryChatControl,
   hasSendControl,
   isTemporaryChatUrl,
+  isRetainedSession,
   isSuccessfulSession,
+  isRetryableLaunchError,
   fleetNeedsRotation,
   hasRemainingRounds,
+  launchOpenAttemptBudget,
+  nextRoundDelayMs,
   sessionRunCount,
   selectFleetClients,
   selectStatusFleet,
@@ -78,6 +85,45 @@ test('cleanup ignores stale streaming markup only after final output and the idl
     ...staleClient,
     tabObservation: { generation: { state: 'active', activeTool: false }, output: { finalMessage: false } },
   }, send), 'unsettled_generation')
+
+  const stuckStreamingClient = {
+    activeRequest: null,
+    tabObservation: {
+      generation: { state: 'active', activeTool: false, stopVisible: false, streamingVisible: true },
+      output: {
+        state: 'streaming',
+        finalMessage: true,
+        answer: 'Đã thực hiện đúng lane',
+        progressItems: [
+          { state: 'completed', active: false },
+          { state: 'completed', active: false },
+        ],
+      },
+    },
+  }
+  assert.equal(hasSettledObservedProgress(stuckStreamingClient), true)
+  assert.equal(cleanupBusyEvidence(stuckStreamingClient, '<div>stale streaming marker</div>'), '')
+  assert.equal(hasSettledObservedProgress({
+    ...stuckStreamingClient,
+    tabObservation: {
+      ...stuckStreamingClient.tabObservation,
+      output: { ...stuckStreamingClient.tabObservation.output, finalMessage: false },
+    },
+  }), false)
+  assert.equal(hasSettledObservedProgress({
+    ...stuckStreamingClient,
+    tabObservation: {
+      ...stuckStreamingClient.tabObservation,
+      generation: { ...stuckStreamingClient.tabObservation.generation, activeTool: true },
+    },
+  }), false)
+  assert.equal(hasSettledObservedProgress({
+    ...stuckStreamingClient,
+    tabObservation: {
+      ...stuckStreamingClient.tabObservation,
+      output: { ...stuckStreamingClient.tabObservation.output, progressItems: [{ state: 'active', active: true }] },
+    },
+  }), false)
 })
 
 test('relay fleet runner selects exactly five healthy tabs and deprioritizes generating tabs', () => {
@@ -113,10 +159,28 @@ test('relay fleet resumes only still-open runner-owned tabs from status', () => 
 
 test('relay fleet counts only successfully submitted Temporary sessions', () => {
   assert.equal(isSuccessfulSession({ state: 'submitted', tabId: 1 }), true)
+  assert.equal(isSuccessfulSession({ state: 'submitted_uncertain', tabId: 1 }), true)
   assert.equal(isSuccessfulSession({ state: 'reused_submitted', tabId: 1 }), true)
   assert.equal(isSuccessfulSession({ state: 'adopted_submitted', tabId: 2 }), true)
   assert.equal(isSuccessfulSession({ state: 'failed', tabId: 3 }), false)
   assert.equal(isSuccessfulSession({ state: 'memory_guard' }), false)
+  assert.equal(isRetainedSession({ state: 'launch_retained', tabId: 3 }), true)
+  assert.equal(isRetainedSession({ state: 'failed', tabId: 3 }), false)
+})
+
+test('relay fleet never opens replacement tabs beyond the requested worker slots', () => {
+  assert.equal(launchOpenAttemptBudget(4, 0), 4)
+  assert.equal(launchOpenAttemptBudget(4, 3), 1)
+  assert.equal(launchOpenAttemptBudget(4, 4), 0)
+  assert.equal(launchOpenAttemptBudget(20, 0), 20)
+})
+
+test('relay fleet retries transient relay failures in place and preserves the configured round delay', () => {
+  assert.equal(isRetryableLaunchError(new Error('Relay HTTP 423: OmniCast return lease')), true)
+  assert.equal(isRetryableLaunchError(new Error('Relay HTTP 500: CHAT_PAGE_NOT_READY')), true)
+  assert.equal(isRetryableLaunchError(new Error('Fresh tab rendered the wrong chat mode')), false)
+  assert.equal(nextRoundDelayMs(27 * 60_000, 0), 27 * 60_000)
+  assert.equal(nextRoundDelayMs(1_000, 2_000), 0)
 })
 
 test('relay fleet rotates a cohort after four runs and supports an unlimited round budget', () => {
@@ -143,4 +207,16 @@ test('fleet prompt file and slot placeholders are deterministic', () => {
   assert.throws(() => fleetSizeArgument(['--fleet-size=0']), /integer from 1 to 20/)
   assert.equal(statusNameArgument(['--status-name=echoes-web-trial.json']), 'echoes-web-trial.json')
   assert.throws(() => statusNameArgument(['--status-name=../escape.json']), /simple \.json filename/)
+})
+
+
+test('fleet runner help is side-effect free and implicit Hachimi prompt launch is disabled', () => {
+  const runnerPath = fileURLToPath(new URL('../../scripts/Run-Hachimi-Temporary-Fleet.mjs', import.meta.url))
+  const help = spawnSync(process.execPath, [runnerPath, '--help'], { encoding: 'utf8' })
+  assert.equal(help.status, 0)
+  assert.match(help.stdout, /legacy embedded hachimi-tl-vi prompt is disabled/i)
+
+  const implicit = spawnSync(process.execPath, [runnerPath, '--once'], { encoding: 'utf8' })
+  assert.equal(implicit.status, 2)
+  assert.match(implicit.stderr, /Refusing to launch: the legacy embedded hachimi-tl-vi prompt is disabled/i)
 })

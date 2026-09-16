@@ -20,6 +20,7 @@ env_value() {
 }
 
 [[ -s "$runtime_root/state/bridge-token.txt" ]] || { echo 'Private bridge token is missing.' >&2; exit 1; }
+[[ -s "$runtime_root/state/omnicast-control-token.txt" ]] || { echo 'Private OmniCast control token is missing.' >&2; exit 1; }
 [[ -s "$relay_env" ]] || { echo 'ChatGPT relay configuration is missing.' >&2; exit 1; }
 
 relay_port="$(env_value PORT)"
@@ -38,24 +39,38 @@ export SHIRO_WORKSPACE_ROOT="$project_root"
 export SHIRO_WORKSPACE_ALLOWLIST="${SHIRO_WORKSPACE_ALLOWLIST-$(dirname -- "$project_root"):/tmp/shiro}"
 export SHIRO_LOG_DIR="$runtime_root/logs"
 export SHIRO_BRIDGE_TOKEN="$(<"$runtime_root/state/bridge-token.txt")"
+export SHIRO_OMNICAST_CONTROL_TOKEN="$(<"$runtime_root/state/omnicast-control-token.txt")"
+export SHIRO_OMNICAST_RETURN_STATE_FILE="$runtime_root/state/omnicast-return.json"
 export SHIRO_BRIDGE_PORT="$mcp_port"
 export SHIRO_RELAY_URL="http://127.0.0.1:${relay_port:-23158}"
 export SHIRO_RELAY_API_TOKEN="$relay_api_token"
-export SHIRO_RELAY_MODEL='GPT-5.6 Sol'
+export SHIRO_RELAY_MODEL="${SHIRO_RELAY_MODEL:-GPT-5.6 Sol}"
+export SHIRO_WEB_PROVIDER="${SHIRO_WEB_PROVIDER:-shiro-web}"
+export SHIRO_WEB_MODEL="${SHIRO_WEB_MODEL:-gpt-5.6-sol}"
+export SHIRO_WEB_RELAY_MODEL="${SHIRO_WEB_RELAY_MODEL:-GPT-5.6 Sol}"
 export DSH_CLIENT_TITLE='Shiro'
 
-# Prefer the native Harness-owned loop when the subscription-authenticated
-# Grok Build CLI is installed. It is already registered as a pure model
-# adapter by the bridge (its own tools/subagents/web search are disabled), so
-# this removes the browser/MCP round trip from every model→tool→model step.
-# An operator can keep the compatibility path with
-# SHIRO_EXECUTION_MODE=relay, or select another ctx.llm adapter by exporting
-# the autonomous provider/model pair before launch.
+# Default to ChatGPT Web quota while keeping the model↔tool loop inside
+# DeepSeek Harness. `shiro-web` always drives a separate safe browser-relay tab
+# for each model round instead of handing the request back to the MCP caller.
+# This necessarily keeps one browser/model round-trip per inference round, but
+# local tools and continuation remain Harness-owned. Codex/Grok stay registered
+# below only as explicit operator-selected fallbacks.
+codex_cli="${SHIRO_CODEX_CLI:-$HOME/.local/bin/codex}"
 grok_cli="${SHIRO_GROK_CLI:-$HOME/.grok/bin/grok}"
+if [[ -x "$codex_cli" ]]; then
+  export SHIRO_CODEX_CLI="$codex_cli"
+fi
 if [[ -x "$grok_cli" ]]; then
   export SHIRO_GROK_CLI="$grok_cli"
-  export SHIRO_AUTONOMOUS_PROVIDER="${SHIRO_AUTONOMOUS_PROVIDER:-shiro-grok}"
-  export SHIRO_AUTONOMOUS_MODEL="${SHIRO_AUTONOMOUS_MODEL:-grok-4.6}"
+fi
+if [[ -z "${SHIRO_AUTONOMOUS_PROVIDER:-}" && -z "${SHIRO_AUTONOMOUS_MODEL:-}" ]]; then
+  export SHIRO_AUTONOMOUS_PROVIDER="$SHIRO_WEB_PROVIDER"
+  export SHIRO_AUTONOMOUS_MODEL="$SHIRO_WEB_MODEL"
+fi
+if [[ ( -z "${SHIRO_AUTONOMOUS_PROVIDER:-}" && -n "${SHIRO_AUTONOMOUS_MODEL:-}" ) || ( -n "${SHIRO_AUTONOMOUS_PROVIDER:-}" && -z "${SHIRO_AUTONOMOUS_MODEL:-}" ) ]]; then
+  echo 'SHIRO_AUTONOMOUS_PROVIDER and SHIRO_AUTONOMOUS_MODEL must be configured together.' >&2
+  exit 2
 fi
 if [[ -n "${SHIRO_AUTONOMOUS_PROVIDER:-}" && -n "${SHIRO_AUTONOMOUS_MODEL:-}" ]]; then
   export SHIRO_EXECUTION_MODE="${SHIRO_EXECUTION_MODE:-autonomous}"

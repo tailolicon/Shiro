@@ -2,7 +2,7 @@
   "name": "shiro",
   "version": "0.1.0",
   "private": true,
-  "description": "Local ChatGPT Sol coding-agent bridge powered by DeepSeek Harness",
+  "description": "Local ChatGPT Astra coding-agent bridge powered by DeepSeek Harness",
   "scripts": {
     "test": "node --test bridge/tests/*.test.js",
     "shiro": "node bridge/bin/shiro.mjs",

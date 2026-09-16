@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { buildCallArguments, coerce, EXIT, parseArguments, renderResult, runCli, UsageError } from '../src/cli.js'
-import { DEFAULT_PORT, resolveEndpoint, resolveToken, TransportError } from '../src/cli-connect.js'
+import { clientRequestHeaders, DEFAULT_PORT, resolveEndpoint, resolveToken, SHIRO_CLIENT_HEADER, TransportError } from '../src/cli-connect.js'
 
 /** A stand-in for the MCP client: records calls, replays canned answers. */
 function fakeClient({ tools = [], results = {} } = {}) {
@@ -178,6 +178,13 @@ test('the endpoint comes from the same variables the launcher exports', () => {
   assert.equal(resolveEndpoint({ SHIRO_BRIDGE_URL: 'http://box.local:8080/mcp' }), 'http://box.local:8080/mcp')
   assert.throws(() => resolveEndpoint({ SHIRO_BRIDGE_PORT: '80' }), TransportError)
   assert.throws(() => resolveEndpoint({ SHIRO_BRIDGE_URL: 'not a url' }), /is not a URL/)
+})
+
+test('the bundled CLI marks requests so local tasks retain the configured loop owner', () => {
+  assert.deepEqual(clientRequestHeaders('secret'), {
+    authorization: 'Bearer secret',
+    [SHIRO_CLIENT_HEADER]: 'shiro-cli',
+  })
 })
 
 test('the token is found in the environment or in the launcher state file', () => {
