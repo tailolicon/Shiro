@@ -22,6 +22,7 @@ import { downloadFile, importArtifact, NET_LIMITS } from './net-actions.js'
 import * as tasks from './task-actions.js'
 import * as review from './review-actions.js'
 import * as worktrees from './worktree-actions.js'
+import { guardWorktreeCreation } from './worktree-policy.js'
 import { CONTROL_KEYS, TERMINAL_LIMITS, TERMINAL_SIGNALS, TerminalRegistry } from './terminal-actions.js'
 import { THREAD_LIMITS } from './thread-registry.js'
 import { PRIMARY_WORKSPACE_ID, WORKSPACE_LIMITS, WorkspaceRegistry } from './workspaces.js'
@@ -729,6 +730,9 @@ export function registerDirectActions(server, options) {
     // Allowlist first: a checkout created somewhere the operator never allowed
     // would be a hole straight through the workspace boundary.
     workspaces.assertPathAllowed(destination)
+    // Reject budget/read-only requests before creating even an empty directory.
+    // addWorktree repeats the guard under its lock to prevent concurrent races.
+    await guardWorktreeCreation(repository.repository, { ...args, destination }, repository.worktrees, gitSignal(extra))
     const opened = await workspaces.create({ path: destination, name: args.name ?? args.branch })
     try {
       const created = await worktrees.addWorktree(source.sandbox, {
