@@ -701,9 +701,12 @@ export function registerDirectActions(server, options) {
     family: 'worktree',
     workspaceScoped: true,
     title: 'Create an isolated checkout and open it as a workspace',
-    description: 'Adds a git worktree -- a second checkout of the same repository on its own branch, sharing one object store -- and registers it as a Shiro workspace in the same call. That workspace id then works everywhere: fs_*, exec_run, git_*, terminal_*, and harness_start({workspace}) to run a whole agent turn isolated in that checkout, which is how two tasks run in parallel without seeing each other’s edits. The destination must sit inside the operator allowlist exactly like workspace_open, and defaults to <repo>.worktrees/<branch> beside the repository. Fails with ALREADY_EXISTS when the branch is checked out elsewhere or the destination is occupied.',
+    description: 'Opt-in isolated checkout for concurrent SOURCE WRITERS only. Read/research/review/media workers use workspace_open and shared data; do not clone a repository per session. Default budgets: 4 linked checkouts and 1 GiB checked-out content; larger data repositories require sparse_paths. Nested checkouts inside the source are rejected. Creation records a 24-hour maintenance lease; preserve results and remove the checkout when done. This does not start an AI worker. Additional ChatGPT workers still use Run-Hachimi-Temporary-Fleet.',
     input: {
       branch: z.string().min(1).describe('Branch for the new checkout. Created from base_ref unless create_branch=false.'),
+      purpose: z.enum(['parallel_write', 'isolated_build', 'read_only']).optional().describe('Read-only tasks are refused: use the existing workspace.'),
+      isolation_reason: z.string().min(1).max(300).optional().describe('Why concurrent source writes or build outputs actually require isolation.'),
+      sparse_paths: z.array(z.string().min(1)).max(40).optional().describe('Only materialize these source directories, never duplicate large data/output trees.'),
       path: z.string().min(1).optional().describe('Absolute destination. Defaults to <repo>.worktrees/<branch> beside the repository.'),
       base_ref: z.string().min(1).optional().describe('Commit or branch the new branch starts from. Defaults to the current HEAD.'),
       create_branch: z.boolean().optional().describe('Default true. false checks out an existing branch instead.'),
@@ -722,7 +725,7 @@ export function registerDirectActions(server, options) {
   }, async (args, extra) => {
     const source = workspaces.get(args.workspace)
     const repository = await worktrees.listWorktrees(source.sandbox, { path: args.repo_path }, gitSignal(extra))
-    const destination = args.path ?? worktrees.defaultWorktreePath(repository.repository, args.branch)
+    const destination = args.path ?? worktrees.defaultWorktreePath(repository.worktrees[0]?.path || repository.repository, args.branch)
     // Allowlist first: a checkout created somewhere the operator never allowed
     // would be a hole straight through the workspace boundary.
     workspaces.assertPathAllowed(destination)
@@ -734,6 +737,9 @@ export function registerDirectActions(server, options) {
         destination,
         base_ref: args.base_ref,
         create_branch: args.create_branch,
+        purpose: args.purpose,
+        isolation_reason: args.isolation_reason,
+        sparse_paths: args.sparse_paths,
       }, gitSignal(extra))
       return {
         workspace_id: opened.workspace_id,

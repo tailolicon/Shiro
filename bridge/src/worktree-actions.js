@@ -4,8 +4,9 @@ import { basename, dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { fail } from './action-errors.js'
 import { git, repoRoot } from './git-actions.js'
+import { guardWorktreeCreation, withWorktreeLock, registerLease } from './worktree-policy.js'
 
-// Git worktrees: one checkout per task.
+// Git worktrees: opt-in isolation for concurrent source writers, NOT one per task.
 //
 // WHY THIS IS SMALL
 // A worktree is a second checkout of the same repository at another path,
@@ -101,11 +102,27 @@ export function defaultWorktreePath(repositoryRoot, branch) {
  */
 export async function addWorktree(sandbox, args = {}, options = {}) {
   const root = await repoRoot(sandbox, args.path)
+  assertBranchName(args.branch)
+  if (!String(args.destination ?? '')) fail('INVALID_ARGUMENT', 'destination is required')
+  return withWorktreeLock(root, async common => {
+    const existing = parseWorktreeList((await git(root, ['worktree', 'list', '--porcelain'], options)).stdout)
+    const budget = await guardWorktreeCreation(root, args, existing, options)
+    const created = await materializeWorktree(sandbox, args, options)
+    await registerLease(common, created.path, { branch: created.branch, head: created.head,
+      purpose: args.purpose || 'parallel_write', reason: args.isolation_reason || 'explicit isolated checkout request',
+      estimated_bytes: budget.estimatedBytes, sparse_paths: budget.sparsePaths })
+    return created
+  }, options)
+}
+
+async function materializeWorktree(sandbox, args = {}, options = {}) {
+  const root = await repoRoot(sandbox, args.path)
   const branch = assertBranchName(args.branch)
   const destination = String(args.destination ?? '')
   if (destination === '') fail('INVALID_ARGUMENT', 'destination is required')
 
   const argv = ['worktree', 'add']
+  if (args.sparse_paths?.length) argv.push('--no-checkout')
   if (args.create_branch === false) {
     argv.push(destination, branch)
   } else {
@@ -125,6 +142,10 @@ export async function addWorktree(sandbox, args = {}, options = {}) {
       fail('NOT_FOUND', stderr)
     }
     fail('GIT_CONFLICT', stderr === '' ? `git worktree add failed with exit code ${result.exitCode}` : stderr)
+  }
+  if (args.sparse_paths?.length) {
+    await git(destination, ['sparse-checkout', 'set', '--cone', '--', ...args.sparse_paths], options)
+    await git(destination, ['checkout', branch], options)
   }
   const listed = parseWorktreeList((await git(root, ['worktree', 'list', '--porcelain'], options)).stdout)
   const created = listed.find(entry => entry.branch === branch) ?? listed.at(-1)
