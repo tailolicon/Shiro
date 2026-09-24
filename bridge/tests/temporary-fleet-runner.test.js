@@ -17,6 +17,7 @@ import {
   hasSettledObservedProgress,
   hasActiveGenerationControl,
   hasActiveTemporaryChatControl,
+  hasAuthenticatedChatLayout,
   hasExpectedChatMode,
   hasInactiveTemporaryChatControl,
   hasSendControl,
@@ -48,6 +49,12 @@ test('relay fleet runner recognizes only the active Temporary control state', ()
   assert.equal(isTemporaryChatUrl('https://chatgpt.com/?temporary-chat=true'), true)
   assert.equal(isTemporaryChatUrl('https://chatgpt.com/c/normal'), false)
   assert.equal(hasExpectedChatMode(active, true, 'https://chatgpt.com/?temporary-chat=true'), true)
+  const sanitizedAuthenticated = '<button data-testid="accounts-profile-button" aria-label="&lt;redacted:17:abc&gt;"></button>'
+  const loggedOut = '<button aria-label="Log in or sign up"></button>'
+  assert.equal(hasAuthenticatedChatLayout(sanitizedAuthenticated), true)
+  assert.equal(hasAuthenticatedChatLayout(loggedOut), false)
+  assert.equal(hasExpectedChatMode(sanitizedAuthenticated, true, 'https://chatgpt.com/?temporary-chat=true'), true)
+  assert.equal(hasExpectedChatMode(loggedOut, true, 'https://chatgpt.com/?temporary-chat=true'), false)
   assert.equal(hasExpectedChatMode(inactive, false, 'https://chatgpt.com/c/normal'), true)
   assert.equal(hasExpectedChatMode('', false, 'https://chatgpt.com/c/normal'), true)
   assert.equal(hasExpectedChatMode(active, false, 'https://chatgpt.com/?temporary-chat=true'), false)

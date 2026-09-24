@@ -146,9 +146,20 @@ export function hasPersonalizedTemporaryChatControl(html) {
   return /<button[^>]*aria-label="Personalized"[^>]*>/i.test(String(html || ''))
 }
 
+export function hasAuthenticatedChatLayout(html) {
+  const text = String(html || '')
+  return /data-testid="accounts-profile-button"/i.test(text)
+    && !/aria-label="Log in or sign up"/i.test(text)
+}
+
 export function hasExpectedChatMode(html, temporaryOnly = true, url = '', personalizedTemporary = false) {
   if (temporaryOnly) {
-    const temporary = isTemporaryChatUrl(url) && hasActiveTemporaryChatControl(html)
+    const tempUrl = isTemporaryChatUrl(url)
+    const explicitControl = hasActiveTemporaryChatControl(html)
+    // Relay layout sanitization can redact Temporary's aria-label while preserving
+    // the authenticated account marker and the authoritative temporary-chat URL.
+    const sanitizedControlFallback = tempUrl && !temporaryButtonMarkup(html) && hasAuthenticatedChatLayout(html)
+    const temporary = tempUrl && (explicitControl || sanitizedControlFallback)
     return temporary && (!personalizedTemporary || hasPersonalizedTemporaryChatControl(html))
   }
   // Existing normal conversations may omit the Temporary toggle entirely.
@@ -509,8 +520,23 @@ async function launchChatTarget({ relay, prompt, signal, log, temporaryOnly = tr
   const risk = memoryRisk()
   if (risk) return { state: 'memory_guard', detail: risk }
   const clients = await relay.clients(signal)
-  const control = clients.find((client) => client.ready && !client.quarantined
+  const candidates = clients.filter((client) => client.ready && !client.quarantined
     && !client.activeRequest?.requestId && !isGenerating(client))
+  let control = candidates[0] || null
+  // Multiple ChatGPT windows can share the relay. Prefer an authenticated tab as
+  // the opener so a fresh worker inherits the paid account/session instead of
+  // silently falling back to a logged-out ChatGPT surface.
+  for (const candidate of candidates) {
+    try {
+      const capture = await relay.captureLayout(candidate.id, signal)
+      if (hasAuthenticatedChatLayout(capture.html)) {
+        control = candidate
+        break
+      }
+    } catch {
+      // A stale/transitioning candidate is not a reason to discard the rest.
+    }
+  }
   if (!control) return { state: 'no_control_tab' }
   let opened = null
   try {
